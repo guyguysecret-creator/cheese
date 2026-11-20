@@ -454,7 +454,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Force + HBE"
+title.Text = "comp heh"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
