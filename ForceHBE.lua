@@ -19,7 +19,7 @@
         side; works, but the hit-block animation won't play.
 
     Every ON feature re-checks itself every 2s, and hiding the panel (Ctrl+H) never
-    turns anything off - a small status line shows what's ON while it's hidden.
+    turns anything off. Hidden = fully gone; F9 prints what's still ON.
 
     Infinite Parry / Infinite Kicks (need a real getgc - NOT Xeno):
       - finds your Lightsaber component in memory and keeps ParriesLeft = 5, KicksLeft = 3.
@@ -633,43 +633,36 @@ do
     end))
 end
 
--- small status line shown ONLY while the panel is hidden, so you can see that
--- hiding the panel doesn't turn anything off
-local status = Instance.new("TextLabel")
-status.AnchorPoint = Vector2.new(0, 0)
-status.Position = UDim2.fromOffset(12, 12)
-status.Size = UDim2.fromOffset(0, 22)
-status.AutomaticSize = Enum.AutomaticSize.X
-status.BackgroundColor3 = COLORS.bg
-status.BackgroundTransparency = 0.25
-status.BorderSizePixel = 0
-status.Font = Enum.Font.GothamBold
-status.TextSize = 12
-status.TextColor3 = COLORS.text
-status.Visible = false
-status.Parent = gui
-Instance.new("UICorner", status).CornerRadius = UDim.new(0, 6)
-local statusPad = Instance.new("UIPadding")
-statusPad.PaddingLeft, statusPad.PaddingRight = UDim.new(0, 8), UDim.new(0, 8)
-statusPad.Parent = status
-
-local function refreshStatus()
+local function onList()
     local on = {}
     if settings.force then table.insert(on, "Force") end
     if settings.block then table.insert(on, "Block") end
     if settings.parry then table.insert(on, "Parry") end
     if settings.kick then table.insert(on, "Kicks") end
     if settings.hbe then table.insert(on, "HBE") end
-    status.Text = "ForceHBE (Ctrl+H)  |  ON: " .. (#on > 0 and table.concat(on, ", ") or "nothing")
+    return #on > 0 and table.concat(on, ", ") or "nothing"
 end
 
--- Ctrl + H hides/shows. This ONLY changes visibility - every feature keeps running.
+--[[
+    Ctrl + H fully hides/shows the menu - nothing is left on screen.
+    Glitch-proofing:
+      - Hiding ONLY flips `frame.Visible`. No feature reads the panel, the switches,
+        or `Visible`; they all read the `settings` table, which hiding never touches.
+      - The gui itself stays Enabled and parented, so nothing gets destroyed or
+        garbage-collected while hidden.
+      - The 2s self-heal loop keeps re-applying ON features while hidden.
+      - Instead of an on-screen status line, F9 prints what's still ON each time
+        you hide it, so you can check without anything showing.
+]]
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.KeyCode ~= Enum.KeyCode.H then return end
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
         frame.Visible = not frame.Visible
-        refreshStatus()
-        status.Visible = not frame.Visible
+        if frame.Visible then
+            log("menu shown")
+        else
+            log("menu hidden (Ctrl+H to bring it back) - still ON: " .. onList())
+        end
     end
 end))
 
