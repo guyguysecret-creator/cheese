@@ -12,9 +12,14 @@
         Their real body is never touched, so no frozen/glitchy players.
       - Turning it off deletes the boxes.
 
-    Infinite Block (same as InfiniteBlock.lua):
-      - deletes the server's "Block" NumberValue on your side so hits can't drain
-        your block meter and your client never breaks its own block.
+    Infinite Block:
+      - hook mode (getgc + hookfunction): hit-block animation still plays, meter is
+        pinned at full, and only the client's own "block broken" stun is dropped.
+      - delete mode (fallback, e.g. Xeno): deletes the server's "Block" value on your
+        side; works, but the hit-block animation won't play.
+
+    Every ON feature re-checks itself every 2s, and hiding the panel (Ctrl+H) never
+    turns anything off - a small status line shows what's ON while it's hidden.
 
     Infinite Parry / Infinite Kicks (need a real getgc - NOT Xeno):
       - finds your Lightsaber component in memory and keeps ParriesLeft = 5, KicksLeft = 3.
@@ -46,6 +51,13 @@ local settings = {
     hbeTransparency = 0.7, -- so you can see the box
     teamCheck = true,      -- don't expand teammates
 }
+
+-- shared so the block-break hook (installed once per game session) always reads the
+-- settings of the copy of this script that's currently running
+do
+    local env = (getgenv and getgenv()) or _G
+    env.ForceHBE_Settings = settings
+end
 
 local connections = {}
 local function track(c) table.insert(connections, c); return c end
@@ -97,13 +109,88 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
     end
 end))
 
+local function log(...) print("[ForceHBE]", ...) end
+
 ------------------------------------------------------------------------
--- Infinite Block (same as InfiniteBlock.lua)
---   The server puts a NumberValue "Block" on your character and lowers it when
---   you get hit; your client reads it and breaks your own block at 0.
---   Deleting it on your side = meter never drops, client never self-breaks.
+-- Infinite Block
+--   How the game does it (Lightsaber.States.Combat.Blocking):
+--     The server puts a NumberValue "Block" on your character and lowers it per hit.
+--     Your client's handler then: sets BlocksLeft = Value, PLAYS THE HIT-BLOCK
+--     ANIMATION + camera shake, and if BlocksLeft <= 0 fires
+--     zap.LightsaberStunFromClient.Fire({ BlockBreak = true, StunType = 2 }).
+--
+--   MODE "hook" (executor has getgc + hookfunction) - keeps the animation:
+--     - leave the Block value alone, so the handler + animation run on every hit
+--     - hook LightsaberStunFromClient.Fire and drop only block-break stuns
+--     - keep your Lightsaber component's BlocksLeft pinned at 140 (full) every frame,
+--       so the meter stays full and each new block reports a full meter to the server
+--   MODE "delete" (fallback, e.g. Xeno) - no animation:
+--     - delete the Block value on your side so hits never reach the client
 ------------------------------------------------------------------------
-local blockConn
+local MAX_BLOCK = 140         -- CombatConstants.BLOCK.MAXIMUM
+local STUN_BLOCK_BROKEN = 2   -- CombatConstants.ENUM.STUN_TYPE.BLOCK_BROKEN
+local blockMode = nil         -- "hook" or "delete", decided the first time block is turned on
+local blockConn, blockHookedChar
+local stunHooked = false
+
+-- find zap's LightsaberStunFromClient.Fire and hook it (once per game session)
+local function hookBlockBreakStun()
+    if stunHooked then return true end
+    local env = (getgenv and getgenv()) or _G
+    if env.ForceHBE_StunHooked then
+        stunHooked = true
+        return true
+    end
+    if type(getgc) ~= "function" or type(hookfunction) ~= "function" then return false end
+
+    local fireFn
+    local ok, list = pcall(getgc, true)
+    if not ok or type(list) ~= "table" then return false end
+    -- 1) the zap module's export table: { LightsaberStunFromClient = { Fire = fn }, LightsaberBlock = ... }
+    for _, t in ipairs(list) do
+        if type(t) == "table" then
+            local entry = rawget(t, "LightsaberStunFromClient")
+            if type(entry) == "table" and rawget(t, "LightsaberBlock") ~= nil
+                and type(rawget(entry, "Fire")) == "function" then
+                fireFn = rawget(entry, "Fire")
+                break
+            end
+        end
+    end
+    -- 2) fallback: the function whose constants include its profiler label
+    if not fireFn and debug.getconstants then
+        for _, f in ipairs(list) do
+            if type(f) == "function" and (not iscclosure or not iscclosure(f)) then
+                local okC, consts = pcall(debug.getconstants, f)
+                if okC and type(consts) == "table" then
+                    for _, c in ipairs(consts) do
+                        if c == "LightsaberStunFromClient Fire" then fireFn = f break end
+                    end
+                end
+                if fireFn then break end
+            end
+        end
+    end
+    if not fireFn then return false end
+
+    local old
+    local okH = pcall(function()
+        old = hookfunction(fireFn, function(payload, ...)
+            -- read live settings through the global so a re-executed script stays in control
+            local s = env.ForceHBE_Settings
+            if s and s.block and type(payload) == "table"
+                and (payload.BlockBreak == true or payload.StunType == STUN_BLOCK_BROKEN) then
+                return -- swallow the self-reported block break
+            end
+            return old(payload, ...)
+        end)
+    end)
+    if okH then
+        stunHooked = true
+        env.ForceHBE_StunHooked = true
+    end
+    return okH
+end
 
 local function isBlockValue(obj)
     return obj.Name == "Block" and obj:IsA("NumberValue")
@@ -111,28 +198,41 @@ end
 
 local function killBlockValue(obj)
     task.defer(function() -- deferred: reparenting inside ChildAdded can error
-        if settings.block and obj.Parent then pcall(function() obj:Destroy() end) end
+        if settings.block and blockMode == "delete" and obj.Parent then
+            pcall(function() obj:Destroy() end)
+        end
     end)
 end
 
-local function blockHook(char)
+local function blockDeleteHook(char)
     if blockConn then blockConn:Disconnect(); blockConn = nil end
-    if not (settings.block and char) then return end
+    blockHookedChar = nil
+    if not (settings.block and blockMode == "delete" and char) then return end
     for _, child in ipairs(char:GetChildren()) do
         if isBlockValue(child) then killBlockValue(child) end
     end
     blockConn = char.ChildAdded:Connect(function(child)
         if isBlockValue(child) then killBlockValue(child) end
     end)
+    blockHookedChar = char
 end
 
 local function setBlock(on)
     settings.block = on
-    blockHook(LocalPlayer.Character) -- on: start removing; off: disconnect
+    if on and not blockMode then
+        if hookBlockBreakStun() then
+            blockMode = "hook"
+            log("Infinite Block: hook mode (hit-block animation still plays)")
+        else
+            blockMode = "delete"
+            log("Infinite Block: delete mode (no getgc/hookfunction - hit animation won't play)")
+        end
+    end
+    blockDeleteHook(LocalPlayer.Character) -- only does anything in delete mode
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(char)
-    if settings.block then blockHook(char) end
+    if settings.block then blockDeleteHook(char) end
 end))
 
 ------------------------------------------------------------------------
@@ -147,8 +247,6 @@ local MAX_PARRIES, MAX_KICKS = 5, 3
 local saberComp
 local lastScan = 0
 local warnedNoGC = false
-
-local function log(...) print("[ForceHBE]", ...) end
 
 local function isMySaber(t)
     if type(t) ~= "table" then return false end
@@ -189,7 +287,8 @@ local function scanForSaber()
 end
 
 track(RunService.Heartbeat:Connect(function()
-    if not (settings.parry or settings.kick) then return end
+    local pinBlock = settings.block and blockMode == "hook"
+    if not (settings.parry or settings.kick or pinBlock) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
         -- the component is rebuilt when you equip/respawn; rescan every 2s until found
@@ -205,6 +304,13 @@ track(RunService.Heartbeat:Connect(function()
     if settings.kick and rawget(saberComp, "KicksLeft") < MAX_KICKS then
         saberComp.KicksLeft = MAX_KICKS
         pcall(function() saberComp:SetKicks() end)
+    end
+    if pinBlock then
+        local b = rawget(saberComp, "BlocksLeft")
+        if type(b) == "number" and b < MAX_BLOCK then
+            saberComp.BlocksLeft = MAX_BLOCK
+            pcall(function() saberComp:SetBlock() end)
+        end
     end
 end))
 
@@ -287,6 +393,27 @@ local function setHBE(on)
     settings.hbe = on
     if not on then removeAllBoxes() end
 end
+
+------------------------------------------------------------------------
+-- Self-heal: every 2s re-check that ON features are really applied to your
+-- CURRENT character (covers respawns, the game resetting attributes, etc.).
+-- Features never depend on the panel being visible.
+------------------------------------------------------------------------
+track(task.spawn(function()
+    while true do
+        task.wait(2)
+        local char = LocalPlayer.Character
+        if char then
+            if settings.force and (char:GetAttribute(REGEN_ATTR) ~= REGEN_MULTIPLIER
+                or char:GetAttribute(DRAIN_ATTR) ~= -REFILL_PER_TICK or #forceConns == 0) then
+                forceApply(char)
+            end
+            if settings.block and blockMode == "delete" and blockHookedChar ~= char then
+                blockDeleteHook(char)
+            end
+        end
+    end
+end))
 
 ------------------------------------------------------------------------
 -- UI
@@ -440,11 +567,43 @@ do
     end))
 end
 
--- Ctrl + H hides/shows
+-- small status line shown ONLY while the panel is hidden, so you can see that
+-- hiding the panel doesn't turn anything off
+local status = Instance.new("TextLabel")
+status.AnchorPoint = Vector2.new(0, 0)
+status.Position = UDim2.fromOffset(12, 12)
+status.Size = UDim2.fromOffset(0, 22)
+status.AutomaticSize = Enum.AutomaticSize.X
+status.BackgroundColor3 = COLORS.bg
+status.BackgroundTransparency = 0.25
+status.BorderSizePixel = 0
+status.Font = Enum.Font.GothamBold
+status.TextSize = 12
+status.TextColor3 = COLORS.text
+status.Visible = false
+status.Parent = gui
+Instance.new("UICorner", status).CornerRadius = UDim.new(0, 6)
+local statusPad = Instance.new("UIPadding")
+statusPad.PaddingLeft, statusPad.PaddingRight = UDim.new(0, 8), UDim.new(0, 8)
+statusPad.Parent = status
+
+local function refreshStatus()
+    local on = {}
+    if settings.force then table.insert(on, "Force") end
+    if settings.block then table.insert(on, "Block") end
+    if settings.parry then table.insert(on, "Parry") end
+    if settings.kick then table.insert(on, "Kicks") end
+    if settings.hbe then table.insert(on, "HBE") end
+    status.Text = "ForceHBE (Ctrl+H)  |  ON: " .. (#on > 0 and table.concat(on, ", ") or "nothing")
+end
+
+-- Ctrl + H hides/shows. This ONLY changes visibility - every feature keeps running.
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.KeyCode ~= Enum.KeyCode.H then return end
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
         frame.Visible = not frame.Visible
+        refreshStatus()
+        status.Visible = not frame.Visible
     end
 end))
 
@@ -456,7 +615,13 @@ local function cleanup()
     setBlock(false)
     settings.parry, settings.kick = false, false
     setHBE(false)
-    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
+    for _, c in ipairs(connections) do
+        if type(c) == "thread" then
+            pcall(task.cancel, c)
+        else
+            pcall(function() c:Disconnect() end)
+        end
+    end
     if gui then gui:Destroy() end
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
