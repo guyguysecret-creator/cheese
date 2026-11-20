@@ -1,5 +1,5 @@
 --[[
-    Infinite Force + Hitbox Expander - one script, one small UI (made for Xeno)
+    Infinite Force + Hitbox Expander - one script, one small UI (made for Potassium)
 
     Infinite Force (same as InfiniteForce.lua v5):
       - ForceRegenMultiplier = huge      -> normal refill is instant
@@ -286,6 +286,72 @@ local function scanForSaber()
     return nil
 end
 
+------------------------------------------------------------------------
+-- Force pin (fix for "force randomly stops until I toggle it")
+--   Cause: the game's drain loop (Character component) only runs
+--     `if not (Force <= 0) then Force -= drain end`
+--   so with our negative drain it ADDS force - except when Force is exactly 0.
+--   And RechargeForce skips normal regen while the drain attribute exists.
+--   So once the bar hit 0 (a move costing more than you had, an enemy
+--   affliction draining you, etc.) nothing refilled it until you toggled
+--   (toggling clears the attribute -> RechargeForce runs -> bar refills).
+--   Fix: with getgc, find YOUR Character component and hold Force at MaxForce
+--   directly. The attributes stay on as a backup.
+------------------------------------------------------------------------
+local charComp
+local lastCharScan = 0
+
+local function isMyCharComp(t)
+    if type(t) ~= "table" then return false end
+    local ok, valid = pcall(function()
+        return type(rawget(t, "Force")) == "number"
+            and type(rawget(t, "MaxForce")) == "number"
+            and t.Instance == LocalPlayer.Character
+            and t.SetForce ~= nil
+    end)
+    return ok and valid
+end
+
+local function scanForCharComp()
+    lastCharScan = os.clock()
+    -- quickest: the saber component points at it
+    if saberComp then
+        local cc = rawget(saberComp, "CharacterComponent")
+        if isMyCharComp(cc) then return cc end
+    end
+    if type(filtergc) == "function" then
+        local ok, res = pcall(filtergc, "table", { Keys = { "Force", "MaxForce" } })
+        if ok and type(res) == "table" then
+            for _, t in pairs(res) do
+                if isMyCharComp(t) then return t end
+            end
+        end
+    end
+    if type(getgc) ~= "function" then return nil end
+    local ok, list = pcall(getgc, true)
+    if not ok or type(list) ~= "table" then return nil end
+    for _, t in ipairs(list) do
+        if isMyCharComp(t) then return t end
+    end
+    return nil
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not settings.force then return end
+    if not isMyCharComp(charComp) then
+        charComp = nil
+        if os.clock() - lastCharScan < 2 then return end
+        charComp = scanForCharComp()
+        if not charComp then return end
+        log("Infinite Force: found your character component (bar is held full)")
+    end
+    local maxF = rawget(charComp, "MaxForce")
+    if rawget(charComp, "Force") < maxF then
+        charComp.Force = maxF
+        pcall(function() charComp.SetForce:Fire(1) end)
+    end
+end))
+
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
     if not (settings.parry or settings.kick or pinBlock) then return end
@@ -454,7 +520,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "comp heh"
+title.Text = "Force + HBE"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
