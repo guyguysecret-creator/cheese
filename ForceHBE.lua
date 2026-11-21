@@ -24,7 +24,10 @@
     Infinite Parry / Infinite Kicks (need a real getgc - NOT Xeno):
       - finds your Lightsaber component in memory and keeps ParriesLeft = 5, KicksLeft = 3.
 
-    UI: draggable panel, ON/OFF switches (force, block, parry, kicks, HBE, team check),
+    Auto Parry (needs getgc; hold right-click with your saber ignited): clicks left-click
+      for you when a swing is really aimed at you - see the "Auto Parry" section below.
+
+    UI: draggable panel, ON/OFF switches (force, block, parry, kicks, auto parry, HBE, team check),
     hitbox size + transparency boxes.
     Ctrl + H hides/shows the panel.
 ]]
@@ -46,6 +49,7 @@ local settings = {
     block = false,
     parry = false,
     kick = false,
+    autoParry = false,
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
     hbeTransparency = 0.7, -- so you can see the box
@@ -354,7 +358,7 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock) then return end
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
         -- the component is rebuilt when you equip/respawn; rescan every 2s until found
@@ -461,6 +465,199 @@ local function setHBE(on)
 end
 
 ------------------------------------------------------------------------
+-- Auto Parry
+--   You hold right-click (saber ignited, state "blocking"); the script presses
+--   left-click for you when an incoming swing is really aimed at you.
+--
+--   How it detects swings: attackers' swing animations replicate to your client, so
+--   we look at every other player's Animator for one of the game's attack animations
+--   (Attack_1-4 for every form + dash attacks) and read its TimePosition.
+--
+--   A swing counts as a THREAT only if ALL of these hold:
+--     - aimed at you: attacker's facing is within ~65 deg of the line to you
+--       (stray swings at other people / at nothing are ignored)
+--     - in range: distance <= blade reach + (closing speed x (ping + reaction lead)),
+--       so fast dash attacks trigger from further away and high ping triggers earlier
+--     - committed: swing has been running >= 50ms (a feint that's cancelled instantly
+--       never gets a parry), and it isn't past ~70% of the animation (hit already done)
+--   Parry in the game stays active ~0.7s, so firing a little early is safe.
+--
+--   Multiple attackers: all threats are scored each frame, ONE parry covers every swing
+--   in that window, and each swing (animation instance) can only trigger once - so
+--   combo follow-ups are new swings and get their own check once the 1.5s cooldown ends.
+--   Baits: right before clicking the threat is re-checked; if the swing was cancelled
+--   in the meantime, that attacker gets a "bait score" that makes us wait slightly
+--   longer on their next swings.
+--   Timing: a small random delay (30-110ms, centered ~70ms) and a per-swing random
+--   +-6% on trigger distance, so it isn't frame-perfect every time.
+--
+--   Safety: never clicks unless your saber is in the BLOCKING state, you have parries
+--   left and the parry cooldown is over - otherwise a click would swing instead.
+------------------------------------------------------------------------
+local AP = {
+    REACH = 14,          -- studs: blade + arm reach of a swing
+    CONE_COS = 0.42,     -- cos(65 deg): how directly the attacker must face you
+    MIN_COMMIT = 0.05,   -- s the swing must have run (feint filter)
+    MAX_PHASE = 0.7,     -- ignore swings already past 70% of their animation
+    LEAD = 0.06,         -- extra reaction lead added to ping (s)
+    JITTER_MIN = 0.03,   -- human delay range: JITTER_MIN .. JITTER_MIN + JITTER_SPAN
+    JITTER_SPAN = 0.08,
+    DIST_VARIANCE = 0.06,
+}
+
+-- every swing animation id used by the game's forms (Shared.Modules.SaberModule.Animations)
+local ATTACK_IDS = {}
+for _, id in ipairs({
+    6317098079, 6317098902, 6317099741, 6317100331,                 -- single / double
+    6669636003, 6669636402, 6669636848, 6669637298,                 -- dual
+    6753355600, 6753356943, 6753357989, 6753358978,                 -- temple guard
+    6860766921, 6860768068, 6860769042, 6860769691,                 -- temple guard single
+    10443651597, 10443656282, 10443658943, 10443661334,             -- dark honor guard / pyke
+    73848906817428, 116587032990420, 70845951518050, 88799039982454, -- pyke
+    98442653394978, 6368651662,                                     -- dash attacks
+}) do ATTACK_IDS[tostring(id)] = true end
+
+local pingEma = 0.08
+local baitScore = {}                              -- [player] = n
+local handledSwing = setmetatable({}, { __mode = "k" }) -- swing track -> true
+local swingVariance = setmetatable({}, { __mode = "k" }) -- swing track -> random factor
+local apBusy = false
+local apLoggedFirst = false
+
+local function findAttackTrack(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+    if not ok or type(tracks) ~= "table" then return nil end
+    for _, trk in ipairs(tracks) do
+        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
+        if okId and id and ATTACK_IDS[id] then return trk end
+    end
+    return nil
+end
+
+-- is this player's current swing a real threat to us? returns eta, swingTrack
+local function assessThreat(plr, myHrp)
+    local char = plr.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum or hum.Health <= 0 then return nil end
+
+    local trk = findAttackTrack(char)
+    if not trk or handledSwing[trk] then return nil end
+
+    local okT, timePos, speed, length = pcall(function() return trk.TimePosition, trk.Speed, trk.Length end)
+    if not okT then return nil end
+    local elapsed = timePos / math.max(speed, 0.1)
+    local minCommit = AP.MIN_COMMIT + math.min(0.12, (baitScore[plr] or 0) * 0.03)
+    if elapsed < minCommit then return nil end                 -- feint filter
+    if length > 0 and timePos / length > AP.MAX_PHASE then return nil end -- hit already happened
+
+    local toMe = myHrp.Position - hrp.Position
+    local d = math.max(toMe.Magnitude, 0.01)
+    local dir = toMe / d
+    if hrp.CFrame.LookVector:Dot(dir) < AP.CONE_COS then return nil end -- not aimed at us
+
+    -- latency + speed compensation: look further out the faster they close in / the higher the ping
+    local closing = math.max((hrp.AssemblyLinearVelocity - myHrp.AssemblyLinearVelocity):Dot(dir), 0)
+    local variance = swingVariance[trk]
+    if not variance then
+        variance = 1 + (math.random() * 2 - 1) * AP.DIST_VARIANCE
+        swingVariance[trk] = variance
+    end
+    local trigger = (AP.REACH + closing * (pingEma + AP.LEAD)) * variance
+    if d > trigger then return nil end
+
+    local eta = math.max(0.25 - elapsed, 0)
+    if closing > 1 then eta = math.min(eta, math.max(d - AP.REACH, 0) / closing) end
+    return eta, trk
+end
+
+-- only true when a left-click would really PARRY (not swing)
+local function canParryNow()
+    local sc = saberComp
+    if not saberStillValid(sc) then return false end
+    local okS, state = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+    if not okS or state ~= "blocking" then return false end
+    if (rawget(sc, "ParriesLeft") or 0) <= 0 then return false end
+    local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") end)
+    if okC and onCd then return false end
+    return true
+end
+
+local function sendParryClick()
+    if type(mouse1click) == "function" and pcall(mouse1click) then return true end
+    if type(mouse1press) == "function" and type(mouse1release) == "function" then
+        if pcall(mouse1press) then
+            task.wait(0.03)
+            pcall(mouse1release)
+            return true
+        end
+    end
+    -- last resort (best effort): feed the saber's own state machine the attack input
+    return pcall(function()
+        saberComp.CombatStateMachine:Input("ATTACK", { inputState = Enum.UserInputState.Begin })
+    end)
+end
+
+track(RunService.Heartbeat:Connect(function(dt)
+    if not settings.autoParry then return end
+
+    local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if okP and type(p) == "number" then pingEma = pingEma + (p - pingEma) * math.min(1, dt * 2) end
+
+    if apBusy then return end
+    local char = LocalPlayer.Character
+    local myHrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not myHrp or not canParryNow() then return end
+
+    -- score every attacker, react to the most urgent swing
+    local bestEta, bestTrk, bestPlr
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local eta, trk = assessThreat(plr, myHrp)
+            if eta and (not bestEta or eta < bestEta) then bestEta, bestTrk, bestPlr = eta, trk, plr end
+        end
+    end
+    if not bestTrk then return end
+
+    apBusy = true
+    local delay = AP.JITTER_MIN + ((math.random() + math.random()) / 2) * AP.JITTER_SPAN * 2
+    task.delay(delay, function()
+        apBusy = false
+        if not settings.autoParry then return end
+        local c = LocalPlayer.Character
+        local hrp2 = c and c:FindFirstChild("HumanoidRootPart")
+        if not hrp2 then return end
+
+        -- bait / feint check: is it still a live, aimed, in-range swing?
+        local eta2, trk2 = assessThreat(bestPlr, hrp2)
+        if trk2 ~= bestTrk then
+            if not bestTrk.IsPlaying then baitScore[bestPlr] = (baitScore[bestPlr] or 0) + 1 end
+            return
+        end
+        if not canParryNow() then return end
+
+        -- one parry covers everyone swinging right now
+        handledSwing[bestTrk] = true
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local _, t2 = assessThreat(plr, hrp2)
+                if t2 then handledSwing[t2] = true end
+            end
+        end
+        baitScore[bestPlr] = math.max(0, (baitScore[bestPlr] or 0) - 0.5)
+
+        if sendParryClick() and not apLoggedFirst then
+            apLoggedFirst = true
+            log("Auto Parry fired (first one this session) vs " .. bestPlr.Name)
+        end
+    end)
+end))
+
+------------------------------------------------------------------------
 -- Self-heal: every 2s re-check that ON features are really applied to your
 -- CURRENT character (covers respawns, the game resetting attributes, etc.).
 -- Features never depend on the panel being visible.
@@ -504,8 +701,8 @@ local COLORS = {
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 360)
-frame.Position = UDim2.new(0, 20, 0.5, -180)
+frame.Size = UDim2.fromOffset(250, 400)
+frame.Position = UDim2.new(0, 20, 0.5, -200)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -594,8 +791,9 @@ makeSwitch(38, "Infinite Force", settings.force, setForce)
 makeSwitch(78, "Infinite Block", settings.block, setBlock)
 makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
 makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(198, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(238, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+makeSwitch(198, "Auto Parry", settings.autoParry, function(on) settings.autoParry = on end)
+makeSwitch(238, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(278, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -619,9 +817,9 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(278, "Hitbox size", "hbeSize", 2, 50)
+makeNumberBox(318, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(318, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(358, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
@@ -725,6 +923,7 @@ local function onList()
     if settings.block then table.insert(on, "Block") end
     if settings.parry then table.insert(on, "Parry") end
     if settings.kick then table.insert(on, "Kicks") end
+    if settings.autoParry then table.insert(on, "AutoParry") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
 end
@@ -758,7 +957,7 @@ end))
 local function cleanup()
     setForce(false)
     setBlock(false)
-    settings.parry, settings.kick = false, false
+    settings.parry, settings.kick, settings.autoParry = false, false, false
     setHBE(false)
     for _, c in ipairs(connections) do
         if type(c) == "thread" then
