@@ -33,6 +33,14 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local LocalPlayer = Players.LocalPlayer
+local PASSWORD = "xoSwiftyxo"
+
+if enteredPassword == PASSWORD then
+    print("Access granted")
+    -- Show authorized testing UI
+else
+    print("Incorrect password")
+end
 
 -- clean up an older copy if you re-execute
 local GUI_NAME = "ForceHBE_UI"
