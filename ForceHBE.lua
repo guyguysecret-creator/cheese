@@ -503,12 +503,8 @@ local COLORS = {
     on = Color3.fromRGB(60, 170, 90), off = Color3.fromRGB(90, 90, 100),
 }
 
-local PASSWORD = "xoSwiftyxo"
-local unlocked = false
-local lockedRows = {} -- rows that only appear after the password is entered
-
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 120)
+frame.Size = UDim2.fromOffset(250, 360)
 frame.Position = UDim2.new(0, 20, 0.5, -180)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
@@ -524,7 +520,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Swift heh"
+title.Text = "Force + HBE"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
@@ -538,13 +534,22 @@ hint.TextColor3 = COLORS.sub
 hint.Text = "Ctrl+H = hide"
 hint.Parent = frame
 
+-- everything below the title lives in `content`, which stays hidden until the
+-- password is entered
+local content = Instance.new("Frame")
+content.Size = UDim2.fromScale(1, 1)
+content.BackgroundTransparency = 1
+content.BorderSizePixel = 0
+content.Visible = false
+content.Parent = frame
+
 local function makeRow(y, labelText)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1, -16, 0, 34)
     row.Position = UDim2.fromOffset(8, y)
     row.BackgroundColor3 = COLORS.panel
     row.BorderSizePixel = 0
-    row.Parent = frame
+    row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
     local label = Instance.new("TextLabel")
@@ -583,37 +588,14 @@ local function makeSwitch(y, labelText, initial, onChanged)
         onChanged(state)
     end)
     render()
-    return row
 end
 
-local function locked(row) row.Visible = false; table.insert(lockedRows, row) end
-
--- always visible
 makeSwitch(38, "Infinite Force", settings.force, setForce)
-
--- password row (visible only while locked)
-local pwRow = makeRow(78, "Password")
-local pwBox = Instance.new("TextBox")
-pwBox.Size = UDim2.fromOffset(100, 22)
-pwBox.Position = UDim2.new(1, -108, 0.5, -11)
-pwBox.BackgroundColor3 = COLORS.bg
-pwBox.BorderSizePixel = 0
-pwBox.Font = Enum.Font.GothamBold
-pwBox.TextSize = 12
-pwBox.TextColor3 = COLORS.text
-pwBox.PlaceholderText = "enter + Enter"
-pwBox.Text = ""
-pwBox.ClearTextOnFocus = true
-pwBox.Parent = pwRow
-Instance.new("UICorner", pwBox).CornerRadius = UDim.new(0, 6)
-pwRow.Size = UDim2.new(1, -16, 0, 34)
-
--- unlocked-only features
-locked(makeSwitch(78, "Infinite Block", settings.block, setBlock))
-locked(makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end))
-locked(makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end))
-locked(makeSwitch(198, "Hitbox Expander", settings.hbe, setHBE))
-locked(makeSwitch(238, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end))
+makeSwitch(78, "Infinite Block", settings.block, setBlock)
+makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
+makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
+makeSwitch(198, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(238, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -635,25 +617,87 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
         if n then settings[key] = math.clamp(n, minV, maxV) end
         box.Text = tostring(settings[key])
     end)
-    return row
 end
 
-locked(makeNumberBox(278, "Hitbox size", "hbeSize", 2, 50))
+makeNumberBox(278, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-locked(makeNumberBox(318, "Transparency (0-1)", "hbeTransparency", 0, 1))
+makeNumberBox(318, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
-pwBox.FocusLost:Connect(function(enterPressed)
-    if unlocked then return end
-    if enterPressed and pwBox.Text == PASSWORD then
-        unlocked = true
-        pwRow.Visible = false
-        for _, r in ipairs(lockedRows) do r.Visible = true end
-        frame.Size = UDim2.fromOffset(250, 360)
+------------------------------------------------------------------------
+-- Password lock. The panel shows only this screen until the right password is
+-- typed. Only a hash is stored here, not the password itself.
+-- NOTE: this keeps casual users out of the menu; it isn't real security (anyone
+-- who reads/edits the script on GitHub can remove it).
+------------------------------------------------------------------------
+local PASSWORD_HASH = 2300189347
+local function hashPassword(s)
+    local h = 5381
+    for i = 1, #s do
+        h = bit32.bxor((h * 33) % 4294967296, string.byte(s, i))
+    end
+    return h
+end
+
+local lock = Instance.new("Frame")
+lock.Size = UDim2.new(1, 0, 1, -36)
+lock.Position = UDim2.fromOffset(0, 36)
+lock.BackgroundTransparency = 1
+lock.BorderSizePixel = 0
+lock.Parent = frame
+
+local lockLabel = Instance.new("TextLabel")
+lockLabel.Size = UDim2.new(1, -16, 0, 40)
+lockLabel.Position = UDim2.fromOffset(8, 40)
+lockLabel.BackgroundTransparency = 1
+lockLabel.Font = Enum.Font.Gotham
+lockLabel.TextSize = 13
+lockLabel.TextWrapped = true
+lockLabel.TextColor3 = COLORS.sub
+lockLabel.Text = "Locked. Enter the password to see the features."
+lockLabel.Parent = lock
+
+local pwBox = Instance.new("TextBox")
+pwBox.Size = UDim2.new(1, -16, 0, 32)
+pwBox.Position = UDim2.fromOffset(8, 96)
+pwBox.BackgroundColor3 = COLORS.panel
+pwBox.BorderSizePixel = 0
+pwBox.Font = Enum.Font.GothamBold
+pwBox.TextSize = 13
+pwBox.TextColor3 = COLORS.text
+pwBox.PlaceholderText = "Password"
+pwBox.PlaceholderColor3 = COLORS.sub
+pwBox.Text = ""
+pwBox.ClearTextOnFocus = false
+pwBox.Parent = lock
+Instance.new("UICorner", pwBox).CornerRadius = UDim.new(0, 6)
+
+local unlockBtn = Instance.new("TextButton")
+unlockBtn.Size = UDim2.new(1, -16, 0, 32)
+unlockBtn.Position = UDim2.fromOffset(8, 138)
+unlockBtn.BackgroundColor3 = COLORS.on
+unlockBtn.BorderSizePixel = 0
+unlockBtn.Font = Enum.Font.GothamBold
+unlockBtn.TextSize = 13
+unlockBtn.TextColor3 = Color3.new(1, 1, 1)
+unlockBtn.Text = "Unlock"
+unlockBtn.Parent = lock
+Instance.new("UICorner", unlockBtn).CornerRadius = UDim.new(0, 6)
+
+local function tryUnlock()
+    if hashPassword(pwBox.Text) == PASSWORD_HASH then
+        pwBox.Text = ""
+        lock.Visible = false
+        content.Visible = true
         log("unlocked")
     else
         pwBox.Text = ""
-        pwBox.PlaceholderText = "wrong password"
+        lockLabel.Text = "Wrong password."
+        lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
     end
+end
+unlockBtn.MouseButton1Click:Connect(tryUnlock)
+pwBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then tryUnlock() end
 end)
 
 -- dragging
