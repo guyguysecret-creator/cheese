@@ -503,8 +503,12 @@ local COLORS = {
     on = Color3.fromRGB(60, 170, 90), off = Color3.fromRGB(90, 90, 100),
 }
 
+local PASSWORD = "xoSwiftyxo"
+local unlocked = false
+local lockedRows = {} -- rows that only appear after the password is entered
+
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 360)
+frame.Size = UDim2.fromOffset(250, 120)
 frame.Position = UDim2.new(0, 20, 0.5, -180)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
@@ -579,14 +583,37 @@ local function makeSwitch(y, labelText, initial, onChanged)
         onChanged(state)
     end)
     render()
+    return row
 end
 
+local function locked(row) row.Visible = false; table.insert(lockedRows, row) end
+
+-- always visible
 makeSwitch(38, "Infinite Force", settings.force, setForce)
-makeSwitch(78, "Infinite Block", settings.block, setBlock)
-makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
-makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(198, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(238, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+
+-- password row (visible only while locked)
+local pwRow = makeRow(78, "Password")
+local pwBox = Instance.new("TextBox")
+pwBox.Size = UDim2.fromOffset(100, 22)
+pwBox.Position = UDim2.new(1, -108, 0.5, -11)
+pwBox.BackgroundColor3 = COLORS.bg
+pwBox.BorderSizePixel = 0
+pwBox.Font = Enum.Font.GothamBold
+pwBox.TextSize = 12
+pwBox.TextColor3 = COLORS.text
+pwBox.PlaceholderText = "enter + Enter"
+pwBox.Text = ""
+pwBox.ClearTextOnFocus = true
+pwBox.Parent = pwRow
+Instance.new("UICorner", pwBox).CornerRadius = UDim.new(0, 6)
+pwRow.Size = UDim2.new(1, -16, 0, 34)
+
+-- unlocked-only features
+locked(makeSwitch(78, "Infinite Block", settings.block, setBlock))
+locked(makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end))
+locked(makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end))
+locked(makeSwitch(198, "Hitbox Expander", settings.hbe, setHBE))
+locked(makeSwitch(238, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end))
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -608,11 +635,26 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
         if n then settings[key] = math.clamp(n, minV, maxV) end
         box.Text = tostring(settings[key])
     end)
+    return row
 end
 
-makeNumberBox(278, "Hitbox size", "hbeSize", 2, 50)
+locked(makeNumberBox(278, "Hitbox size", "hbeSize", 2, 50))
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(318, "Transparency (0-1)", "hbeTransparency", 0, 1)
+locked(makeNumberBox(318, "Transparency (0-1)", "hbeTransparency", 0, 1))
+
+pwBox.FocusLost:Connect(function(enterPressed)
+    if unlocked then return end
+    if enterPressed and pwBox.Text == PASSWORD then
+        unlocked = true
+        pwRow.Visible = false
+        for _, r in ipairs(lockedRows) do r.Visible = true end
+        frame.Size = UDim2.fromOffset(250, 360)
+        log("unlocked")
+    else
+        pwBox.Text = ""
+        pwBox.PlaceholderText = "wrong password"
+    end
+end)
 
 -- dragging
 do
