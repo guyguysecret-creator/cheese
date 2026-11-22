@@ -52,6 +52,7 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
+    parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
     antiKickKey = "K",     -- keyboard key that toggles Anti-kick (change it in the panel)
@@ -381,7 +382,7 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick) then return end
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick or settings.parryChase) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
         -- the component is rebuilt when you equip/respawn; rescan every 2s until found
@@ -522,6 +523,7 @@ end
 local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
+    ZIGZAG_STEP = 0.16,    -- stun evade: seconds between left/right direction flips
     EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
     DASH_GUARD_SPEED = 25, -- studs/s toward you that counts as "dashing at you"
     DASH_GUARD_RANGE = 70, -- studs
@@ -1250,6 +1252,41 @@ local function blockBuffer()
     end
 end
 
+local function groundedMS(ms) return ms == "idle_m" or ms == "running" end
+
+-- the game's own dash input (what pressing E does) - no OS keyboard latency
+local function sendDashInput()
+    if saberStillValid(saberComp) then
+        pcall(function()
+            saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
+        end)
+    end
+end
+
+-- every keyboard key + the mouse buttons EXCEPT right-click: bound as one "sink" above the
+-- game's own bindings while an evade/chase runs, so nothing you press can interrupt it
+local sinkInputs
+local function getSinkInputs()
+    if sinkInputs then return sinkInputs end
+    sinkInputs = {}
+    for _, k in ipairs(Enum.KeyCode:GetEnumItems()) do
+        if k ~= Enum.KeyCode.Unknown then sinkInputs[#sinkInputs + 1] = k end
+    end
+    sinkInputs[#sinkInputs + 1] = Enum.UserInputType.MouseButton1
+    sinkInputs[#sinkInputs + 1] = Enum.UserInputType.MouseButton3
+    sinkInputs[#sinkInputs + 1] = Enum.UserInputType.MouseWheel
+    return sinkInputs
+end
+local function bindSink(name)
+    pcall(function()
+        game:GetService("ContextActionService"):BindActionAtPriority(name,
+            function() return Enum.ContextActionResult.Sink end, false, 9000, table.unpack(getSinkInputs()))
+    end)
+end
+local function unbindSink(name)
+    pcall(function() game:GetService("ContextActionService"):UnbindAction(name) end)
+end
+
 local function doEvade()
     if evadeBusy or not settings.autoEvade then return end
     evadeBusy = true
@@ -1261,10 +1298,33 @@ local function doEvade()
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not hrp then evadeBusy = false return end
 
-        -- 1) DECIDE the direction, TURN instantly (character + camera: the game moves you
-        --    the way the camera points), and press the matching keys: W, plus A or D when
-        --    slipping out diagonally
-        local faceDir, moveDir, sideKey = evadePlan(hrp)
+        -- NO INPUT CAN MESS IT UP: from this moment every key and mouse button except
+        -- right-click is swallowed (and we steer the character ourselves). The game only
+        -- asks "is W down?" via UserInputService:IsKeyDown, which the sink doesn't affect.
+        bindSink("ForceHBE_EvadeSink")
+
+        -- MID-AIR: a dash can't start in the air (only from idle/running), so if you were
+        -- stunned while jumping we wait here (jump is swallowed, so spamming it can't
+        -- launch you again) and evade the moment you touch the ground
+        if not groundedMS(movementState()) then
+            local t = os.clock()
+            while os.clock() - t < 4 and settings.autoEvade and not groundedMS(movementState()) do
+                RunService.Heartbeat:Wait()
+            end
+            local okS, cs = pcall(function() return rawget(saberComp, "CombatStateMachine"):GetCurrentState() end)
+            if not (okS and cs == "stunned") then -- stun already over: nothing left to escape
+                unbindSink("ForceHBE_EvadeSink")
+                evadeBusy = false
+                return
+            end
+            char = LocalPlayer.Character
+            hrp = char and char:FindFirstChild("HumanoidRootPart")
+            hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not hrp then unbindSink("ForceHBE_EvadeSink") evadeBusy = false return end
+        end
+
+        -- 1) DECIDE the way (see evadePlan), TURN instantly (character + camera)
+        local faceDir = evadePlan(hrp)
         local prevCamType
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
         if cam then
@@ -1276,66 +1336,207 @@ local function doEvade()
             end)
         end
 
-        -- 2) NO KEY CAN MESS IT UP: a sink bound above the game's own bindings swallows
-        --    W/A/S/D (and the mouse attack button) while the evade runs, and we steer the
-        --    character ourselves every frame. (The game only asks "is W down?" through
-        --    UserInputService:IsKeyDown, which the sink does not affect.)
-        local CAS = game:GetService("ContextActionService")
-        pcall(function()
-            CAS:BindActionAtPriority("ForceHBE_EvadeSink", function() return Enum.ContextActionResult.Sink end,
-                false, 9000, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1)
-        end)
+        -- 2) ZIG-ZAG: steer 45 deg to one side (W+D / W+A feel), flip to the other side every
+        --    ZIGZAG_STEP seconds, and keep alternating for the whole dash
+        local startSide = (math.random(2) == 1) and 1 or -1
+        local zigStart = os.clock()
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
-                if hum then hum:Move(moveDir, false) end
+                if not hum then return end
+                local seg = math.floor((os.clock() - zigStart) / AP.ZIGZAG_STEP)
+                local side = (seg % 2 == 0) and startSide or -startSide
+                hum:Move(CFrame.Angles(0, math.rad(45 * side), 0):VectorToWorldSpace(faceDir), false)
             end)
         end)
 
-        if haveKeys then
-            pcall(keypress, KEY_W)
-            if sideKey then pcall(keypress, sideKey) end
-        end
+        -- 3) hold W and DASH (retry every frame for ~1.5s: right after a stun the game may
+        --    still refuse a dash for a moment)
+        if haveKeys then pcall(keypress, KEY_W) end
         RunService.RenderStepped:Wait()                          -- earliest moment the game can see the key
-        local function sendDash()
-            if saberStillValid(saberComp) then
-                pcall(function()
-                    saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
-                end)
-            end
+        for _ = 1, 90 do
+            sendDashInput()
+            RunService.RenderStepped:Wait()
+            if movementState() == "dashing" or not settings.autoEvade then break end
         end
-        sendDash()
-        -- the dash starts synchronously, so ONE frame is enough to know whether it took.
-        -- If not: try the game's input again, and if that fails too a real E tap
-        RunService.RenderStepped:Wait()
-        if movementState() ~= "dashing" then
-            sendDash()
-            if haveKeys and movementState() ~= "dashing" then
-                pcall(keypress, KEY_E)
-                task.wait(0.02)
-                pcall(keyrelease, KEY_E)
-            end
-        end
-        -- the game cancels a dash when ANY of W/A/S/D/left-click is pressed (an input
-        -- listener it adds when the dash starts). Take that listener out for this dash.
+        zigStart = os.clock() -- zig-zag starts counting from the real start of the dash
+        -- the game cancels a dash when ANY of W/A/S/D/left-click is pressed (a listener it adds
+        -- when the dash starts). Take that listener out for this dash.
         pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
         task.spawn(blockBuffer)                                  -- hold right-click => block the instant it's allowed
 
-        -- 3) steer until the dash really ends (at least 0.15s, at most 0.9s)
+        -- 4) steer until the dash really ends (at least 0.15s, at most 0.9s)
         local t0 = os.clock()
         while os.clock() - t0 < 0.9 and (os.clock() - t0 < 0.15 or movementState() == "dashing") do
             RunService.RenderStepped:Wait()
         end
 
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EvadeMove") end)
-        pcall(function() CAS:UnbindAction("ForceHBE_EvadeSink") end)
-        if haveKeys then
-            pcall(keyrelease, KEY_W)
-            if sideKey then pcall(keyrelease, sideKey) end
-        end
+        unbindSink("ForceHBE_EvadeSink")
+        if haveKeys then pcall(keyrelease, KEY_W) end
         if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end -- camera back to normal
         evadeBusy = false
     end)
+end
+
+------------------------------------------------------------------------
+-- Parry chase  (+ "cut the parry animation" so you can move right after a parry)
+--   1. Watching: right after you parry, if a nearby player's STUN animation starts, that
+--      parry worked and they're stunned.
+--   2. The rest of your parry animation is cut short (the game only lets you act normally
+--      once it finishes - that was the delay before you could chase). The server-side parry
+--      is not touched. Needs Auto Parry or Parry chase on.
+--   3. Parry chase (own switch): chase them and multi: W held, dash (the game's E input),
+--      then the dash is cancelled into a swing - exactly what left-click during a dash does
+--      - repeated every frame the game allows (dash cooldown, force and swing debounce are
+--      still the game's own). Stops AT ONCE when their stun animation ends, if they leave,
+--      die, you get stunned, or after 6s.
+------------------------------------------------------------------------
+local STUN_ANIM_IDS = { ["6297531803"] = true, ["6322313635"] = true, ["6322315386"] = true }
+local function findStunTrack(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+    if not ok or type(tracks) ~= "table" then return nil end
+    for _, trk in ipairs(tracks) do
+        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
+        if okId and id and STUN_ANIM_IDS[id] then return trk end
+    end
+    return nil
+end
+
+local function combatStateNow()
+    local sc = saberComp
+    if not saberStillValid(sc) then return nil end
+    local ok, st = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+    return ok and st or nil
+end
+
+local function cutParry()
+    local sc = saberComp
+    if not saberStillValid(sc) then return end
+    pcall(function()
+        local a = rawget(sc, "Animations").Parry
+        if a and a.IsPlaying then a:Stop(0) end -- its Stopped event ends the parrying state
+    end)
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        if combatStateNow() == "parrying" then -- didn't end by itself: finish it ourselves
+            local held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            pcall(function()
+                rawget(sc, "CombatStateMachine"):Input(held and "parry_to_block" or "parry_finished")
+            end)
+        end
+    end)
+end
+
+local chaseBusy = false
+local function startChase(plr)
+    if chaseBusy then return end
+    chaseBusy = true
+    task.spawn(function()
+        local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp then chaseBusy = false return end
+
+        local moveDir = hrp.CFrame.LookVector
+        pcall(function()
+            RunService:BindToRenderStep("ForceHBE_ChaseMove", Enum.RenderPriority.Last.Value, function()
+                if hum then hum:Move(moveDir, false) end
+            end)
+        end)
+        if haveKeys then pcall(keypress, KEY_W) end -- the dash reads "is W down?"
+
+        local t0, swung = os.clock(), false
+        while os.clock() - t0 < 6 and settings.parryChase do
+            local tc = plr.Character
+            local th = tc and tc:FindFirstChild("HumanoidRootPart")
+            local thum = tc and tc:FindFirstChildOfClass("Humanoid")
+            if not th or not thum or thum.Health <= 0 then break end
+            if not findStunTrack(tc) then break end            -- their stun ended: STOP at once
+            if combatStateNow() == "stunned" then break end    -- you got hit: stop
+            hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if not hrp then break end
+
+            -- run at where they are heading (a little ahead of their current spot)
+            local aim = th.Position + (plrVelFast[plr] or Vector3.zero) * 0.15
+            local to = Vector3.new(aim.X - hrp.Position.X, 0, aim.Z - hrp.Position.Z)
+            if to.Magnitude > 0.5 then
+                moveDir = to.Unit
+                pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + moveDir) end)
+            end
+
+            local ms = movementState()
+            if ms == "dashing" then
+                if not swung then
+                    swung = true
+                    -- left-click during a dash = dash-cancel straight into a swing
+                    local h = saberComp and rawget(saberComp, "_dashCancelHandler")
+                    if type(h) == "function" then
+                        pcall(h, true)
+                    else
+                        pcall(function()
+                            saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+                        end)
+                    end
+                end
+            else
+                swung = false
+                local sc = saberComp
+                local onCd = false
+                if saberStillValid(sc) then
+                    local okC, v = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("dash") end)
+                    onCd = okC and v
+                end
+                if not onCd then
+                    sendDashInput()                             -- W is held -> E
+                else
+                    -- dash on cooldown: keep swinging meanwhile
+                    pcall(function()
+                        saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+                    end)
+                end
+            end
+            RunService.RenderStepped:Wait()
+        end
+
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseMove") end)
+        if haveKeys then pcall(keyrelease, KEY_W) end
+        chaseBusy = false
+    end)
+end
+
+-- watch for "I just parried and the attacker got stunned"
+do
+    local wasParrying, parryAt = false, -math.huge
+    track(RunService.Heartbeat:Connect(function()
+        if not (settings.autoParry or settings.parryChase) then wasParrying = false return end
+        local parrying = combatStateNow() == "parrying"
+        if parrying and not wasParrying then parryAt = os.clock() end
+        wasParrying = parrying
+        if os.clock() - parryAt > 1.0 then return end          -- only look right after a parry
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then
+                local tc = plr.Character
+                local th = tc and tc:FindFirstChild("HumanoidRootPart")
+                if th and (th.Position - hrp.Position).Magnitude <= 30 then
+                    local trk = findStunTrack(tc)
+                    local okT, pos = pcall(function() return trk and trk.TimePosition end)
+                    if trk and okT and pos < 0.6 then            -- a FRESH stun right after my parry
+                        parryAt = -math.huge                     -- count it once
+                        cutParry()
+                        if settings.parryChase then startChase(plr) end
+                        break
+                    end
+                end
+            end
+        end
+    end))
 end
 
 track(RunService.Heartbeat:Connect(function()
@@ -1766,7 +1967,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v30"
+hint.Text = "Ctrl+H = hide  |  v31"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -1872,7 +2073,7 @@ local function makeHeader(order, text)
 end
 makeHeader(10, "RESOURCES")
 makeHeader(20, "COMBAT")
-makeHeader(30, "HITBOX EXPANDER")
+makeHeader(40, "HITBOX EXPANDER")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce)
 makeSwitch(12, "Infinite Block", settings.block, setBlock)
@@ -1891,8 +2092,8 @@ makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end)
-makeSwitch(31, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(32, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
@@ -1993,13 +2194,15 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(33, "Hitbox size", "hbeSize", 2, 50)
+makeNumberBox(43, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(34, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(44, "Transparency (0-1)", "hbeTransparency", 0, 1)
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
 makeNumberBox(29, "Parry timing (ms)", "parryOffset", -500, 500)
+-- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
+makeSwitch(30, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
@@ -2105,6 +2308,7 @@ local function onList()
     if settings.kick then table.insert(on, "Kicks") end
     if settings.autoParry then table.insert(on, "AutoParry") end
     if settings.autoEvade then table.insert(on, "AutoEvade") end
+    if settings.parryChase then table.insert(on, "ParryChase") end
     if settings.dashGuard then table.insert(on, "DashGuard") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
@@ -2141,6 +2345,7 @@ local function cleanup()
     setBlock(false)
     settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
     settings.autoEvade = false
+    settings.parryChase = false
     settings.antiKick = false
     setHBE(false)
     for _, c in ipairs(connections) do
