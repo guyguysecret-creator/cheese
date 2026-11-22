@@ -1330,7 +1330,13 @@ local antiKickStatus = "off"
 local function isKickStun(env, stunData)
     if type(stunData) ~= "table" then return false end
     local t = stunData.StunType
-    if t == 3 or t == 4 then return true end
+    if t == 3 or t == 4 then
+        -- a kick stun just arrived: open the sparks/sound cleanup window NOW, even if we
+        -- never saw the kick animation (first time an animation plays on your screen it
+        -- can arrive late while its asset loads - the stun message doesn't wait for it)
+        env.ForceHBE_LastKick = os.clock()
+        return true
+    end
     local lk = env.ForceHBE_LastKick
     return lk ~= nil and os.clock() - lk < 2.2
 end
@@ -1457,6 +1463,26 @@ end
 do
     local env = (getgenv and getgenv()) or _G
     local SoundService = game:GetService("SoundService")
+
+    -- PRELOAD the animations kicks use. The first time an animation plays on your screen
+    -- its asset has to download, so it can show up LATE - after the hit and the stun - which
+    -- is exactly "only the first kick (and the first dash-kick) gets through". Loaded now,
+    -- they play on time from the first kick on.
+    task.spawn(function()
+        local list = {}
+        for _, id in ipairs({
+            13552157283,                                  -- the kick
+            6302511048, 6302512079, 6382639524, 6392682622, -- dashes
+            6297531803, 6322313635, 6322315386,           -- stun animations
+            6322860474, 6317097513,                       -- parry, block
+        }) do
+            local a = Instance.new("Animation")
+            a.AnimationId = "rbxassetid://" .. id
+            list[#list + 1] = a
+        end
+        pcall(function() game:GetService("ContentProvider"):PreloadAsync(list) end)
+        for _, a in ipairs(list) do a:Destroy() end
+    end)
 
     -- "is a kick happening near me right now?" - ALSO published through env so the
     -- long-lived audio hook always runs the newest version of this check
@@ -1674,7 +1700,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v26"
+hint.Text = "Ctrl+H = hide  |  v27"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
