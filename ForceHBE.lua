@@ -652,7 +652,7 @@ local function getCores(char)
 end
 
 -- called once per frame: refresh every attacker's blade speed + time-to-hit
-local plrVel, plrLastPos = {}, {} -- every player's body velocity, tracked all the time
+local plrVel, plrVelFast, plrLastPos, plrPeak = {}, {}, {}, {} -- every player's body velocity, tracked all the time
 
 local function updateSwings(myHrp, dt)
     local myPos, myVel = myHrp.Position, myHrp.AssemblyLinearVelocity
@@ -668,6 +668,11 @@ local function updateSwings(myHrp, dt)
                     local v = (hrp0.Position - last) / dt
                     if v.Magnitude > 150 then v = Vector3.zero end -- respawn / teleport
                     plrVel[plr] = (plrVel[plr] or v) * 0.5 + v * 0.5
+                    -- fast-reacting version (70% newest sample): a dash takes off in 1-2
+                    -- frames and the slow average above would still read "standing still"
+                    plrVelFast[plr] = (plrVelFast[plr] or v) * 0.3 + v * 0.7
+                    -- peak speed over roughly the last 0.7s (decays), for dash-kicks
+                    plrPeak[plr] = math.max(plrVelFast[plr].Magnitude, (plrPeak[plr] or 0) * math.max(0, 1 - dt * 1.5))
                 end
                 plrLastPos[plr] = hrp0.Position
             end
@@ -814,11 +819,17 @@ local function assessThreat(plr, myHrp)
         -- 26 studs away who is not closing in can never hit, so it is NOT answered
         -- (answering it only burns the 1.5s parry cooldown, then the real kick lands).
         local tAct = math.max(AP.KICK_WINDUP - sinceStart, 0)
-        local eVel = st.eVel or Vector3.zero
+        local eVel = plrVelFast[plr] or st.eVel or Vector3.zero
         local kPred = hrp.Position + eVel * (tAct + pingEma)
         local mePred = myHrp.Position + myHrp.AssemblyLinearVelocity * tAct
         local dAct = (mePred - kPred).Magnitude
         local slack = math.min(math.min(pingEma, 0.5) * 12, 4) -- a little extra forgiveness, capped
+        -- DASH-KICK: you can only kick when you are NOT dashing, so a dash-kicker dashes in
+        -- first and kicks the moment they land. On a laggy screen that kicker is still drawn
+        -- partway through the dash (ping x dash speed studs behind where they really are),
+        -- and their speed has already dropped to ~0. So remember how fast they were going in
+        -- the last ~0.7s and allow for that much "hidden" distance.
+        local hidden = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
         -- Test 1 (geometry): is your body inside the kick's real hit box (4.5-stud cube
         -- in front of the kicker) once we add tolerance for turning / ping drift?
         local rel = hrp.CFrame:PointToObjectSpace(myHrp.Position)
@@ -827,10 +838,11 @@ local function assessThreat(plr, myHrp)
             and math.abs(rel.X) <= 2.25 + tol and math.abs(rel.Y) <= 2.25 + tol
         -- Test 2 (old rule, now ping-aware): close enough + roughly facing you
         local coneK = AP.KICK_CONE - math.min(pingEma, 0.4) * 0.8 -- laggier = more forgiving aim
-        local nearOK = dAct <= AP.KICK_RANGE + slack and (face >= coneK or d <= AP.NEAR_RANGE)
+        local inReach = dAct <= AP.KICK_RANGE + slack or d <= AP.KICK_RANGE + slack + hidden
+        local nearOK = inReach and (face >= coneK or d <= AP.NEAR_RANGE)
         if not inBox and not nearOK then
-            if dAct > AP.KICK_RANGE + slack then
-                return no(("kicker too far (%.0f studs now, ~%.0f when the kick lands)"):format(d, dAct))
+            if not inReach then
+                return no(("kicker too far (%.0f studs now, ~%.0f when the kick lands, %.0f hidden by dash+lag)"):format(d, dAct, hidden))
             end
             return no("kicker not facing you")
         end
@@ -1571,4 +1583,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 13: instant kick reaction) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 14: dash-kick fix) - Ctrl+H toggles the panel")
