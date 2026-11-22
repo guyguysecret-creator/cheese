@@ -52,6 +52,7 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
+    multiDelay = 150,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
@@ -1541,6 +1542,7 @@ local function startChase(plr)
         --     combat state is "ignited").
         local DASH_COST, MELEE, ARRIVED = 32 + 8, 7, 5
         local mode, dashFrames, cancelled = "approach", 0, false
+        local nextMultiAt = 0 -- pacing: the multi never starts a new cycle before this time
         local t0 = os.clock()
         while os.clock() - t0 < 6 and settings.parryChase do
             local tc = plr.Character
@@ -1617,13 +1619,21 @@ local function startChase(plr)
                     end
                 else
                     mode = "multi"
-                    if ready and not onCd and groundedMS(ms) and force >= DASH_COST then
-                        sendDashInput()                         -- E (W and A are held)
-                    elseif cs == "ignited" then
-                        -- dash still cooling down (or no force): keep hitting with plain swings
-                        pcall(function()
-                            sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
-                        end)
+                    -- PACING: the game would allow a new cycle every ~0.18s, which looks like a machine.
+                    -- "Multi delay" adds extra time between cycles (and +-20% randomness so the rhythm
+                    -- isn't a metronome). Set it to 0 for the fastest the game allows.
+                    if os.clock() >= nextMultiAt then
+                        local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
+                        if ready and not onCd and groundedMS(ms) and force >= DASH_COST then
+                            sendDashInput()                     -- E (W and A are held)
+                            nextMultiAt = os.clock() + 0.18 + gap
+                        elseif cs == "ignited" then
+                            -- dash still cooling down (or no force): keep hitting with plain swings
+                            pcall(function()
+                                sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+                            end)
+                            nextMultiAt = os.clock() + 0.15 + gap
+                        end
                     end
                 end
             end
@@ -3039,7 +3049,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v44"
+hint.Text = "Ctrl+H = hide  |  v45"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3464,6 +3474,7 @@ makeWhitelist(55, "ESP whitelist", "esp")
 makeNumberBox(31, "Parry timing (ms)", "parryOffset", -500, 500)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
 makeSwitch(32, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
+makeNumberBox(33, "Multi delay (ms)", "multiDelay", 0, 800)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
