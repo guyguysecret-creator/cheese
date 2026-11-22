@@ -1493,6 +1493,7 @@ do
     env.ForceHBE_InKickWindow = inWindow
     local function badSoundName(n)
         n = tostring(n):lower()
+        if n:find("woosh") or n:find("whoosh") then return false end -- the swing/kick whoosh isn't a hit sound
         return n:find("break") or n:find("stun") or n:find("kick") or n:find("hit")
             or n:find("impact") or n:find("spark") or n:find("clash")
     end
@@ -1543,7 +1544,11 @@ do
         if not hrp then return end
         local near
         if d:IsA("Sound") then
+            -- on you, stun-like name, or ANY new sound created on a part within 16 studs
+            -- (covers the victim's hit sounds when YOU are the one kicking)
+            local sp = d:FindFirstAncestorWhichIsA("BasePart")
             near = d:IsDescendantOf(char) or badSoundName(d.Name)
+                or (sp ~= nil and (sp.Position - hrp.Position).Magnitude <= 16 and not tostring(d.Name):lower():find("woosh"))
         elseif d:IsA("ParticleEmitter") or d:IsA("Sparkles") or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Trail") or d:IsA("Beam") then
             local part = d:FindFirstAncestorWhichIsA("BasePart")
             near = part and (d:IsDescendantOf(char) or (part.Position - hrp.Position).Magnitude <= 16)
@@ -1587,6 +1592,13 @@ do
     track(RunService.Heartbeat:Connect(function()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        -- WHEN YOU KICK: your own game also shows hit sparks + a hit sound on your screen.
+        -- While your saber is in its "kicking" state, keep the window open too, so the
+        -- same cleanup hides them for you (each player's script only changes their OWN screen)
+        if settings.antiKick and saberStillValid(saberComp) then
+            local okK, st = pcall(function() return rawget(saberComp, "CombatStateMachine"):GetCurrentState() end)
+            if okK and st == "kicking" then env.ForceHBE_LastKick = os.clock() end
+        end
         if inWindow() and hrp then
             frameN += 1
             for _, d in ipairs(char:GetDescendants()) do
@@ -1700,7 +1712,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v27"
+hint.Text = "Ctrl+H = hide  |  v29"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -1784,11 +1796,35 @@ local function makeSwitch(y, labelText, initial, onChanged)
     end
 end
 
-makeSwitch(38, "Infinite Force", settings.force, setForce)
-makeSwitch(78, "Infinite Block", settings.block, setBlock)
-makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
-makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(198, "Auto Parry", settings.autoParry, function(on)
+-- section headers: Resources / Combat / HBE (the number is the position in the list)
+local function makeHeader(order, text)
+    local h = Instance.new("TextLabel")
+    h.Size = UDim2.new(1, -16, 0, 18)
+    h.LayoutOrder = order
+    h.BackgroundTransparency = 1
+    h.Font = Enum.Font.GothamBold
+    h.TextSize = 11
+    h.TextColor3 = COLORS.on
+    h.TextXAlignment = Enum.TextXAlignment.Left
+    h.Text = text
+    h.Parent = content
+    -- thin line under the title
+    local line = Instance.new("Frame")
+    line.Size = UDim2.new(1, 0, 0, 1)
+    line.Position = UDim2.new(0, 0, 1, -1)
+    line.BackgroundColor3 = COLORS.off
+    line.BorderSizePixel = 0
+    line.Parent = h
+end
+makeHeader(10, "RESOURCES")
+makeHeader(20, "COMBAT")
+makeHeader(30, "HITBOX EXPANDER")
+
+makeSwitch(11, "Infinite Force", settings.force, setForce)
+makeSwitch(12, "Infinite Block", settings.block, setBlock)
+makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
+makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
+makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
         -- self-test so you can see in F9 whether everything Auto Parry needs is there
@@ -1801,26 +1837,26 @@ makeSwitch(198, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end)
-makeSwitch(238, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(278, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
-makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+makeSwitch(31, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(32, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(358, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+makeSwitch(28, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
-makeSwitch(362, "Auto evade (stun)", settings.autoEvade, function(on)
+makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
     if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
 end)
 
 -- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
-antiKickSwitch = makeSwitch(364, "Anti-kick", settings.antiKick, function(on)
+antiKickSwitch = makeSwitch(22, "Anti-kick", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end)
 do
     local warn = Instance.new("TextLabel")
     warn.Size = UDim2.new(1, -16, 0, 14)
-    warn.LayoutOrder = 365
+    warn.LayoutOrder = 23
     warn.BackgroundTransparency = 1
     warn.Font = Enum.Font.GothamMedium
     warn.TextSize = 10
@@ -1832,7 +1868,7 @@ end
 
 -- keybind row: click the button, then press the key you want (Esc cancels)
 do
-    local row = makeRow(366, "Anti-kick key")
+    local row = makeRow(24, "Anti-kick key")
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.fromOffset(46, 18)
     btn.Position = UDim2.new(1, -52, 0.5, -9)
@@ -1869,7 +1905,7 @@ do
     -- tells you whether the hooks are really in place (so you're not guessing)
     local st = Instance.new("TextLabel")
     st.Size = UDim2.new(1, -16, 0, 14)
-    st.LayoutOrder = 367
+    st.LayoutOrder = 25
     st.BackgroundTransparency = 1
     st.Font = Enum.Font.Gotham
     st.TextSize = 10
@@ -1903,13 +1939,13 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(398, "Hitbox size", "hbeSize", 2, 50)
+makeNumberBox(33, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(438, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(34, "Transparency (0-1)", "hbeTransparency", 0, 1)
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(478, "Parry timing (ms)", "parryOffset", -500, 500)
+makeNumberBox(29, "Parry timing (ms)", "parryOffset", -500, 500)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
