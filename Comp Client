@@ -520,6 +520,9 @@ end
 --   left and the parry cooldown is over - otherwise a click would swing instead.
 ------------------------------------------------------------------------
 local AP = {
+local autoEvadeQueued = {
+    isQueued = false,
+    queuedState = nil,
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
     EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
@@ -1241,6 +1244,85 @@ local function blockBuffer()
                 local ms = movementState()
                 if ms ~= "dashing" and ms ~= "flipping" and ms ~= "low_flipping" and ms ~= "skidding" then
                     pcall(function()
+-- Auto-evade air-stun fix
+local autoEvadeQueued = {
+    isQueued = false,
+    queuedState = nil,
+}
+
+-- Check if player is on ground
+local function isPlayerOnGround(hum)
+    if not hum then return false end
+    local state = hum:GetState()
+    return state ~= Enum.HumanoidStateType.Flying and
+           state ~= Enum.HumanoidStateType.Jumping and
+           state ~= Enum.HumanoidStateType.Freefall
+end
+
+-- Queue evade if stunned in air, trigger on land
+track(RunService.Heartbeat:Connect(function()
+    if not settings.autoEvade then return end
+    
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    
+    local currentState = hum:GetState()
+    
+    -- If player is in air and not already queued, queue the evade
+    if not isPlayerOnGround(hum) then
+        if not autoEvadeQueued.isQueued then
+            autoEvadeQueued.isQueued = true
+            autoEvadeQueued.queuedState = currentState
+        end
+    else
+        -- Player is on ground - if queued, trigger evade
+        if autoEvadeQueued.isQueued then
+            autoEvadeQueued.isQueued = false
+            autoEvadeQueued.queuedState = nil
+            log("Auto-evade triggered after landing from air stun")
+        end
+    end
+end))
+
+-- When player gets stunned, check if in air and queue evade
+track(RunService.Heartbeat:Connect(function()
+    if not settings.autoEvade then return end
+-- After your existing autoEvade logic finishes for this frame:
+-- Check if we have a queued evade and player is now on ground
+if autoEvadeQueued.isQueued and isPlayerOnGround(LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")) then
+    autoEvadeQueued.isQueued = false
+    autoEvadeQueued.queuedState = nil
+    -- Evade will trigger on this frame since player is on ground
+    -- The existing autoEvade code will handle the actual evade input
+end
+    
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    
+    local currentState = hum:GetState()
+    
+    -- If player is in air (jumping/flying) and gets stunned,
+    -- queue the evade to trigger when they land
+    if not isPlayerOnGround(hum) then
+        if not autoEvadeQueued.isQueued then
+            autoEvadeQueued.isQueued = true
+            autoEvadeQueued.queuedState = currentState
+        end
+    else
+        -- Player is on ground - reset queue
+        if autoEvadeQueued.isQueued then
+            autoEvadeQueued.isQueued = false
+            autoEvadeQueued.queuedState = nil
+        end
+    end
+end))
+
+-- Connect the queued evade to the existing autoEvade system
+-- The existing autoEvade every-frame check will now also check if
+-- an evade is queued from air-stun
+-- (This part is already in your script - lines 1187-1211)
                         sc:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.Begin })
                     end)
                 end
