@@ -1978,12 +1978,70 @@ do
     end))
 end
 
--- keybind: press the chosen key to toggle (set the key in the panel)
-local capturingKey = false -- true while you're choosing a new key in the panel
+------------------------------------------------------------------------
+-- KEYBINDS. A bind is plain text: "K", "Ctrl+U", "Ctrl+Shift+F5", "MB3" (middle click) or
+-- "MB4" / "MB5" (the mouse SIDE buttons). Modifiers must match exactly, so Ctrl+U does not
+-- fire on a plain U. Any toggle can register one with KB.add(getBind, onFire) and get a
+-- rebind box in the menu with KB.makeRow(order, label, settingsKey).
+-- NOTE: Roblox itself never reports the side buttons, so they are read through the
+-- executor's own iskeypressed (virtual-key 0x05 / 0x06) when it has that function.
+------------------------------------------------------------------------
+local KB = { list = {}, capturing = false, side = { { vk = 0x05, name = "MB4" }, { vk = 0x06, name = "MB5" } } }
+function KB.mods()
+    local U = UserInputService
+    return U:IsKeyDown(Enum.KeyCode.LeftControl) or U:IsKeyDown(Enum.KeyCode.RightControl),
+        U:IsKeyDown(Enum.KeyCode.LeftShift) or U:IsKeyDown(Enum.KeyCode.RightShift),
+        U:IsKeyDown(Enum.KeyCode.LeftAlt) or U:IsKeyDown(Enum.KeyCode.RightAlt)
+end
+function KB.prefix()
+    local c, s, a = KB.mods()
+    return (c and "Ctrl+" or "") .. (s and "Shift+" or "") .. (a and "Alt+" or "")
+end
+function KB.parse(spec)
+    local ctrl, shift, alt, key = false, false, false, nil
+    for part in tostring(spec):gmatch("[^+]+") do
+        local low = part:lower()
+        if low == "ctrl" then ctrl = true elseif low == "shift" then shift = true
+        elseif low == "alt" then alt = true else key = part end
+    end
+    return ctrl, shift, alt, key
+end
+function KB.match(spec, keyName)
+    local c, s, a, key = KB.parse(spec)
+    if not key or key ~= keyName then return false end
+    local mc, ms, ma = KB.mods()
+    return c == mc and s == ms and a == ma
+end
+function KB.fire(keyName)
+    if KB.capturing then return end
+    for _, b in ipairs(KB.list) do
+        local spec = b.key()
+        if spec and spec ~= "None" and KB.match(spec, keyName) then pcall(b.fire) end
+    end
+end
+function KB.add(getBind, onFire) KB.list[#KB.list + 1] = { key = getBind, fire = onFire } end
+function KB.sideDown(vk)
+    if type(iskeypressed) ~= "function" then return false end
+    local ok, v = pcall(iskeypressed, vk)
+    return ok and v == true
+end
 track(UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or capturingKey or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-    if input.KeyCode.Name == settings.antiKickKey then setAntiKick(not settings.antiKick) end
+    if processed then return end
+    if input.UserInputType == Enum.UserInputType.Keyboard then KB.fire(input.KeyCode.Name)
+    elseif input.UserInputType == Enum.UserInputType.MouseButton3 then KB.fire("MB3") end
 end))
+do
+    local was = {}
+    track(RunService.Heartbeat:Connect(function()
+        for _, s in ipairs(KB.side) do
+            local down = KB.sideDown(s.vk)
+            if down and not was[s.name] then KB.fire(s.name) end
+            was[s.name] = down
+        end
+    end))
+end
+-- Anti-kick's toggle key
+KB.add(function() return settings.antiKickKey end, function() setAntiKick(not settings.antiKick) end)
 
 ------------------------------------------------------------------------
 -- Visuals (ESP) - purely a drawing on YOUR screen; nothing is sent to the server and
@@ -2233,7 +2291,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v36"
+hint.Text = "Ctrl+H = hide  |  v37"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -2388,42 +2446,74 @@ do
     warn.Parent = content
 end
 
--- keybind row: click the button, then press the key you want (Esc cancels)
-do
-    local row = makeRow(24, "Anti-kick key")
+-- keybind row: click the box, then press the key / combo (Ctrl+U ...) / middle click / mouse
+-- side button you want. Esc cancels, Backspace/Delete clears it ("None").
+function KB.makeRow(order, labelText, settingKey)
+    local row = makeRow(order, labelText)
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(46, 18)
-    btn.Position = UDim2.new(1, -52, 0.5, -9)
+    btn.Size = UDim2.fromOffset(78, 18)
+    btn.Position = UDim2.new(1, -84, 0.5, -9)
     btn.BackgroundColor3 = COLORS.bg
     btn.BorderSizePixel = 0
     btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 10
+    btn.TextSize = 9
     btn.TextColor3 = COLORS.text
-    btn.Text = settings.antiKickKey
+    btn.TextTruncate = Enum.TextTruncate.AtEnd
+    btn.Text = tostring(settings[settingKey])
     btn.AutoButtonColor = true
     btn.Parent = row
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
 
-    local listening, conn = false, nil
+    local listening = false
     btn.MouseButton1Click:Connect(function()
         if listening then return end
         listening = true
-        capturingKey = true
-        btn.Text = "..."
-        conn = UserInputService.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
-            if conn then conn:Disconnect() conn = nil end
+        KB.capturing = true
+        btn.Text = "press..."
+        local done, conn = false, nil
+        local function stop(spec)
+            if done then return end
+            done = true
             listening = false
-            task.defer(function() capturingKey = false end) -- after the toggle listener has seen this same press
-            if input.KeyCode ~= Enum.KeyCode.Escape then
-                settings.antiKickKey = input.KeyCode.Name
+            if conn then conn:Disconnect() end
+            if spec then settings[settingKey] = spec end
+            btn.Text = tostring(settings[settingKey])
+            task.defer(function() KB.capturing = false end) -- after the toggle listener has seen this same press
+        end
+        local MODS = {
+            [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
+            [Enum.KeyCode.LeftShift] = true, [Enum.KeyCode.RightShift] = true,
+            [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.RightAlt] = true,
+        }
+        conn = UserInputService.InputBegan:Connect(function(input)
+            local ut = input.UserInputType
+            if ut == Enum.UserInputType.Keyboard then
+                local kc = input.KeyCode
+                if MODS[kc] then return end                    -- hold the modifier, then press the main key
+                if kc == Enum.KeyCode.Escape then stop(nil) return end
+                if kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then stop("None") return end
+                stop(KB.prefix() .. kc.Name)
+            elseif ut == Enum.UserInputType.MouseButton3 then
+                stop(KB.prefix() .. "MB3")
             end
-            btn.Text = settings.antiKickKey
         end)
         track(conn)
+        -- the side buttons only exist through the executor, so poll them while listening
+        task.spawn(function()
+            local was = {}
+            for _, s in ipairs(KB.side) do was[s.name] = KB.sideDown(s.vk) end
+            while not done do
+                for _, s in ipairs(KB.side) do
+                    local down = KB.sideDown(s.vk)
+                    if down and not was[s.name] then stop(KB.prefix() .. s.name) end
+                    was[s.name] = down
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
     end)
 end
-do
+KB.makeRow(24, "Anti-kick key", "antiKickKey")do
     -- tells you whether the hooks are really in place (so you're not guessing)
     local st = Instance.new("TextLabel")
     st.Size = UDim2.new(1, -16, 0, 14)
