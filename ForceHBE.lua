@@ -1337,7 +1337,12 @@ end
 
 local function installAntiKick()
     local env = (getgenv and getgenv()) or _G
-    if env.ForceHBE_KickHook2 then
+    -- The hooks below live for the whole game session and keep the code they were created
+    -- with, so they never call this copy's functions directly: they call THESE env entries,
+    -- which every (re)run of the script refreshes. That way updating the script takes effect
+    -- without rejoining (an old hook running an old version was a cause of "works 85%").
+    env.ForceHBE_IsKickStun = function(stunData) return isKickStun(env, stunData) end
+    if env.ForceHBE_KickHook3 then
         antiKickStatus = "active"
         pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end)
         return true
@@ -1367,14 +1372,16 @@ local function installAntiKick()
     local okH, err = pcall(function()
         oldHandle = hookfunction(rawget(classes.sab, "HandleSignal"), function(self, req, payload, ...)
             local s = env.ForceHBE_Settings -- always the settings of the copy currently running
-            if s and s.antiKick and req == 15 and isKickStun(env, payload) then return end -- 15 = STUN
+            local pred = env.ForceHBE_IsKickStun
+            if s and s.antiKick and req == 15 and pred and pred(payload) then return end -- 15 = STUN
             return oldHandle(self, req, payload, ...)
         end)
         if classes.fsm then
             oldInput = hookfunction(rawget(classes.fsm, "Input"), function(self, name, data, ...)
                 local s = env.ForceHBE_Settings
+                local pred = env.ForceHBE_IsKickStun
                 if s and s.antiKick and name == "stun_request" and type(data) == "table"
-                    and isKickStun(env, data.StunData) then
+                    and pred and pred(data.StunData) then
                     return false
                 end
                 return oldInput(self, name, data, ...)
@@ -1382,7 +1389,7 @@ local function installAntiKick()
         end
     end)
     if not okH then return fail("hook failed: " .. tostring(err)) end
-    env.ForceHBE_KickHook2 = true
+    env.ForceHBE_KickHook3 = true
     antiKickStatus = classes.fsm and "active" or "active (partial)"
     pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end) -- mute stun sounds too
     return true
@@ -1449,14 +1456,26 @@ end
 -- Best effort: effects the SERVER creates and shows only to others can't be touched.
 do
     local env = (getgenv and getgenv()) or _G
+    local SoundService = game:GetService("SoundService")
+
+    -- "is a kick happening near me right now?" - ALSO published through env so the
+    -- long-lived audio hook always runs the newest version of this check
     local function inWindow()
         local lk = env.ForceHBE_LastKick
         return settings.antiKick and lk ~= nil and os.clock() - lk < 2.2
     end
+    env.ForceHBE_InKickWindow = inWindow
+    local function badSoundName(n)
+        n = tostring(n):lower()
+        return n:find("break") or n:find("stun") or n:find("kick") or n:find("hit")
+            or n:find("impact") or n:find("spark") or n:find("clash")
+    end
+    env.ForceHBE_BadSound = badSoundName
 
-    -- 1) the game's own audio helper (found in memory, like the other getgc features)
+    -- 1) the game's own audio helper (found in memory, like the other getgc features).
+    --    The hook calls the env functions above, so it never goes stale.
     local function hookAudio()
-        if env.ForceHBE_AudioHook or type(hookfunction) ~= "function" then return end
+        if env.ForceHBE_AudioHook2 or type(hookfunction) ~= "function" then return end
         local audio
         local function isAudio(t)
             return type(t) == "table" and type(rawget(t, "PlaySound")) == "function"
@@ -1478,22 +1497,16 @@ do
             local fn = rawget(audio, fnName)
             if type(fn) ~= "function" then return end
             local old
-            local ok = pcall(function()
+            pcall(function()
                 old = hookfunction(fn, function(self, name, ...)
-                    local s = env.ForceHBE_Settings
-                    local lk = env.ForceHBE_LastKick
-                    if s and s.antiKick and lk and os.clock() - lk < 2.2 and type(name) == "string"
-                        and (name:lower():find("break") or name:lower():find("stun") or name:lower():find("kicked")
-                            or name:lower():find("hit") or name:lower():find("impact")) then
-                        return
-                    end
+                    local win, bad = env.ForceHBE_InKickWindow, env.ForceHBE_BadSound
+                    if win and bad and type(name) == "string" and win() and bad(name) then return end
                     return old(self, name, ...)
                 end)
             end)
-            return ok
         end
         wrap("PlaySound"); wrap("PlayLocalSound")
-        env.ForceHBE_AudioHook = true
+        env.ForceHBE_AudioHook2 = true
     end
     env.ForceHBE_HookAudio = hookAudio
 
@@ -1504,12 +1517,10 @@ do
         if not hrp then return end
         local near
         if d:IsA("Sound") then
-            local n = d.Name:lower()
-            near = d:IsDescendantOf(char) or n:find("break") or n:find("stun") or n:find("kick") or n:find("hit")
-                or n:find("impact") or n:find("spark")
+            near = d:IsDescendantOf(char) or badSoundName(d.Name)
         elseif d:IsA("ParticleEmitter") or d:IsA("Sparkles") or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Trail") or d:IsA("Beam") then
             local part = d:FindFirstAncestorWhichIsA("BasePart")
-            near = part and (d:IsDescendantOf(char) or (part.Position - hrp.Position).Magnitude <= 14)
+            near = part and (d:IsDescendantOf(char) or (part.Position - hrp.Position).Magnitude <= 16)
         end
         if near then pcall(function()
             if d:IsA("Sound") then d.Volume = 0; d:Stop() end
@@ -1521,23 +1532,61 @@ do
         if inWindow() then killFx(d) end
     end))
 
-    -- 3) switch off every ParticleEmitter already on your character while the window is open
-    local silenced = {}
+    -- 3) things that ALREADY exist (cached sounds the game replays, emitters it :Emit()s):
+    --    while the window is open, every frame
+    --      - any playing sound on you / in SoundService / near you with a stun-like name -> volume 0
+    --      - any particle emitter on you or within 16 studs -> fully transparent + disabled
+    --        (Enabled=false alone doesn't stop :Emit(); transparency does)
+    --    and everything is put back when the window closes.
+    local savedVol, savedTrans, savedEnabled = {}, {}, {}
+    local function muteSound(d, inChar)
+        if d.IsPlaying and (inChar or badSoundName(d.Name)) then
+            if savedVol[d] == nil then savedVol[d] = d.Volume end
+            d.Volume = 0
+            pcall(d.Stop, d)
+        end
+    end
+    local function hideFx(d)
+        if d:IsA("ParticleEmitter") then
+            if savedTrans[d] == nil then savedTrans[d] = d.Transparency; savedEnabled[d] = d.Enabled end
+            d.Transparency = NumberSequence.new(1)
+            d.Enabled = false
+            pcall(d.Clear, d)
+        elseif d:IsA("Sparkles") or d:IsA("Fire") or d:IsA("Smoke") then
+            if savedEnabled[d] == nil then savedEnabled[d] = d.Enabled end
+            d.Enabled = false
+        end
+    end
+    local frameN = 0
     track(RunService.Heartbeat:Connect(function()
         local char = LocalPlayer.Character
-        if inWindow() and char then
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if inWindow() and hrp then
+            frameN += 1
             for _, d in ipairs(char:GetDescendants()) do
-                if d:IsA("ParticleEmitter") and d.Enabled then
-                    silenced[d] = true
-                    d.Enabled = false
-                    d:Clear()
+                if d:IsA("Sound") then muteSound(d, true) else hideFx(d) end
+            end
+            if frameN % 2 == 0 then -- the wider sweep every other frame (it's heavier)
+                for _, d in ipairs(SoundService:GetDescendants()) do
+                    if d:IsA("Sound") then muteSound(d, false) end
+                end
+                local okP, parts = pcall(workspace.GetPartBoundsInRadius, workspace, hrp.Position, 16)
+                if okP and parts then
+                    for _, part in ipairs(parts) do
+                        if not part:IsDescendantOf(char) then
+                            for _, d in ipairs(part:GetDescendants()) do
+                                if d:IsA("Sound") then muteSound(d, false) else hideFx(d) end
+                            end
+                        end
+                    end
                 end
             end
-        elseif next(silenced) then
-            for d in pairs(silenced) do
-                if d.Parent then pcall(function() d.Enabled = true end) end
-            end
-            table.clear(silenced)
+        elseif next(savedVol) or next(savedTrans) or next(savedEnabled) then
+            for d, v in pairs(savedVol) do if d.Parent then pcall(function() d.Volume = v end) end end
+            for d, v in pairs(savedTrans) do if d.Parent then pcall(function() d.Transparency = v end) end end
+            for d, v in pairs(savedEnabled) do if d.Parent then pcall(function() d.Enabled = v end) end end
+            table.clear(savedVol); table.clear(savedTrans); table.clear(savedEnabled)
+            frameN = 0
         end
     end))
 end
@@ -1625,7 +1674,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v25"
+hint.Text = "Ctrl+H = hide  |  v26"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
