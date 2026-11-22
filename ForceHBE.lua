@@ -711,7 +711,7 @@ local function updateSwings(myHrp, dt)
                 -- remember "someone near me is kicking" for Anti-kick (unknown stun types)
                 if isKick then
                     local hk = char:FindFirstChild("HumanoidRootPart")
-                    if hk and (hk.Position - myPos).Magnitude <= 20 then
+                    if hk and (hk.Position - myPos).Magnitude <= 70 then -- 70: a dash-kicker is drawn FAR away
                         ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
                     end
                 end
@@ -1127,9 +1127,18 @@ do
                 local animator = hum and hum:WaitForChild("Animator", 10)
                 if not animator then return end
                 track(animator.AnimationPlayed:Connect(function(t)
-                    if not settings.autoParry then return end
                     local ok, id = pcall(function() return string.match(t.Animation.AnimationId, "%d+") end)
-                    if ok and id == KICK_ID then apStep(0) end
+                    if ok and id == KICK_ID then
+                        -- Anti-kick: note "a kick just started near me" the instant it does
+                        -- (event-driven, so it's set before the stun can possibly arrive)
+                        local mine = LocalPlayer.Character
+                        local mh = mine and mine:FindFirstChild("HumanoidRootPart")
+                        local kh = char:FindFirstChild("HumanoidRootPart")
+                        if mh and kh and (mh.Position - kh.Position).Magnitude <= 70 then
+                            ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
+                        end
+                        if settings.autoParry then apStep(0) end
+                    end
                 end))
             end)
         end
@@ -1145,16 +1154,44 @@ end
 --   The game gives you a short window right after you're stunned (STUN_DASH_WINDOW,
 --   0.4s) in which a force dash is still allowed - after it, dashing is blocked until
 --   the stun ends. A dash needs a movement key held (the game checks W/S with
---   UserInputService:IsKeyDown), and holding S makes it a BACK dash.
---   So the moment your saber enters the "stunned" state we: hold S, wait one frame so the
---   game sees it, then send the dash through the game's own input function (the same one
---   the E key calls); if that didn't start a dash we tap a real E as a back-up; finally
---   S is released. Needs Force for a dash (Infinite Force covers that).
+--   UserInputService:IsKeyDown), and W makes it a FORWARD dash (the way you face).
+--   So the moment your saber enters the "stunned" state we: snap your character (and the
+--   camera) around to face AWAY from the attacker, hold W, wait one frame so the game
+--   sees it, then send the dash through the game's own input function (the same one the
+--   E key calls); if that didn't start a dash we tap a real E as a back-up; finally W is
+--   released and the camera is handed back. Needs Force for a dash (Infinite Force helps).
 --   Triggered both by the state machine's StateChanged event (instant) and a per-frame
 --   check (back-up).
 ------------------------------------------------------------------------
 local evadeBusy, wasStunned, lastCSM = false, false, nil
-local KEY_S, KEY_E = 0x53, 0x45
+local KEY_W, KEY_E = 0x57, 0x45
+
+-- which way is AWAY? from whoever is attacking you (a player with a swing/kick/dash in
+-- progress first), otherwise the nearest enemy within 60 studs. Flat (no up/down).
+local function awayDirection(hrp)
+    local best, bestPri, bestD
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local ch = plr.Character
+            local h = ch and ch:FindFirstChild("HumanoidRootPart")
+            local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+            if h and hum and hum.Health > 0 then
+                local d = (h.Position - hrp.Position).Magnitude
+                local pri = swingState[plr] and 0 or 1
+                if d <= 60 and (not best or pri < bestPri or (pri == bestPri and d < bestD)) then
+                    best, bestPri, bestD = h, pri, d
+                end
+            end
+        end
+    end
+    local v
+    if best then v = Vector3.new(hrp.Position.X - best.Position.X, 0, hrp.Position.Z - best.Position.Z) end
+    if not v or v.Magnitude < 0.1 then
+        local look = hrp.CFrame.LookVector
+        v = Vector3.new(-look.X, 0, -look.Z) -- nobody near: just turn around
+    end
+    return v.Unit
+end
 
 local function movementState()
     local sc = saberComp
@@ -1168,7 +1205,28 @@ local function doEvade()
     evadeBusy = true
     task.spawn(function()
         local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
-        if haveKeys then pcall(keypress, KEY_S) end            -- hold S = backwards
+
+        -- 1) TURN AROUND instantly: face away from the attacker (character + camera, since
+        --    W moves you the way the camera points), then dash FORWARD (W) = away from them
+        local cam = workspace.CurrentCamera
+        local prevCamType
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            local away = awayDirection(hrp)
+            pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + away) end)
+            if cam then
+                pcall(function()
+                    prevCamType = cam.CameraType
+                    cam.CameraType = Enum.CameraType.Scriptable
+                    local eye = hrp.Position - away * 10 + Vector3.new(0, 4, 0)
+                    cam.CFrame = CFrame.lookAt(eye, hrp.Position + away * 20)
+                end)
+            end
+        end
+
+        -- 2) hold W (the game's dash reads "is W down?" for the direction)
+        if haveKeys then pcall(keypress, KEY_W) end
         RunService.Heartbeat:Wait()                              -- let the game see the key
         if saberStillValid(saberComp) then
             pcall(function()
@@ -1182,8 +1240,9 @@ local function doEvade()
             task.wait(0.03)
             pcall(keyrelease, KEY_E)
         end
-        task.wait(0.4)                                           -- keep S held through the dash
-        if haveKeys then pcall(keyrelease, KEY_S) end
+        task.wait(0.4)                                           -- keep W held through the dash
+        if haveKeys then pcall(keyrelease, KEY_W) end
+        if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end -- camera back to normal
         evadeBusy = false
     end)
 end
@@ -1236,7 +1295,7 @@ local function isKickStun(env, stunData)
     local t = stunData.StunType
     if t == 3 or t == 4 then return true end
     local lk = env.ForceHBE_LastKick
-    return lk ~= nil and os.clock() - lk < 1.5
+    return lk ~= nil and os.clock() - lk < 2.2
 end
 
 local function installAntiKick()
@@ -1319,7 +1378,7 @@ do
     local env = (getgenv and getgenv()) or _G
     local function inWindow()
         local lk = env.ForceHBE_LastKick
-        return settings.antiKick and lk ~= nil and os.clock() - lk < 1.5
+        return settings.antiKick and lk ~= nil and os.clock() - lk < 2.2
     end
 
     -- 1) the game's own audio helper (found in memory, like the other getgc features)
@@ -1350,7 +1409,7 @@ do
                 old = hookfunction(fn, function(self, name, ...)
                     local s = env.ForceHBE_Settings
                     local lk = env.ForceHBE_LastKick
-                    if s and s.antiKick and lk and os.clock() - lk < 1.5 and type(name) == "string"
+                    if s and s.antiKick and lk and os.clock() - lk < 2.2 and type(name) == "string"
                         and (name:lower():find("break") or name:lower():find("stun") or name:lower():find("kicked")
                             or name:lower():find("hit") or name:lower():find("impact")) then
                         return
@@ -1492,7 +1551,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v22"
+hint.Text = "Ctrl+H = hide  |  v23"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
