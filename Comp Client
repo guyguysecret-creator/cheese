@@ -57,6 +57,7 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
+    parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
     whitelist = { esp = {}, hbe = {}, parry = {} }, -- [UserId] = true: that player is skipped by that feature
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
@@ -561,6 +562,7 @@ local AP = {
     KICK_RANGE = 9,     -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
     KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
     KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
+    COUNTER_RANGE = 22,  -- Anti-kick counter: react to a kicker this close (studs), wider than Auto Parry's kick test
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
@@ -591,6 +593,28 @@ for _, id in ipairs({
 -- the kick uses the "ParryBreak" animation (Client.Components.Lightsaber.States.Combat.Kicking)
 local KICK_ID = "13552157283"
 local DASH_ID = "6302511048" -- Dash_Animation (force dash, E)
+-- FLIPS and rolls: while someone flips, their blade whips around their body - that is not a swing.
+local FLIP_IDS = {}
+for _, id in ipairs({ 6312272936, 6312274072, 6317093733, 6317094309, 6728895746 }) do FLIP_IDS[tostring(id)] = true end
+local DASH_ATK_IDS = { ["98442653394978"] = true, ["6368651662"] = true } -- the real dash-attack animations
+local plrFlip = {} -- [player] = { trk, t0 (flip first seen), last (last seen) }
+local function findFlipTrack(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+    if not ok or type(tracks) ~= "table" then return nil end
+    for _, trk in ipairs(tracks) do
+        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
+        if okId and id and FLIP_IDS[id] then return trk end
+    end
+    return nil
+end
+-- "Parry strictness" (0-100): 0 = parry on almost anything near you, 100 = only clear hits
+local function strictLerp(loose, strict)
+    local s = math.clamp((settings.parryStrict or 60) / 100, 0, 1)
+    return loose + (strict - loose) * s
+end
 
 local pingEma = 0.08
 local baitScore = {}                              -- [player] = n
@@ -721,6 +745,15 @@ local function updateSwings(myHrp, dt)
                 end
                 plrLastPos[plr] = hrp0.Position
             end
+            -- flips: remember when each player is mid-flip / roll
+            if char then
+                local ft = findFlipTrack(char)
+                if ft then
+                    local pf = plrFlip[plr]
+                    if not pf or pf.trk ~= ft then pf = { trk = ft, t0 = os.clock() }; plrFlip[plr] = pf end
+                    pf.last = os.clock()
+                end
+            end
             local trk, isKick, isUnknown, isDash
             if char then trk, isKick, isUnknown, isDash = findAttackTrack(char) end
             local old = swingState[plr]
@@ -799,6 +832,13 @@ local function updateSwings(myHrp, dt)
                 end
                 st.bodyClosing = bodyClosing
 
+                -- how close the blade's path has to come to you to count: set by "Parry strictness", and
+                -- tighter while they're airborne (a jump/flip throws the blade around without aiming it)
+                local hE = char:FindFirstChildOfClass("Humanoid")
+                local airE = hE ~= nil and hE.FloorMaterial == Enum.Material.Air
+                local pathRadius = strictLerp(5.5, 3.2) * (airE and 0.7 or 1)
+                st.air = airE
+
                 local best, missMin
                 if st.prev and #pts == #st.prev and dt > 0 then
                     for i, pt in ipairs(pts) do
@@ -821,7 +861,7 @@ local function updateSwings(myHrp, dt)
                                 -- path threat: a real swing (fast relative to THEIR body, so walking
                                 -- past you doesn't count) that passes through you
                                 if (st.swingV[i].Magnitude >= AP.MIN_SWING_SPEED or bodyClosing >= AP.DASH_CLOSING)
-                                    and miss <= AP.HIT_RADIUS
+                                    and miss <= pathRadius
                                     and relV:Dot(toMe) / math.max(toMe.Magnitude, 0.01) >= AP.MIN_CLOSING then
                                     local t = math.max(tStar - AP.BODY_RADIUS / relSpeed, 0)
                                     if not best or t < best then best = t end
@@ -905,7 +945,16 @@ local function assessThreat(plr, myHrp, forCounter)
     if st.isKick then
         -- while Anti-kick is on it answers kicks (unblock + multi); Auto Parry stays out of it
         if settings.antiKick and not forCounter then return no("Anti-kick counters kicks") end
-        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
+        if forCounter then
+            -- The counter is CHEAP to be wrong about (letting go of block costs nothing), so it casts a wide
+            -- net instead of Auto Parry's precise "will it hit me" test: any kicker within COUNTER_RANGE
+            -- (plus the distance a dash + lag hides) who isn't facing away from you.
+            local hiddenC = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
+            if d <= AP.COUNTER_RANGE + hiddenC and (face >= -0.2 or d <= AP.NEAR_RANGE) then
+                return 0, trk
+            end
+            return no("kicker too far / facing away for the counter")
+        end        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
         -- kicker's position we see is that old too. So: (1) the kick is further along than
         -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
         local sinceStart = os.clock() - st.t0 + pingEma
@@ -948,8 +997,17 @@ local function assessThreat(plr, myHrp, forCounter)
     end
 
     local elapsed = timePos / math.max(speed, 0.1)
+    -- strictness-scaled limits for the "swing animation near me" rules
+    local closeRange = strictLerp(14, 8)
+    local closeCone = strictLerp(0.45, 0.85)
+    local closeMiss = strictLerp(8, 3.5)
+    local nearRange = strictLerp(8, 5)
+    -- FLIPS: while they flip, only a swing that STARTED AFTER the flip began can be a hit
+    local pf = plrFlip[plr]
+    local flipping = pf ~= nil and (os.clock() - (pf.last or 0)) < 0.3
+    if flipping and st.t0 <= pf.t0 then return no("they're flipping - the blade whipping round isn't a swing") end
     -- up close there is almost no time, so the feint filter is much shorter there
-    local minCommit = (d <= AP.CLOSE_RANGE and AP.CLOSE_COMMIT or AP.MIN_COMMIT)
+    local minCommit = (d <= closeRange and AP.CLOSE_COMMIT or AP.MIN_COMMIT)
         + math.min(0.12, (baitScore[plr] or 0) * 0.03)
     if elapsed < minCommit then return no("too early") end                -- feint filter
     if length > 0 and timePos / length > AP.MAX_PHASE then return no("swing was nearly over") end
@@ -957,13 +1015,17 @@ local function assessThreat(plr, myHrp, forCounter)
     if d > AP.MAX_RANGE then return no(("attacker too far (%.0f studs)"):format(d)) end
     -- facing only matters at range: someone beside you can sweep the blade across you
     -- without their body facing you, so inside NEAR_RANGE the blade path decides instead
-    if face < AP.CONE_COS and d > AP.NEAR_RANGE then return no("attacker not facing you") end
+    if face < AP.CONE_COS and d > nearRange then return no("attacker not facing you") end
 
     if st.unknown and st.looksLikeParry then return no("looks like their parry (someone else is attacking them)") end
     local ttc = st.ttc
     -- DASH ATTACK: their whole body is rushing at you - no need for the blade path
     local bodyClosing = st.bodyClosing or 0
-    if not ttc and bodyClosing >= AP.DASH_CLOSING then
+    -- a DASH ATTACK needs the real dash-attack animation, or a young swing while they rush you on the ground.
+    -- (A flip also moves the body fast - that used to count as a dash attack.)
+    local isDashAtk = false
+    pcall(function() isDashAtk = DASH_ATK_IDS[string.match(trk.Animation.AnimationId, "%d+")] == true end)
+    if not ttc and bodyClosing >= AP.DASH_CLOSING and not flipping and (isDashAtk or (elapsed <= 0.35 and not st.air)) then
         ttc = math.max(d - AP.DASH_REACH, 0) / bodyClosing
     end
     -- CLOSE-RANGE RULE: slow regular swings and fast multi-hit combos right next to you
@@ -971,9 +1033,10 @@ local function assessThreat(plr, myHrp, forCounter)
     -- is the signal: attacker is near, facing you, and the blade isn't clearly going
     -- somewhere else -> parry right away. (Unknown/custom animations must show some
     -- real blade movement first.)
-    if not ttc and d <= AP.CLOSE_RANGE
-        and (face >= AP.CLOSE_CONE or d <= AP.NEAR_RANGE)
-        and (st.missMin == nil or st.missMin <= AP.CLOSE_MISS)
+    if not ttc and d <= closeRange
+        and (face >= closeCone or d <= nearRange)
+        and (st.missMin == nil or st.missMin <= closeMiss)
+        and not flipping
         and not st.unknown then -- unknown/custom animations must PROVE they swing at you (blade path), see below
         ttc = 0
     end
@@ -982,7 +1045,7 @@ local function assessThreat(plr, myHrp, forCounter)
         ttc = math.max(AP.FALLBACK_HIT - elapsed, 0)
     end
     if not ttc then
-        if d <= AP.CLOSE_RANGE then
+        if d <= closeRange then
             return no(("swing is aimed away from you (blade passes %.1f studs off)"):format(st.missMin or -1))
         end
         return no("blade not heading toward you")
@@ -1187,6 +1250,7 @@ do
                         if mh and kh and (mh.Position - kh.Position).Magnitude <= 70 then
                             ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
                         end
+                        if settings.antiKick and AP.onKick then AP.onKick(plr) end
                         if settings.autoParry then apStep(0) end
                     end
                 end))
@@ -1878,14 +1942,14 @@ local function startKickCounter(plr, kickTrk)
         antiKickStatus = "countering " .. plr.Name
         if antiKickStatusSink then antiKickStatusSink() end
 
-        -- 1) UNBLOCK: let go of block through the game's own input (a kick breaks a block)
-        if combatStateNow() == "blocking" then
+        local function unblock()
             pcall(function()
                 saberComp:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.End })
             end)
         end
+        -- 1) UNBLOCK - the very first thing, before anything else can go wrong
+        if combatStateNow() == "blocking" then unblock() end
 
-        -- steering + the W + A held for the multi (same approach as the Parry chase)
         local moveDir = hrp.CFrame.LookVector
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_CounterMove", Enum.RenderPriority.Last.Value, function()
@@ -1897,108 +1961,120 @@ local function startKickCounter(plr, kickTrk)
             pcall(keypress, KEY_A)
         end
 
-        local lastTPos, tVel, lastTime = nil, Vector3.zero, os.clock()
-        local DASH_COST, MELEE = 32 + 8, (settings.hbe and 7 or 5)
-        local dashFrames, cancelled, nextMultiAt = 0, false, 0
-        local function sendAttack()
-            pcall(function()
-                saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
-            end)
-        end
-        local function faceTarget()
-            if settings.hbe or not lastTPos or not hrp then return end
-            pcall(function()
-                local pos = hrp.Position
-                hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
-            end)
-        end
-
-        local t0 = os.clock()
-        while os.clock() - t0 < 2.5 and settings.antiKick do
-            local tc = plr.Character
-            local th = tc and tc:FindFirstChild("HumanoidRootPart")
-            local thum = tc and tc:FindFirstChildOfClass("Humanoid")
-            local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-            if not th or not thum or thum.Health <= 0 or not mh then break end
-            hrp = mh
-
-            -- STOP when their kick animation is over (we see it one ping late, so ping is subtracted)
-            local okK, playing, rem = pcall(function()
-                return kickTrk.IsPlaying, (kickTrk.Length - kickTrk.TimePosition) / math.max(kickTrk.Speed, 0.05)
-            end)
-            if not okK or not playing then break end
-            local remEff = (type(rem) == "number") and (rem - pingEma) or 9
-            if remEff <= 0.05 then break end
-            local canDash, canSwing = remEff >= 0.3, remEff >= 0.12
-            local cs = combatStateNow()
-            if cs == "stunned" then break end                  -- the kick got you anyway: stop
-
-            -- where they are / are heading
-            local now = os.clock()
-            local dt = math.max(now - lastTime, 1 / 240)
-            lastTime = now
-            if lastTPos then tVel = tVel * 0.4 + ((th.Position - lastTPos) / dt) * 0.6 end
-            lastTPos = th.Position
-            local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
-            local lead = math.min(dist / 60, 0.4)
-            local center = th.Position + tVel * lead
-            -- aim at their FLANK (the side I'm already on), not the cube in front of them
-            local look = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
-            look = look.Magnitude > 0.05 and look.Unit or Vector3.new(0, 0, -1)
-            local right = Vector3.new(th.CFrame.RightVector.X, 0, th.CFrame.RightVector.Z)
-            right = right.Magnitude > 0.05 and right.Unit or Vector3.new(1, 0, 0)
-            local mySide = (right:Dot(Vector3.new(mh.Position.X - th.Position.X, 0, mh.Position.Z - th.Position.Z)) >= 0) and 1 or -1
-            local aimPoint = (dist > 6) and (center + right * mySide * 4.5 - look * 1.5) or center
-            local to = Vector3.new(aimPoint.X - mh.Position.X, 0, aimPoint.Z - mh.Position.Z)
-            if to.Magnitude > 0.5 then moveDir = to.Unit end
-
-            local ms = movementState()
-            local sc = saberComp
-            local force = 0
-            if saberStillValid(sc) then
-                local okF, f = pcall(function() return rawget(rawget(sc, "CharacterComponent"), "Force") end)
-                force = okF and f or 0
+        -- Everything that can fail runs inside pcall, and the clean-up below ALWAYS runs. (Before, one
+        -- error in the middle left "counterBusy" stuck on, which silently disabled Anti-kick for the
+        -- rest of the session - a likely cause of "works sometimes".)
+        local okRun, errRun = pcall(function()
+            local lastTPos, tVel, lastTime = nil, Vector3.zero, os.clock()
+            local DASH_COST, MELEE = 32 + 8, (settings.hbe and 7 or 5)
+            local dashFrames, cancelled, nextMultiAt = 0, false, 0
+            local function sendAttack()
+                pcall(function()
+                    saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+                end)
             end
-            local ready = (cs == "ignited")                     -- we've let go of block, so "ignited" is what we want
+            local function faceTarget()
+                if settings.hbe or not lastTPos or not hrp then return end
+                pcall(function()
+                    local pos = hrp.Position
+                    hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
+                end)
+            end
 
-            if ms == "dashing" then
-                dashFrames += 1
-                pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
-                -- the dash runs its full length toward the flank; once on them, it becomes a swing
-                if not cancelled and dashFrames >= 2 and ready and dist <= MELEE and canSwing then
-                    cancelled = true
-                    faceTarget()
-                    local h = rawget(sc, "_dashCancelHandler")
-                    if type(h) == "function" then pcall(h, true) else sendAttack() end
-                end
-            else
-                dashFrames, cancelled = 0, false
-                local onCd = false
+            local t0 = os.clock()
+            while os.clock() - t0 < 2.5 and settings.antiKick do
+                local tc = plr.Character
+                local th = tc and tc:FindFirstChild("HumanoidRootPart")
+                local thum = tc and tc:FindFirstChildOfClass("Humanoid")
+                local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not th or not thum or thum.Health <= 0 or not mh then break end
+                hrp = mh
+
+                -- STOP when their kick animation is over (we see it one ping late, so ping is subtracted)
+                local okK, playing, rem = pcall(function()
+                    return kickTrk.IsPlaying, (kickTrk.Length - kickTrk.TimePosition) / math.max(kickTrk.Speed, 0.05)
+                end)
+                if not okK or not playing then break end
+                local remEff = (type(rem) == "number") and (rem - pingEma) or 9
+                if remEff <= 0.05 then break end
+                local canDash, canSwing = remEff >= 0.25, remEff >= 0.1
+                local cs = combatStateNow()
+                if cs == "stunned" then break end              -- the kick got you anyway: stop
+                -- the game puts you straight back into block after a swing while the block button is
+                -- still held - so keep letting go for as long as the counter runs
+                if cs == "blocking" then unblock() end
+
+                -- where they are / are heading
+                local now = os.clock()
+                local dt = math.max(now - lastTime, 1 / 240)
+                lastTime = now
+                if lastTPos then tVel = tVel * 0.4 + ((th.Position - lastTPos) / dt) * 0.6 end
+                lastTPos = th.Position
+                local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
+                local lead = math.min(dist / 60, 0.4)
+                local center = th.Position + tVel * lead
+                -- aim at their FLANK (the side I'm already on), not the cube in front of them
+                local look = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
+                look = look.Magnitude > 0.05 and look.Unit or Vector3.new(0, 0, -1)
+                local right = Vector3.new(th.CFrame.RightVector.X, 0, th.CFrame.RightVector.Z)
+                right = right.Magnitude > 0.05 and right.Unit or Vector3.new(1, 0, 0)
+                local mySide = (right:Dot(Vector3.new(mh.Position.X - th.Position.X, 0, mh.Position.Z - th.Position.Z)) >= 0) and 1 or -1
+                local aimPoint = (dist > 6) and (center + right * mySide * 4.5 - look * 1.5) or center
+                local to = Vector3.new(aimPoint.X - mh.Position.X, 0, aimPoint.Z - mh.Position.Z)
+                if to.Magnitude > 0.5 then moveDir = to.Unit end
+
+                local ms = movementState()
+                local sc = saberComp
+                local force = 0
                 if saberStillValid(sc) then
-                    local okC, v = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("dash") end)
-                    onCd = okC and v or false
+                    local okF, f = pcall(function() return rawget(rawget(sc, "CharacterComponent"), "Force") end)
+                    force = okF and f or 0
                 end
-                if dist > MELEE then
-                    if ready and not onCd and groundedMS(ms) and force >= 32 and canDash then
-                        sendDashInput()                         -- close the gap with a full dash
-                    end
-                elseif os.clock() >= nextMultiAt and canSwing then
-                    -- MULTI, paced like the Parry chase ("Multi delay")
-                    local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
-                    if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
-                        faceTarget()
-                        sendDashInput()
-                        nextMultiAt = os.clock() + 0.18 + gap
-                    elseif ready then
-                        faceTarget()
-                        sendAttack()
-                        nextMultiAt = os.clock() + 0.15 + gap
-                    end
-                end
-            end
-            RunService.RenderStepped:Wait()
-        end
+                -- a dash can start from "ignited" OR "blocking" (the dash itself cancels block); a swing needs "ignited"
+                local dashReady = (cs == "ignited" or cs == "blocking")
+                local swingReady = (cs == "ignited")
 
+                if ms == "dashing" then
+                    dashFrames += 1
+                    pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
+                    -- the dash runs its full length toward the flank; once on them, it becomes a swing
+                    if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE and canSwing then
+                        cancelled = true
+                        faceTarget()
+                        local h = rawget(sc, "_dashCancelHandler")
+                        if type(h) == "function" then pcall(h, true) else sendAttack() end
+                    end
+                else
+                    dashFrames, cancelled = 0, false
+                    local onCd = false
+                    if saberStillValid(sc) then
+                        local okC, v = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("dash") end)
+                        onCd = okC and v or false
+                    end
+                    if dist > MELEE then
+                        if dashReady and not onCd and groundedMS(ms) and force >= 32 and canDash then
+                            sendDashInput()                     -- close the gap with a full dash
+                        end
+                    elseif os.clock() >= nextMultiAt and canSwing then
+                        -- MULTI, paced like the Parry chase ("Multi delay")
+                        local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
+                        if dashReady and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
+                            faceTarget()
+                            sendDashInput()
+                            nextMultiAt = os.clock() + 0.18 + gap
+                        elseif swingReady then
+                            faceTarget()
+                            sendAttack()
+                            nextMultiAt = os.clock() + 0.15 + gap
+                        end
+                    end
+                end
+                RunService.RenderStepped:Wait()
+            end
+        end)
+        if not okRun then warn("[ForceHBE] kick counter error: " .. tostring(errRun)) end
+
+        -- ALWAYS clean up
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_CounterMove") end)
         if haveKeys then
             pcall(keyrelease, KEY_W)
@@ -2010,23 +2086,33 @@ local function startKickCounter(plr, kickTrk)
     end)
 end
 
--- watch for a kick that is about to land on you and counter it (once per kick)
-track(RunService.Heartbeat:Connect(function()
+-- ONE place that decides "counter this kick?" - used by the per-frame watcher AND (instantly) by the
+-- AnimationPlayed hook the moment a kick animation starts on anyone
+local function tryCounterKick(plr)
     if not settings.antiKick or counterBusy then return end
     local me = LocalPlayer.Character
     local mh = me and me:FindFirstChild("HumanoidRootPart")
     if not mh then return end
+    local st = swingState[plr]
+    if st and st.isKick and not countered[st.trk] then
+        local eta, trk = assessThreat(plr, mh, true)
+        if eta and trk == st.trk then startKickCounter(plr, trk) end
+    end
+end
+-- instant path: refresh the blade/animation state (dt 0 = no velocity update) and decide right now
+AP.onKick = function(plr)
+    if not settings.antiKick or counterBusy then return end
+    local me = LocalPlayer.Character
+    local mh = me and me:FindFirstChild("HumanoidRootPart")
+    if not mh then return end
+    pcall(updateSwings, mh, 0)
+    tryCounterKick(plr)
+end
+-- per-frame path (covers everything the instant path missed)
+track(RunService.Heartbeat:Connect(function()
+    if not settings.antiKick or counterBusy then return end
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local st = swingState[plr]
-            if st and st.isKick and not countered[st.trk] then
-                local eta, trk = assessThreat(plr, mh, true)
-                if eta and trk == st.trk then
-                    startKickCounter(plr, trk)
-                    break
-                end
-            end
-        end
+        if plr ~= LocalPlayer then tryCounterKick(plr) end
     end
 end))
 -- Auto Evade, EARLY trigger: hook the exact spot where the server's stun message arrives
@@ -3092,7 +3178,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v51"
+hint.Text = "Ctrl+H = hide  |  v53"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3354,10 +3440,10 @@ makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
 makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 makeSwitch(27, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end)
 makeWhitelist(28, "Parry whitelist", "parry")
-makeSwitch(29, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+makeSwitch(30, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(30, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+makeSwitch(31, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
 makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
@@ -3514,12 +3600,14 @@ makeWhitelist(55, "ESP whitelist", "esp")
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(31, "Parry timing (ms)", "parryOffset", -500, 500)
+makeNumberBox(32, "Parry timing (ms)", "parryOffset", -500, 500)
+-- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
+makeNumberBox(29, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-makeSwitch(32, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
-makeNumberBox(33, "Multi delay (ms)", "multiDelay", 0, 800)
+makeSwitch(33, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
+makeNumberBox(34, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
-makeSwitch(34, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
+makeSwitch(35, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
