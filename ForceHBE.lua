@@ -52,6 +52,7 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
+    autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
     antiKickKey = "K",     -- keyboard key that toggles Anti-kick (change it in the panel)
     parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping)
@@ -380,7 +381,7 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.antiKick) then return end
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
         -- the component is rebuilt when you equip/respawn; rescan every 2s until found
@@ -707,6 +708,13 @@ local function updateSwings(myHrp, dt)
                 swingState[plr] = nil
             else
                 local st = swingState[plr]
+                -- remember "someone near me is kicking" for Anti-kick (unknown stun types)
+                if isKick then
+                    local hk = char:FindFirstChild("HumanoidRootPart")
+                    if hk and (hk.Position - myPos).Magnitude <= 20 then
+                        ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
+                    end
+                end
                 if not st or st.trk ~= trk then
                     st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil,
                            isKick = isKick, unknown = isUnknown, isDash = isDash, t0 = os.clock(), maxSwing = 0 }
@@ -997,7 +1005,15 @@ end
 
 local apStep
 track(RunService.Heartbeat:Connect(function(dt)
-    if not settings.autoParry then return end
+    if not settings.autoParry then
+        -- Anti-kick alone still needs to SEE kicks (to know which stuns are kick stuns)
+        if settings.antiKick then
+            local c = LocalPlayer.Character
+            local h = c and c:FindFirstChild("HumanoidRootPart")
+            if h then updateSwings(h, dt) end
+        end
+        return
+    end
 
     local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if okP and type(p) == "number" then
@@ -1125,6 +1141,76 @@ do
 end
 
 ------------------------------------------------------------------------
+-- Auto Evade
+--   The game gives you a short window right after you're stunned (STUN_DASH_WINDOW,
+--   0.4s) in which a force dash is still allowed - after it, dashing is blocked until
+--   the stun ends. A dash needs a movement key held (the game checks W/S with
+--   UserInputService:IsKeyDown), and holding S makes it a BACK dash.
+--   So the moment your saber enters the "stunned" state we: hold S, wait one frame so the
+--   game sees it, then send the dash through the game's own input function (the same one
+--   the E key calls); if that didn't start a dash we tap a real E as a back-up; finally
+--   S is released. Needs Force for a dash (Infinite Force covers that).
+--   Triggered both by the state machine's StateChanged event (instant) and a per-frame
+--   check (back-up).
+------------------------------------------------------------------------
+local evadeBusy, wasStunned, lastCSM = false, false, nil
+local KEY_S, KEY_E = 0x53, 0x45
+
+local function movementState()
+    local sc = saberComp
+    if not saberStillValid(sc) then return nil end
+    local ok, st = pcall(function() return rawget(sc, "MovementStateMachine"):GetCurrentState() end)
+    return ok and st or nil
+end
+
+local function doEvade()
+    if evadeBusy or not settings.autoEvade then return end
+    evadeBusy = true
+    task.spawn(function()
+        local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
+        if haveKeys then pcall(keypress, KEY_S) end            -- hold S = backwards
+        RunService.Heartbeat:Wait()                              -- let the game see the key
+        if saberStillValid(saberComp) then
+            pcall(function()
+                saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
+            end)
+        end
+        RunService.Heartbeat:Wait()
+        RunService.Heartbeat:Wait()
+        if haveKeys and movementState() ~= "dashing" then       -- didn't take: real E tap
+            pcall(keypress, KEY_E)
+            task.wait(0.03)
+            pcall(keyrelease, KEY_E)
+        end
+        task.wait(0.4)                                           -- keep S held through the dash
+        if haveKeys then pcall(keyrelease, KEY_S) end
+        evadeBusy = false
+    end)
+end
+
+track(RunService.Heartbeat:Connect(function()
+    if not settings.autoEvade then wasStunned = false return end
+    local sc = saberComp
+    if not saberStillValid(sc) then return end
+    local okS, csm = pcall(function() return rawget(sc, "CombatStateMachine") end)
+    if not okS or not csm then return end
+    -- instant path: react the moment the state machine switches to "stunned"
+    if csm ~= lastCSM then
+        lastCSM = csm
+        pcall(function()
+            track(csm.StateChanged:Connect(function(state)
+                if state == "stunned" and settings.autoEvade then doEvade() end
+            end))
+        end)
+    end
+    -- back-up path: per-frame check
+    local okG, state = pcall(function() return csm:GetCurrentState() end)
+    local stunned = okG and state == "stunned"
+    if stunned and not wasStunned then doEvade() end
+    wasStunned = stunned
+end))
+
+------------------------------------------------------------------------
 -- Anti-kick
 --   When a kick lands, the SERVER sends your game a "stun" message (type BLOCK_KICKED
 --   or PARRY_KICKED) and your game then puts you in the Stunned state: you can't act
@@ -1132,50 +1218,77 @@ end
 --   that receives that message) and drops those two stun types, so on YOUR screen you
 --   simply aren't stunned and keep full control.
 --   Honest limits: the server still decided the kick connected, so your block/parry
---   state or any damage on the server side is not undone, and if the server also locks
---   your actions while "stunned" you may still be blocked from some of them. It does
---   not turn a landed kick into a real parry - that can't be done from the client.
+--   state or any damage on the server side is not undone, and it does NOT stun the
+--   kicker (only a real parry does that). If the server also locks your actions while
+--   "stunned" you may still be blocked from some of them.
 --   Needs hookfunction + getgc (same as the other getgc features).
 ------------------------------------------------------------------------
+-- Anti-kick v2. Two hooks, so no path into the stunned state is left open:
+--   (1) Lightsaber:HandleSignal  - where the server's stun message arrives
+--   (2) FiniteStateMachine:Input - the "stun_request" that actually enters Stunned
+--       (that is the thing that plays the stun animation + BlockBreak sound)
+-- A stun counts as a KICK stun if its type is BLOCK_KICKED/PARRY_KICKED (3/4), OR if a
+-- kick animation was seen on someone within ~20 studs of you in the last 1.5s (covers
+-- kicks on an un-blocking player, whose stun type we don't know).
+local antiKickStatus = "off"
+local function isKickStun(env, stunData)
+    if type(stunData) ~= "table" then return false end
+    local t = stunData.StunType
+    if t == 3 or t == 4 then return true end
+    local lk = env.ForceHBE_LastKick
+    return lk ~= nil and os.clock() - lk < 1.5
+end
+
 local function installAntiKick()
     local env = (getgenv and getgenv()) or _G
-    -- each (re)run of this script points the hook's notifier at ITS log
-    env.ForceHBE_KickNotify = function(stunType)
-        logP("kick-stun", "Anti-kick: ignored a " .. (stunType == 3 and "block-breaking" or "parry-breaking") .. " kick stun")
-    end
-    if env.ForceHBE_KickHooked then return true end
-    if type(hookfunction) ~= "function" then return false, "your executor has no hookfunction" end
-    if not saberStillValid(saberComp) then return false, "lightsaber component not found yet (equip + ignite your saber)" end
-    local okC, class = pcall(function()
+    if env.ForceHBE_KickHook2 then antiKickStatus = "active" return true end
+    local function fail(why) antiKickStatus = "NOT active: " .. why return false, why end
+    if type(hookfunction) ~= "function" then return fail("no hookfunction in this executor") end
+    if not saberStillValid(saberComp) then return fail("saber not found (equip + ignite it)") end
+    local okC, classes = pcall(function()
         local mt = getmetatable(saberComp)
-        if type(mt) ~= "table" then return nil end
-        if type(rawget(mt, "HandleSignal")) == "function" then return mt end
-        if type(mt.__index) == "table" and type(rawget(mt.__index, "HandleSignal")) == "function" then return mt.__index end
-        return nil
+        local sabClass
+        if type(mt) == "table" then
+            if type(rawget(mt, "HandleSignal")) == "function" then sabClass = mt
+            elseif type(mt.__index) == "table" and type(rawget(mt.__index, "HandleSignal")) == "function" then sabClass = mt.__index end
+        end
+        local fsmClass
+        local csm = rawget(saberComp, "CombatStateMachine")
+        local fm = csm and getmetatable(csm)
+        if type(fm) == "table" then
+            if type(rawget(fm, "Input")) == "function" then fsmClass = fm
+            elseif type(fm.__index) == "table" and type(rawget(fm.__index, "Input")) == "function" then fsmClass = fm.__index end
+        end
+        return { sab = sabClass, fsm = fsmClass }
     end)
-    if not okC or not class then return false, "couldn't find the saber class (HandleSignal)" end
-    local fn = rawget(class, "HandleSignal")
-    local old
+    if not okC or not classes.sab then return fail("couldn't find HandleSignal") end
+
+    local oldHandle, oldInput
     local okH, err = pcall(function()
-        old = hookfunction(fn, function(self, req, payload, ...)
-            local s = env.ForceHBE_Settings
-            if s and s.antiKick and req == 15 and type(payload) == "table" then -- 15 = STUN
-                local t = payload.StunType
-                if t == 3 or t == 4 then -- BLOCK_KICKED / PARRY_KICKED
-                    local n = env.ForceHBE_KickNotify
-                    if n then pcall(n, t) end
-                    return
-                end
-            end
-            return old(self, req, payload, ...)
+        oldHandle = hookfunction(rawget(classes.sab, "HandleSignal"), function(self, req, payload, ...)
+            local s = env.ForceHBE_Settings -- always the settings of the copy currently running
+            if s and s.antiKick and req == 15 and isKickStun(env, payload) then return end -- 15 = STUN
+            return oldHandle(self, req, payload, ...)
         end)
+        if classes.fsm then
+            oldInput = hookfunction(rawget(classes.fsm, "Input"), function(self, name, data, ...)
+                local s = env.ForceHBE_Settings
+                if s and s.antiKick and name == "stun_request" and type(data) == "table"
+                    and isKickStun(env, data.StunData) then
+                    return false
+                end
+                return oldInput(self, name, data, ...)
+            end)
+        end
     end)
-    if not okH then return false, "hook failed: " .. tostring(err) end
-    env.ForceHBE_KickHooked = true
+    if not okH then return fail("hook failed: " .. tostring(err)) end
+    env.ForceHBE_KickHook2 = true
+    antiKickStatus = classes.fsm and "active" or "active (partial)"
     return true
 end
 
 local antiKickSwitch -- set by the UI so the key can flip the on-screen switch too
+local antiKickStatusSink -- set by the UI: shows antiKickStatus under the key row
 local function setAntiKick(on)
     settings.antiKick = on
     if antiKickSwitch then antiKickSwitch(on, true) end
@@ -1184,8 +1297,10 @@ local function setAntiKick(on)
         if ok then log("Anti-kick ON - kick stuns are ignored on your screen")
         else log("Anti-kick ON but not active yet: " .. tostring(why) .. " (retrying every 2s)") end
     else
+        antiKickStatus = "off"
         log("Anti-kick OFF")
     end
+    if antiKickStatusSink then antiKickStatusSink() end
 end
 
 -- keybind: press the chosen key to toggle (set the key in the panel)
@@ -1212,13 +1327,9 @@ track(task.spawn(function()
             if settings.block and blockMode == "delete" and blockHookedChar ~= char then
                 blockDeleteHook(char)
             end
-            if settings.antiKick then
-                local ok = installAntiKick()
-                local env = (getgenv and getgenv()) or _G
-                if ok and not env.ForceHBE_KickLogged then
-                    env.ForceHBE_KickLogged = true
-                    log("Anti-kick is active")
-                end
+            if settings.antiKick then -- keeps retrying until it can hook
+                installAntiKick()
+                if antiKickStatusSink then antiKickStatusSink() end
             end
         end
     end
@@ -1274,7 +1385,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v17"
+hint.Text = "Ctrl+H = hide  |  v21"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -1381,15 +1492,29 @@ makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
 makeSwitch(358, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+-- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
+makeSwitch(362, "Auto evade (stun)", settings.autoEvade, function(on) settings.autoEvade = on end)
 
--- Anti-kick: toggle here or with its key (rebindable right below)
-antiKickSwitch = makeSwitch(362, "Anti-kick", settings.antiKick, function(on)
+-- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
+antiKickSwitch = makeSwitch(364, "Anti-kick", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end)
+do
+    local warn = Instance.new("TextLabel")
+    warn.Size = UDim2.new(1, -16, 0, 14)
+    warn.LayoutOrder = 365
+    warn.BackgroundTransparency = 1
+    warn.Font = Enum.Font.GothamMedium
+    warn.TextSize = 10
+    warn.TextColor3 = Color3.fromRGB(230, 150, 80)
+    warn.TextXAlignment = Enum.TextXAlignment.Left
+    warn.Text = "  (Very blatant - use at your own discretion)"
+    warn.Parent = content
+end
 
 -- keybind row: click the button, then press the key you want (Esc cancels)
 do
-    local row = makeRow(364, "Anti-kick key")
+    local row = makeRow(366, "Anti-kick key")
     local btn = Instance.new("TextButton")
     btn.Size = UDim2.fromOffset(46, 18)
     btn.Position = UDim2.new(1, -52, 0.5, -9)
@@ -1421,6 +1546,21 @@ do
         end)
         track(conn)
     end)
+end
+do
+    -- tells you whether the hooks are really in place (so you're not guessing)
+    local st = Instance.new("TextLabel")
+    st.Size = UDim2.new(1, -16, 0, 14)
+    st.LayoutOrder = 367
+    st.BackgroundTransparency = 1
+    st.Font = Enum.Font.Gotham
+    st.TextSize = 10
+    st.TextColor3 = COLORS.sub
+    st.TextXAlignment = Enum.TextXAlignment.Left
+    st.TextTruncate = Enum.TextTruncate.AtEnd
+    st.Parent = content
+    antiKickStatusSink = function() st.Text = "  anti-kick: " .. antiKickStatus end
+    antiKickStatusSink()
 end
 
 -- number boxes (type a value, press Enter or click away)
@@ -1556,6 +1696,7 @@ local function onList()
     if settings.parry then table.insert(on, "Parry") end
     if settings.kick then table.insert(on, "Kicks") end
     if settings.autoParry then table.insert(on, "AutoParry") end
+    if settings.autoEvade then table.insert(on, "AutoEvade") end
     if settings.dashGuard then table.insert(on, "DashGuard") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
@@ -1591,6 +1732,7 @@ local function cleanup()
     setForce(false)
     setBlock(false)
     settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
+    settings.autoEvade = false
     settings.antiKick = false
     setHBE(false)
     for _, c in ipairs(connections) do
