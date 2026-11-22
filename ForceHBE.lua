@@ -1271,14 +1271,44 @@ do
     local selected = {}   -- [player name] = true ; empty = show everything
     local nSelected = 0
 
+    -- Own window (NOT inside the menu), so it can't end up below the edge of your screen.
+    -- Starts at the bottom-left, drag it anywhere. Shows/hides with the menu (Ctrl+H) and
+    -- only after you've unlocked.
     local box = Instance.new("Frame")
-    box.Size = UDim2.new(1, 0, 0, 190)
-    box.Position = UDim2.new(0, 0, 1, 6)
+    box.Size = UDim2.fromOffset(300, 190)
+    box.AnchorPoint = Vector2.new(0, 1)
+    box.Position = UDim2.new(0, 20, 1, -20)
     box.BackgroundColor3 = COLORS.bg
-    box.BackgroundTransparency = 0.15
+    box.BackgroundTransparency = 0.1
     box.BorderSizePixel = 0
-    box.Parent = content
+    box.Active = true
+    box.Visible = false
+    box.Parent = gui
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+
+    local function syncVisible() box.Visible = frame.Visible and content.Visible end
+    frame:GetPropertyChangedSignal("Visible"):Connect(syncVisible)
+    content:GetPropertyChangedSignal("Visible"):Connect(syncVisible)
+    syncVisible()
+
+    -- drag the box by its empty space / text area
+    do
+        local dragging, dragStart, startPos
+        box.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+                dragging, dragStart, startPos = true, input.Position, box.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then dragging = false end
+                end)
+            end
+        end)
+        track(UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+                local d = input.Position - dragStart
+                box.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end))
+    end
 
     -- "Track: ..." button that opens the player list
     local pick = Instance.new("TextButton")
@@ -1475,4 +1505,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 10: player filter) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 11: player filter box) - Ctrl+H toggles the panel")
