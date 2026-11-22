@@ -54,6 +54,9 @@ local settings = {
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
+    espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
+    parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
+    whitelist = { esp = {}, hbe = {}, parry = {} }, -- [UserId] = true: that player is skipped by that feature
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
@@ -426,8 +429,19 @@ end))
 local BOX_NAME = "HBE_Box"
 local boxes = {} -- [character] = box part
 
+-- whitelists (per feature) and a plain "same team?" test, shared by HBE / Auto Parry / ESP
+local function inWhitelist(listName, plr)
+    local wl = settings.whitelist and settings.whitelist[listName]
+    return wl ~= nil and wl[plr.UserId] == true
+end
+local function sameTeam(plr)
+    local mine = LocalPlayer.Team
+    return mine ~= nil and plr.Team == mine
+end
+
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
+    if inWhitelist("hbe", plr) then return false end        -- HBE whitelist: no expanded hitbox on them
     if not settings.teamCheck then return true end
     if LocalPlayer.Team == nil or plr.Team == nil then return true end
     return plr.Team ~= LocalPlayer.Team
@@ -838,6 +852,8 @@ end
 
 -- is this player's current swing a real threat to us? returns urgency (lower = sooner), swingTrack
 local function assessThreat(plr, myHrp)
+    -- Auto Parry never reacts to whitelisted players (or teammates, when its team check is on)
+    if inWhitelist("parry", plr) or (settings.parryTeamCheck and sameTeam(plr)) then return nil end
     local char = plr.Character
     if not char then return nil end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -2006,10 +2022,17 @@ function KB.parse(spec)
     end
     return ctrl, shift, alt, key
 end
+KB.modKey = {
+    LeftControl = "c", RightControl = "c", LeftShift = "s", RightShift = "s", LeftAlt = "a", RightAlt = "a",
+}
 function KB.match(spec, keyName)
     local c, s, a, key = KB.parse(spec)
     if not key or key ~= keyName then return false end
     local mc, ms, ma = KB.mods()
+    -- when the bind itself IS a modifier key (e.g. "RightControl"), that key being held down
+    -- is the bind - not an extra modifier
+    local own = KB.modKey[keyName]
+    if own == "c" then mc = false elseif own == "s" then ms = false elseif own == "a" then ma = false end
     return c == mc and s == ms and a == ma
 end
 function KB.fire(keyName)
@@ -2026,9 +2049,27 @@ function KB.sideDown(vk)
     return ok and v == true
 end
 track(UserInputService.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if input.UserInputType == Enum.UserInputType.Keyboard then KB.fire(input.KeyCode.Name)
-    elseif input.UserInputType == Enum.UserInputType.MouseButton3 then KB.fire("MB3") end
+    local ut = input.UserInputType
+    if ut == Enum.UserInputType.Keyboard then
+        if not processed then KB.fire(input.KeyCode.Name) end
+        return
+    end
+    local name = (ut == Enum.UserInputType.MouseButton1 and "MB1")
+        or (ut == Enum.UserInputType.MouseButton2 and "MB2")
+        or (ut == Enum.UserInputType.MouseButton3 and "MB3")
+    if not name then return end
+    -- the game "processes" its own left/right-click controls, so mouse binds can't wait for an
+    -- unprocessed click; instead ignore clicks that land on this menu
+    local f = KB.guiFrame
+    if f and f.Visible then
+        local ok, inside = pcall(function()
+            local m = UserInputService:GetMouseLocation() - game:GetService("GuiService"):GetGuiInset()
+            local ap, as = f.AbsolutePosition, f.AbsoluteSize
+            return m.X >= ap.X and m.X <= ap.X + as.X and m.Y >= ap.Y and m.Y <= ap.Y + as.Y
+        end)
+        if ok and inside then return end
+    end
+    KB.fire(name)
 end))
 do
     local was = {}
@@ -2067,6 +2108,7 @@ do
     local objs = {}                                         -- [character] = ui pieces
     local seenTrack = setmetatable({}, { __mode = "k" })    -- animation tracks we already timed
     local parryAt, kickAt = {}, {}                          -- [player] = when we saw it start
+    local parryVerdict = {}                                 -- [player] = { at = parryAt, v = "hit"/"wasted" }
 
     local function removeOne(char)
         local o = objs[char]
@@ -2108,7 +2150,7 @@ do
         gui.Name = "ForceHBE_ESPGui"
         gui.Adornee = char:FindFirstChild("Head") or hrp
         gui.AlwaysOnTop = true
-        gui.Size = UDim2.fromOffset(150, 58)
+        gui.Size = UDim2.fromOffset(150, 72)
         gui.StudsOffset = Vector3.new(0, 2.8, 0)
         gui.MaxDistance = 600
         gui.Parent = char
@@ -2116,8 +2158,8 @@ do
         local o = { hl = hl, gui = gui }
         o.name = label(gui, 0, 14, 12, true)
         local bg = Instance.new("Frame")
-        bg.Size = UDim2.new(0.8, 0, 0, 6)
-        bg.Position = UDim2.new(0.1, 0, 0, 16)
+        bg.Size = UDim2.new(0.86, 0, 0, 11)
+        bg.Position = UDim2.new(0.07, 0, 0, 16)
         bg.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
         bg.BackgroundTransparency = 0.25
         bg.BorderSizePixel = 0
@@ -2129,9 +2171,23 @@ do
         fill.BorderSizePixel = 0
         fill.Parent = bg
         o.fill = fill
-        o.status = label(gui, 25, 14, 11, true)
-        o.cd = label(gui, 39, 13, 10, false)
-        o.cd.TextColor3 = Color3.fromRGB(255, 210, 90)
+        -- health PERCENTAGE written on the bar
+        local pct = Instance.new("TextLabel")
+        pct.Size = UDim2.fromScale(1, 1)
+        pct.BackgroundTransparency = 1
+        pct.Font = Enum.Font.GothamBold
+        pct.TextSize = 9
+        pct.TextColor3 = Color3.new(1, 1, 1)
+        pct.TextStrokeTransparency = 0.3
+        pct.Text = ""
+        pct.ZIndex = 3
+        pct.Parent = bg
+        o.pct = pct
+        o.status = label(gui, 30, 14, 11, true)
+        o.cd = label(gui, 44, 13, 10, true)    -- stun timer / kick cooldown
+        o.cd.TextColor3 = Color3.fromRGB(120, 220, 255)
+        o.cd2 = label(gui, 57, 13, 10, true)   -- parry result + parry cooldown
+        o.cd2.TextColor3 = Color3.fromRGB(255, 210, 90)
         objs[char] = o
         return o
     end
@@ -2148,18 +2204,46 @@ do
         local me = LocalPlayer.Character
         local myHrp = me and me:FindFirstChild("HumanoidRootPart")
         local seen = {}
+
+        -- 1) everyone who should be drawn, nearest first
+        local list = {}
         for _, plr in ipairs(Players:GetPlayers()) do
             local char = plr.Character
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if plr ~= LocalPlayer and hrp and hum and hum.Health > 0 and isEnemy(plr) then
-                seen[char] = true
-                local o = objs[char] or build(char)
+            if plr ~= LocalPlayer and hrp and hum and hum.Health > 0
+                and (not settings.espTeamCheck or not sameTeam(plr)) and not inWhitelist("esp", plr) then
+                list[#list + 1] = { plr = plr, char = char, hrp = hrp, hum = hum,
+                    d = myHrp and (hrp.Position - myHrp.Position).Magnitude or 0 }
+            end
+        end
+        table.sort(list, function(a, b) return a.d < b.d end)
+
+        -- 2) draw each one. Three things that used to break the ESP for players who just joined
+        --    or just respawned are handled here:
+        --    * the game / a respawn can destroy or re-parent the outline + bar we attached to a
+        --      character -> every tick we check they're still attached and rebuild if not
+        --    * the bar's anchor (the head) is replaced while a character loads -> re-pointed every tick
+        --    * Roblox only draws ~31 outlines at once, so in a full server the LAST players in the
+        --      list lost theirs -> only the 25 NEAREST get an outline (everyone keeps the info bar)
+        --    * one player's error can't stop the loop for the players after them any more (pcall)
+        for rank, e in ipairs(list) do
+            local plr, char, hrp, hum = e.plr, e.char, e.hrp, e.hum
+            seen[char] = true
+            pcall(function()
+                local o = objs[char]
+                if o and (not o.hl.Parent or not o.gui.Parent or o.hl.Parent ~= char or o.gui.Parent ~= char) then
+                    removeOne(char)
+                    o = nil
+                end
+                o = o or build(char)
                 if o then
+                    o.hl.Adornee = char
+                    o.gui.Adornee = char:FindFirstChild("Head") or hrp
                     local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
                     -- outline: red, yellow when they're low (easy to spot who to finish)
                     local low = frac < 0.3
-                    o.hl.Enabled = settings.espOutline
+                    o.hl.Enabled = settings.espOutline and rank <= 25
                     local c = low and Color3.fromRGB(255, 225, 60) or Color3.fromRGB(255, 40, 40)
                     o.hl.OutlineColor, o.hl.FillColor = c, c
                     o.gui.Enabled = settings.espInfo
@@ -2168,6 +2252,7 @@ do
                         o.name.Text = ("%s  %dm"):format(plr.DisplayName ~= "" and plr.DisplayName or plr.Name, math.floor(dist))
                         o.fill.Size = UDim2.fromScale(frac, 1)
                         o.fill.BackgroundColor3 = Color3.fromHSV(frac * 0.33, 0.85, 0.95) -- green -> red
+                        o.pct.Text = ("%d%%"):format(math.floor(frac * 100 + 0.5))
                         -- what are they doing right now?
                         local status, parrying, blocking = "", false, false
                         local ok, tracks = pcall(function()
@@ -2199,16 +2284,63 @@ do
                         o.status.TextColor3 = (status == "STUNNED") and Color3.fromRGB(120, 220, 255)
                             or (status == "BLOCKING" or status == "PARRYING") and Color3.fromRGB(150, 170, 255)
                             or Color3.fromRGB(255, 120, 120)
-                        -- estimated cooldowns
-                        local parts = {}
-                        local pl = parryAt[plr] and (PARRY_CD - (os.clock() - parryAt[plr]))
-                        if pl and pl > 0 then parts[#parts + 1] = ("Parry %.1fs"):format(pl) end
+                        -- STUN TIMER. A stunned player's stun animation is played so that its length equals the
+                        -- stun length (Stunned state: speed = animation length / stun time), so what's left of
+                        -- the animation IS the time left in the stun.
+                        local line1 = {}
+                        if stunTrk then
+                            local okS, rem = pcall(function()
+                                return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
+                            end)
+                            if okS and rem and rem > 0 then
+                                line1[#line1 + 1] = ("STUN %.1fs"):format(math.min(rem, 3))
+                            end
+                        end
+                        -- kick cooldown (estimated from when we saw the kick start)
                         local kl = kickAt[plr] and (KICK_CD - (os.clock() - kickAt[plr]))
-                        if kl and kl > 0 then parts[#parts + 1] = ("Kick %.1fs"):format(kl) end
-                        o.cd.Text = (#parts > 0) and ("CD (est): " .. table.concat(parts, "  ")) or ""
+                        if kl and kl > 0 then line1[#line1 + 1] = ("Kick CD %.1fs"):format(kl) end
+                        o.cd.Text = table.concat(line1, "  ")
+
+                        -- PARRY: did it hit anything, or was it WASTED?  A parry that works stuns whoever it
+                        -- caught, so within ~0.9s of their parry we look for someone near them in a stun
+                        -- (that includes you, if you're the one who got parried). Nobody stunned = wasted.
+                        local line2 = ""
+                        local pa = parryAt[plr]
+                        if pa then
+                            local el = os.clock() - pa
+                            local verdict = parryVerdict[plr]
+                            if not verdict or verdict.at ~= pa then
+                                verdict = { at = pa, v = nil }
+                                parryVerdict[plr] = verdict
+                            end
+                            if not verdict.v then
+                                local caught = false
+                                if combatStateNow() == "stunned" and myHrp and (myHrp.Position - hrp.Position).Magnitude <= 25 then
+                                    caught = true
+                                end
+                                if not caught then
+                                    for _, other in ipairs(Players:GetPlayers()) do
+                                        local oc = other ~= plr and other ~= LocalPlayer and other.Character
+                                        local oh = oc and oc:FindFirstChild("HumanoidRootPart")
+                                        if oh and (oh.Position - hrp.Position).Magnitude <= 25 and findStunTrack(oc) then
+                                            caught = true
+                                            break
+                                        end
+                                    end
+                                end
+                                if caught then verdict.v = "hit" elseif el >= 0.9 then verdict.v = "wasted" end
+                            end
+                            local left = PARRY_CD - el
+                            if left > 0 then
+                                local word = (verdict.v == "wasted") and "Parry WASTED" or (verdict.v == "hit") and "Parry hit" or "Parry..."
+                                line2 = ("%s - CD %.1fs"):format(word, left)
+                                o.cd2.TextColor3 = (verdict.v == "wasted") and Color3.fromRGB(255, 190, 60) or Color3.fromRGB(160, 200, 255)
+                            end
+                        end
+                        o.cd2.Text = line2
                     end
                 end
-            end
+            end)
         end
         for char in pairs(objs) do
             if not seen[char] or not char.Parent then removeOne(char) end
@@ -2257,479 +2389,12 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 local okSet = pcall(function() gui.Parent = parentGui end)
 if not okSet then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
-local COLORS = {
-    bg = Color3.fromRGB(24, 24, 28), panel = Color3.fromRGB(34, 34, 40),
-    text = Color3.fromRGB(235, 235, 240), sub = Color3.fromRGB(150, 150, 160),
-    on = Color3.fromRGB(60, 170, 90), off = Color3.fromRGB(90, 90, 100),
-}
-
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(210, 320) -- compact; the rows scroll (mouse wheel)
-frame.Position = UDim2.new(0, 20, 0.5, -160)
-frame.BackgroundColor3 = COLORS.bg
-frame.BorderSizePixel = 0
-frame.Active = true
-frame.Parent = gui
-Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
-
-local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -16, 0, 26)
-title.Position = UDim2.fromOffset(8, 2)
-title.BackgroundTransparency = 1
-title.Font = Enum.Font.GothamBold
-title.TextSize = 13
-title.TextXAlignment = Enum.TextXAlignment.Left
-title.TextColor3 = COLORS.text
-title.Text = "Comp Client"
-title.Parent = frame
-
-local hint = Instance.new("TextLabel")
-hint.Size = UDim2.new(1, -16, 0, 26)
-hint.Position = UDim2.fromOffset(8, 2)
-hint.BackgroundTransparency = 1
-hint.Font = Enum.Font.Gotham
-hint.TextSize = 10
-hint.TextXAlignment = Enum.TextXAlignment.Right
-hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v37"
-hint.Parent = frame
-
--- everything below the title lives in `content`, which stays hidden until the
--- password is entered
--- a scrolling list: mouse wheel (or drag the thin bar) to scroll; rows stack in the order
--- they're created (the first number given to makeRow/makeSwitch is just the sort order)
-local content = Instance.new("ScrollingFrame")
-content.Size = UDim2.new(1, 0, 1, -30)
-content.Position = UDim2.fromOffset(0, 30)
-content.BackgroundTransparency = 1
-content.BorderSizePixel = 0
-content.ScrollBarThickness = 4
-content.ScrollBarImageColor3 = COLORS.sub
-content.ScrollingDirection = Enum.ScrollingDirection.Y
-content.CanvasSize = UDim2.new(0, 0, 0, 0)
-content.AutomaticCanvasSize = Enum.AutomaticSize.Y
-content.Visible = false
-content.Parent = frame
-do
-    local layout = Instance.new("UIListLayout")
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 4)
-    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
-    layout.Parent = content
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 2), UDim.new(0, 8)
-    pad.Parent = content
-end
-
-local function makeRow(y, labelText)
-    local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -16, 0, 26)
-    row.LayoutOrder = y
-    row.BackgroundColor3 = COLORS.panel
-    row.BorderSizePixel = 0
-    row.Parent = content
-    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -70, 1, 0)
-    label.Position = UDim2.fromOffset(8, 0)
-    label.BackgroundTransparency = 1
-    label.Font = Enum.Font.Gotham
-    label.TextSize = 11
-    label.TextTruncate = Enum.TextTruncate.AtEnd
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextColor3 = COLORS.text
-    label.Text = labelText
-    label.Parent = row
-    return row
-end
-
-local function makeSwitch(y, labelText, initial, onChanged)
-    local row = makeRow(y, labelText)
-    local state = initial
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(46, 18)
-    btn.Position = UDim2.new(1, -52, 0.5, -9)
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 10
-    btn.TextColor3 = Color3.new(1, 1, 1)
-    btn.AutoButtonColor = true
-    btn.Parent = row
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
-    local function render()
-        btn.Text = state and "ON" or "OFF"
-        btn.BackgroundColor3 = state and COLORS.on or COLORS.off
-    end
-    btn.MouseButton1Click:Connect(function()
-        state = not state
-        render()
-        onChanged(state)
-    end)
-    render()
-    -- lets other code (e.g. a keybind) flip this switch: setter(on, skipCallback)
-    return function(on, skipCallback)
-        state = on
-        render()
-        if not skipCallback then onChanged(on) end
-    end
-end
-
--- section headers: Resources / Combat / HBE (the number is the position in the list)
-local function makeHeader(order, text)
-    local h = Instance.new("TextLabel")
-    h.Size = UDim2.new(1, -16, 0, 18)
-    h.LayoutOrder = order
-    h.BackgroundTransparency = 1
-    h.Font = Enum.Font.GothamBold
-    h.TextSize = 11
-    h.TextColor3 = COLORS.on
-    h.TextXAlignment = Enum.TextXAlignment.Left
-    h.Text = text
-    h.Parent = content
-    -- thin line under the title
-    local line = Instance.new("Frame")
-    line.Size = UDim2.new(1, 0, 0, 1)
-    line.Position = UDim2.new(0, 0, 1, -1)
-    line.BackgroundColor3 = COLORS.off
-    line.BorderSizePixel = 0
-    line.Parent = h
-end
-makeHeader(10, "RESOURCES")
-makeHeader(20, "COMBAT")
-makeHeader(40, "HITBOX EXPANDER")
-makeHeader(50, "VISUALS")
-
-makeSwitch(11, "Infinite Force", settings.force, setForce)
-makeSwitch(12, "Infinite Block", settings.block, setBlock)
-makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
-makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
-    settings.autoParry = on
-    if on then
-        -- self-test so you can see in F9 whether everything Auto Parry needs is there
-        task.delay(2.5, function()
-            if not settings.autoParry then return end
-            log(("Auto Parry ON | lightsaber component: %s | click function: %s | live ping %.0f ms"):format(
-                saberStillValid(saberComp) and "found" or "NOT FOUND (equip + ignite your saber; needs getgc)",
-                (type(mouse1click) == "function" or type(mouse1press) == "function") and "yes" or "NO (executor has no mouse1click)",
-                pingEma * 1000))
-        end)
-    end
-end)
-makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
-makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
--- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
--- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(28, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
--- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
-makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
-    settings.autoEvade = on
-    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
-end)
-
--- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
-antiKickSwitch = makeSwitch(22, "Anti-kick", settings.antiKick, function(on)
-    if on ~= settings.antiKick then setAntiKick(on) end
-end)
-do
-    local warn = Instance.new("TextLabel")
-    warn.Size = UDim2.new(1, -16, 0, 14)
-    warn.LayoutOrder = 23
-    warn.BackgroundTransparency = 1
-    warn.Font = Enum.Font.GothamMedium
-    warn.TextSize = 10
-    warn.TextColor3 = Color3.fromRGB(230, 150, 80)
-    warn.TextXAlignment = Enum.TextXAlignment.Left
-    warn.Text = "  (*Warning* - Blatant)"
-    warn.Parent = content
-end
-
--- keybind row: click the box, then press the key / combo (Ctrl+U ...) / middle click / mouse
--- side button you want. Esc cancels, Backspace/Delete clears it ("None").
-function KB.makeRow(order, labelText, settingKey)
-    local row = makeRow(order, labelText)
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(78, 18)
-    btn.Position = UDim2.new(1, -84, 0.5, -9)
-    btn.BackgroundColor3 = COLORS.bg
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 9
-    btn.TextColor3 = COLORS.text
-    btn.TextTruncate = Enum.TextTruncate.AtEnd
-    btn.Text = tostring(settings[settingKey])
-    btn.AutoButtonColor = true
-    btn.Parent = row
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
-    local listening = false
-    btn.MouseButton1Click:Connect(function()
-        if listening then return end
-        listening = true
-        KB.capturing = true
-        btn.Text = "press..."
-        local done, conn = false, nil
-        local function stop(spec)
-            if done then return end
-            done = true
-            listening = false
-            if conn then conn:Disconnect() end
-            if spec then settings[settingKey] = spec end
-            btn.Text = tostring(settings[settingKey])
-            task.defer(function() KB.capturing = false end) -- after the toggle listener has seen this same press
-        end
-        local MODS = {
-            [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
-            [Enum.KeyCode.LeftShift] = true, [Enum.KeyCode.RightShift] = true,
-            [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.RightAlt] = true,
-        }
-        conn = UserInputService.InputBegan:Connect(function(input)
-            local ut = input.UserInputType
-            if ut == Enum.UserInputType.Keyboard then
-                local kc = input.KeyCode
-                if MODS[kc] then return end                    -- hold the modifier, then press the main key
-                if kc == Enum.KeyCode.Escape then stop(nil) return end
-                if kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then stop("None") return end
-                stop(KB.prefix() .. kc.Name)
-            elseif ut == Enum.UserInputType.MouseButton3 then
-                stop(KB.prefix() .. "MB3")
-            end
-        end)
-        track(conn)
-        -- the side buttons only exist through the executor, so poll them while listening
-        task.spawn(function()
-            local was = {}
-            for _, s in ipairs(KB.side) do was[s.name] = KB.sideDown(s.vk) end
-            while not done do
-                for _, s in ipairs(KB.side) do
-                    local down = KB.sideDown(s.vk)
-                    if down and not was[s.name] then stop(KB.prefix() .. s.name) end
-                    was[s.name] = down
-                end
-                RunService.Heartbeat:Wait()
-            end
-        end)
-    end)
-end
-KB.makeRow(24, "Anti-kick key", "antiKickKey")do
-    -- tells you whether the hooks are really in place (so you're not guessing)
-    local st = Instance.new("TextLabel")
-    st.Size = UDim2.new(1, -16, 0, 14)
-    st.LayoutOrder = 25
-    st.BackgroundTransparency = 1
-    st.Font = Enum.Font.Gotham
-    st.TextSize = 10
-    st.TextColor3 = COLORS.sub
-    st.TextXAlignment = Enum.TextXAlignment.Left
-    st.TextTruncate = Enum.TextTruncate.AtEnd
-    st.Parent = content
-    antiKickStatusSink = function() st.Text = "  anti-kick: " .. antiKickStatus end
-    antiKickStatusSink()
-end
-
--- number boxes (type a value, press Enter or click away)
-local function makeNumberBox(y, labelText, key, minV, maxV)
-    local row = makeRow(y, labelText)
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.fromOffset(46, 18)
-    box.Position = UDim2.new(1, -52, 0.5, -9)
-    box.BackgroundColor3 = COLORS.bg
-    box.BorderSizePixel = 0
-    box.Font = Enum.Font.GothamBold
-    box.TextSize = 10
-    box.TextColor3 = COLORS.text
-    box.Text = tostring(settings[key])
-    box.ClearTextOnFocus = false
-    box.Parent = row
-    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
-    box.FocusLost:Connect(function()
-        local n = tonumber(box.Text)
-        if n then settings[key] = math.clamp(n, minV, maxV) end
-        box.Text = tostring(settings[key])
-    end)
-end
-
-makeNumberBox(43, "Hitbox size", "hbeSize", 2, 50)
--- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(44, "Transparency (0-1)", "hbeTransparency", 0, 1)
-
--- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
-makeSwitch(51, "ESP (through walls)", settings.esp, function(on) settings.esp = on end)
-makeSwitch(52, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end)
-makeSwitch(53, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end)
--- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
--- parry too LATE (you get hit first) -> lower it (negative is fine).
--- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(29, "Parry timing (ms)", "parryOffset", -500, 500)
--- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-makeSwitch(30, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
-
-------------------------------------------------------------------------
--- Password lock. The panel shows only this screen until the right password is
--- typed. Only a hash is stored here, not the password itself.
--- NOTE: this keeps casual users out of the menu; it isn't real security (anyone
--- who reads/edits the script on GitHub can remove it).
-------------------------------------------------------------------------
-local PASSWORD_HASH = 1815920161
-local function hashPassword(s)
-    local h = 5381
-    for i = 1, #s do
-        h = bit32.bxor((h * 33) % 4294967296, string.byte(s, i))
-    end
-    return h
-end
-
-local lock = Instance.new("Frame")
-lock.Size = UDim2.new(1, 0, 1, -36)
-lock.Position = UDim2.fromOffset(0, 36)
-lock.BackgroundTransparency = 1
-lock.BorderSizePixel = 0
-lock.Parent = frame
-
-local lockLabel = Instance.new("TextLabel")
-lockLabel.Size = UDim2.new(1, -16, 0, 40)
-lockLabel.Position = UDim2.fromOffset(8, 40)
-lockLabel.BackgroundTransparency = 1
-lockLabel.Font = Enum.Font.Gotham
-lockLabel.TextSize = 13
-lockLabel.TextWrapped = true
-lockLabel.TextColor3 = COLORS.sub
-lockLabel.Text = "Locked. Enter the password to see the features."
-lockLabel.Parent = lock
-
-local pwBox = Instance.new("TextBox")
-pwBox.Size = UDim2.new(1, -16, 0, 32)
-pwBox.Position = UDim2.fromOffset(8, 96)
-pwBox.BackgroundColor3 = COLORS.panel
-pwBox.BorderSizePixel = 0
-pwBox.Font = Enum.Font.GothamBold
-pwBox.TextSize = 13
-pwBox.TextColor3 = COLORS.text
-pwBox.PlaceholderText = "Password"
-pwBox.PlaceholderColor3 = COLORS.sub
-pwBox.Text = ""
-pwBox.ClearTextOnFocus = false
-pwBox.Parent = lock
-Instance.new("UICorner", pwBox).CornerRadius = UDim.new(0, 6)
-
-local unlockBtn = Instance.new("TextButton")
-unlockBtn.Size = UDim2.new(1, -16, 0, 32)
-unlockBtn.Position = UDim2.fromOffset(8, 138)
-unlockBtn.BackgroundColor3 = COLORS.on
-unlockBtn.BorderSizePixel = 0
-unlockBtn.Font = Enum.Font.GothamBold
-unlockBtn.TextSize = 13
-unlockBtn.TextColor3 = Color3.new(1, 1, 1)
-unlockBtn.Text = "Unlock"
-unlockBtn.Parent = lock
-Instance.new("UICorner", unlockBtn).CornerRadius = UDim.new(0, 6)
-
-local function tryUnlock()
-    if hashPassword(pwBox.Text) == PASSWORD_HASH then
-        pwBox.Text = ""
-        lock.Visible = false
-        content.Visible = true
-        log("unlocked")
-    else
-        pwBox.Text = ""
-        lockLabel.Text = "Wrong password."
-        lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
-    end
-end
-unlockBtn.MouseButton1Click:Connect(tryUnlock)
-pwBox.FocusLost:Connect(function(enterPressed)
-    if enterPressed then tryUnlock() end
-end)
-
--- dragging
-do
-    local dragging, dragStart, startPos
-    frame.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging, dragStart, startPos = true, input.Position, frame.Position
-            input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then dragging = false end
-            end)
-        end
-    end)
-    track(UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
-            local d = input.Position - dragStart
-            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
-        end
-    end))
-end
-
-local function onList()
-    local on = {}
-    if settings.force then table.insert(on, "Force") end
-    if settings.block then table.insert(on, "Block") end
-    if settings.parry then table.insert(on, "Parry") end
-    if settings.kick then table.insert(on, "Kicks") end
-    if settings.autoParry then table.insert(on, "AutoParry") end
-    if settings.autoEvade then table.insert(on, "AutoEvade") end
-    if settings.parryChase then table.insert(on, "ParryChase") end
-    if settings.dashGuard then table.insert(on, "DashGuard") end
-    if settings.hbe then table.insert(on, "HBE") end
-    return #on > 0 and table.concat(on, ", ") or "nothing"
-end
-
---[[
-    Ctrl + H fully hides/shows the menu - nothing is left on screen.
-    Glitch-proofing:
-      - Hiding ONLY flips `frame.Visible`. No feature reads the panel, the switches,
-        or `Visible`; they all read the `settings` table, which hiding never touches.
-      - The gui itself stays Enabled and parented, so nothing gets destroyed or
-        garbage-collected while hidden.
-      - The 2s self-heal loop keeps re-applying ON features while hidden.
-      - Instead of an on-screen status line, F9 prints what's still ON each time
-        you hide it, so you can check without anything showing.
-]]
-track(UserInputService.InputBegan:Connect(function(input, processed)
-    if processed or input.KeyCode ~= Enum.KeyCode.H then return end
-    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
-        frame.Visible = not frame.Visible
-        if frame.Visible then
-            log("menu shown")
-        else
-            log("menu hidden (Ctrl+H to bring it back) - still ON: " .. onList())
-        end
-    end
-end))
-
-------------------------------------------------------------------------
--- cleanup (used when you re-execute the script)
-------------------------------------------------------------------------
-local function cleanup()
-    setForce(false)
-    setBlock(false)
-    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
-    settings.autoEvade = false
-    settings.parryChase = false
-    settings.antiKick = false
-    settings.esp = false
-    if espClear then espClear() end
-    setHBE(false)
-    for _, c in ipairs(connections) do
-        if type(c) == "thread" then
-            pcall(task.cancel, c)
-        else
-            pcall(function() c:Disconnect() end)
-        end
-    end
-    if gui then pcall(function() local i = gui.Parent and gui.Parent:FindFirstChild("ForceHBE_Intro"); if i then i:Destroy() end end) end
-    if gui then gui:Destroy() end
-end
-if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
-
-log("loaded (build 17: no log box) - Ctrl+H toggles the panel")
 ------------------------------------------------------------------------
 -- Intro splash: the logo pops in with a pulsing red glow, then fades away
 -- (Image ID 72002193288588; Decal ID 135560314705244 is the fallback)
 ------------------------------------------------------------------------
 task.spawn(function()
+  local okIntro, errIntro = pcall(function()
     local TweenService = game:GetService("TweenService")
     local ContentProvider = game:GetService("ContentProvider")
     local host = gui and gui.Parent
@@ -3260,8 +2925,8 @@ iigD/9k=
         if not okA or not asset then return false end
         img.Image = asset
         pcall(function() ContentProvider:PreloadAsync({ img }) end)
-        task.wait(0.15)
-        return loaded()
+        task.wait(0.3)
+        return true -- trust a local file we just wrote and converted
     end
     shown = tryEmbedded()
 
@@ -3335,4 +3000,625 @@ iigD/9k=
     TweenService:Create(glow2, fade, { BackgroundTransparency = 1 }):Play()
     task.wait(0.8)
     sg:Destroy()
+  end)
+  if not okIntro then warn("[ForceHBE] intro splash failed: " .. tostring(errIntro)) end
 end)
+
+local COLORS = {
+    bg = Color3.fromRGB(24, 24, 28), panel = Color3.fromRGB(34, 34, 40),
+    text = Color3.fromRGB(235, 235, 240), sub = Color3.fromRGB(150, 150, 160),
+    on = Color3.fromRGB(60, 170, 90), off = Color3.fromRGB(90, 90, 100),
+}
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.fromOffset(210, 320) -- compact; the rows scroll (mouse wheel)
+frame.Position = UDim2.new(0, 20, 0.5, -160)
+frame.BackgroundColor3 = COLORS.bg
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = gui
+KB.guiFrame = frame
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -16, 0, 26)
+title.Position = UDim2.fromOffset(8, 2)
+title.BackgroundTransparency = 1
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.TextColor3 = COLORS.text
+title.Text = "Comp Client"
+title.Parent = frame
+
+local hint = Instance.new("TextLabel")
+hint.Size = UDim2.new(1, -16, 0, 26)
+hint.Position = UDim2.fromOffset(8, 2)
+hint.BackgroundTransparency = 1
+hint.Font = Enum.Font.Gotham
+hint.TextSize = 10
+hint.TextXAlignment = Enum.TextXAlignment.Right
+hint.TextColor3 = COLORS.sub
+hint.Text = "Ctrl+H = hide  |  v41"
+hint.Parent = frame
+
+-- everything below the title lives in `content`, which stays hidden until the
+-- password is entered
+-- a scrolling list: mouse wheel (or drag the thin bar) to scroll; rows stack in the order
+-- they're created (the first number given to makeRow/makeSwitch is just the sort order)
+local content = Instance.new("ScrollingFrame")
+content.Size = UDim2.new(1, 0, 1, -30)
+content.Position = UDim2.fromOffset(0, 30)
+content.BackgroundTransparency = 1
+content.BorderSizePixel = 0
+content.ScrollBarThickness = 4
+content.ScrollBarImageColor3 = COLORS.sub
+content.ScrollingDirection = Enum.ScrollingDirection.Y
+content.CanvasSize = UDim2.new(0, 0, 0, 0)
+content.AutomaticCanvasSize = Enum.AutomaticSize.Y
+content.Visible = false
+content.Parent = frame
+do
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 4)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.Parent = content
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 2), UDim.new(0, 8)
+    pad.Parent = content
+end
+
+local function makeRow(y, labelText)
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, -16, 0, 26)
+    row.LayoutOrder = y
+    row.BackgroundColor3 = COLORS.panel
+    row.BorderSizePixel = 0
+    row.Parent = content
+    Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -70, 1, 0)
+    label.Position = UDim2.fromOffset(8, 0)
+    label.BackgroundTransparency = 1
+    label.Font = Enum.Font.Gotham
+    label.TextSize = 11
+    label.TextTruncate = Enum.TextTruncate.AtEnd
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextColor3 = COLORS.text
+    label.Text = labelText
+    label.Parent = row
+    return row
+end
+
+local function makeSwitch(y, labelText, initial, onChanged)
+    local row = makeRow(y, labelText)
+    local state = initial
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(46, 18)
+    btn.Position = UDim2.new(1, -52, 0.5, -9)
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.TextColor3 = Color3.new(1, 1, 1)
+    btn.AutoButtonColor = true
+    btn.Parent = row
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+    local function render()
+        btn.Text = state and "ON" or "OFF"
+        btn.BackgroundColor3 = state and COLORS.on or COLORS.off
+    end
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        render()
+        onChanged(state)
+    end)
+    render()
+    -- lets other code (e.g. a keybind) flip this switch: setter(on, skipCallback)
+    return function(on, skipCallback)
+        state = on
+        render()
+        if not skipCallback then onChanged(on) end
+    end
+end
+
+-- section headers: Resources / Combat / HBE (the number is the position in the list)
+local function makeHeader(order, text)
+    local h = Instance.new("TextLabel")
+    h.Size = UDim2.new(1, -16, 0, 18)
+    h.LayoutOrder = order
+    h.BackgroundTransparency = 1
+    h.Font = Enum.Font.GothamBold
+    h.TextSize = 11
+    h.TextColor3 = COLORS.on
+    h.TextXAlignment = Enum.TextXAlignment.Left
+    h.Text = text
+    h.Parent = content
+    -- thin line under the title
+    local line = Instance.new("Frame")
+    line.Size = UDim2.new(1, 0, 0, 1)
+    line.Position = UDim2.new(0, 0, 1, -1)
+    line.BackgroundColor3 = COLORS.off
+    line.BorderSizePixel = 0
+    line.Parent = h
+end
+-- WHITELIST drop-down: a header row "Whitelist (n) v"; click it to open a search box and the
+-- list of everyone in the server. Tick a name = that feature skips them. Stored by UserId.
+local function makeWhitelist(order, labelText, listName)
+    local wl = settings.whitelist[listName]
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, -16, 0, 26)
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.LayoutOrder = order
+    container.BackgroundTransparency = 1
+    container.BorderSizePixel = 0
+    container.Parent = content
+    local lay = Instance.new("UIListLayout")
+    lay.SortOrder = Enum.SortOrder.LayoutOrder
+    lay.Padding = UDim.new(0, 2)
+    lay.Parent = container
+
+    local head = Instance.new("Frame")
+    head.Size = UDim2.new(1, 0, 0, 26)
+    head.LayoutOrder = 1
+    head.BackgroundColor3 = COLORS.panel
+    head.BorderSizePixel = 0
+    head.Parent = container
+    Instance.new("UICorner", head).CornerRadius = UDim.new(0, 6)
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -92, 1, 0)
+    lbl.Position = UDim2.fromOffset(8, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Gotham
+    lbl.TextSize = 11
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextColor3 = COLORS.text
+    lbl.TextTruncate = Enum.TextTruncate.AtEnd
+    lbl.Text = labelText
+    lbl.Parent = head
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(78, 18)
+    btn.Position = UDim2.new(1, -84, 0.5, -9)
+    btn.BackgroundColor3 = COLORS.bg
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 9
+    btn.TextColor3 = COLORS.text
+    btn.AutoButtonColor = true
+    btn.Parent = head
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local panel = Instance.new("Frame")
+    panel.Size = UDim2.new(1, 0, 0, 150)
+    panel.LayoutOrder = 2
+    panel.BackgroundColor3 = COLORS.panel
+    panel.BorderSizePixel = 0
+    panel.Visible = false
+    panel.Parent = container
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 6)
+    local search = Instance.new("TextBox")
+    search.Size = UDim2.new(1, -10, 0, 22)
+    search.Position = UDim2.fromOffset(5, 4)
+    search.BackgroundColor3 = COLORS.bg
+    search.BorderSizePixel = 0
+    search.Font = Enum.Font.Gotham
+    search.TextSize = 11
+    search.TextColor3 = COLORS.text
+    search.PlaceholderText = "search players..."
+    search.PlaceholderColor3 = COLORS.sub
+    search.Text = ""
+    search.ClearTextOnFocus = false
+    search.Parent = panel
+    Instance.new("UICorner", search).CornerRadius = UDim.new(0, 5)
+    local list = Instance.new("ScrollingFrame")
+    list.Size = UDim2.new(1, -10, 1, -34)
+    list.Position = UDim2.fromOffset(5, 30)
+    list.BackgroundTransparency = 1
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 3
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.Parent = panel
+    local ll = Instance.new("UIListLayout")
+    ll.SortOrder = Enum.SortOrder.LayoutOrder
+    ll.Padding = UDim.new(0, 2)
+    ll.Parent = list
+
+    local function count()
+        local n = 0
+        for _ in pairs(wl) do n += 1 end
+        btn.Text = ("Whitelist (%d) %s"):format(n, panel.Visible and "^" or "v")
+    end
+    local function rebuild()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        local q = search.Text:lower()
+        local players = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then players[#players + 1] = plr end
+        end
+        table.sort(players, function(a, b) return a.Name:lower() < b.Name:lower() end)
+        for i, plr in ipairs(players) do
+            local nm = plr.DisplayName ~= "" and plr.DisplayName or plr.Name
+            if q == "" or plr.Name:lower():find(q, 1, true) or nm:lower():find(q, 1, true) then
+                local on = wl[plr.UserId] == true
+                local b = Instance.new("TextButton")
+                b.Size = UDim2.new(1, -4, 0, 20)
+                b.LayoutOrder = i
+                b.BackgroundColor3 = on and COLORS.on or COLORS.bg
+                b.BackgroundTransparency = on and 0.35 or 0
+                b.BorderSizePixel = 0
+                b.Font = Enum.Font.Gotham
+                b.TextSize = 11
+                b.TextColor3 = COLORS.text
+                b.TextXAlignment = Enum.TextXAlignment.Left
+                b.TextTruncate = Enum.TextTruncate.AtEnd
+                b.Text = ("  %s %s%s"):format(on and "[x]" or "[ ]", nm, nm ~= plr.Name and (" (@" .. plr.Name .. ")") or "")
+                b.Parent = list
+                b.MouseButton1Click:Connect(function()
+                    if wl[plr.UserId] then wl[plr.UserId] = nil else wl[plr.UserId] = true end
+                    count()
+                    rebuild()
+                end)
+            end
+        end
+    end
+    btn.MouseButton1Click:Connect(function()
+        panel.Visible = not panel.Visible
+        if panel.Visible then rebuild() end
+        count()
+    end)
+    search:GetPropertyChangedSignal("Text"):Connect(function() if panel.Visible then rebuild() end end)
+    track(Players.PlayerAdded:Connect(function() if panel.Visible then rebuild() end end))
+    track(Players.PlayerRemoving:Connect(function() task.defer(function() if panel.Visible then rebuild() end end) end))
+    count()
+end
+makeHeader(10, "RESOURCES")
+makeHeader(20, "COMBAT")
+makeHeader(40, "HITBOX EXPANDER")
+makeHeader(50, "VISUALS")
+
+makeSwitch(11, "Infinite Force", settings.force, setForce)
+makeSwitch(12, "Infinite Block", settings.block, setBlock)
+makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
+makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
+makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
+    settings.autoParry = on
+    if on then
+        -- self-test so you can see in F9 whether everything Auto Parry needs is there
+        task.delay(2.5, function()
+            if not settings.autoParry then return end
+            log(("Auto Parry ON | lightsaber component: %s | click function: %s | live ping %.0f ms"):format(
+                saberStillValid(saberComp) and "found" or "NOT FOUND (equip + ignite your saber; needs getgc)",
+                (type(mouse1click) == "function" or type(mouse1press) == "function") and "yes" or "NO (executor has no mouse1click)",
+                pingEma * 1000))
+        end)
+    end
+end)
+makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+makeSwitch(27, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end)
+makeWhitelist(28, "Parry whitelist", "parry")
+makeSwitch(29, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+-- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
+-- force-dashing straight at you, so it can also spend a parry on a plain dash
+makeSwitch(30, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+-- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
+makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
+    settings.autoEvade = on
+    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
+end)
+
+-- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
+antiKickSwitch = makeSwitch(22, "Anti-kick", settings.antiKick, function(on)
+    if on ~= settings.antiKick then setAntiKick(on) end
+end)
+do
+    local warn = Instance.new("TextLabel")
+    warn.Size = UDim2.new(1, -16, 0, 14)
+    warn.LayoutOrder = 23
+    warn.BackgroundTransparency = 1
+    warn.Font = Enum.Font.GothamMedium
+    warn.TextSize = 10
+    warn.TextColor3 = Color3.fromRGB(230, 150, 80)
+    warn.TextXAlignment = Enum.TextXAlignment.Left
+    warn.Text = "  (*Warning* - Blatant)"
+    warn.Parent = content
+end
+
+-- keybind row: click the box, then press the key / combo (Ctrl+U ...) / middle click / mouse
+-- side button you want. Esc cancels, Backspace/Delete clears it ("None").
+function KB.makeRow(order, labelText, settingKey)
+    local row = makeRow(order, labelText)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(78, 18)
+    btn.Position = UDim2.new(1, -84, 0.5, -9)
+    btn.BackgroundColor3 = COLORS.bg
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 9
+    btn.TextColor3 = COLORS.text
+    btn.TextTruncate = Enum.TextTruncate.AtEnd
+    btn.Text = tostring(settings[settingKey])
+    btn.AutoButtonColor = true
+    btn.Parent = row
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local MOD_NAMES = {
+        [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
+        [Enum.KeyCode.LeftShift] = true, [Enum.KeyCode.RightShift] = true,
+        [Enum.KeyCode.LeftAlt] = true, [Enum.KeyCode.RightAlt] = true,
+    }
+    local MOUSE = {
+        [Enum.UserInputType.MouseButton1] = "MB1",
+        [Enum.UserInputType.MouseButton2] = "MB2",
+        [Enum.UserInputType.MouseButton3] = "MB3",
+    }
+    local listening = false
+    btn.MouseButton1Click:Connect(function()
+        if listening then return end
+        listening = true
+        KB.capturing = true
+        btn.Text = (type(iskeypressed) == "function") and "press..." or "press (no MB4/5)"
+        local done = false
+        local conns = {}
+        local function stop(spec)
+            if done then return end
+            done = true
+            listening = false
+            for _, c in ipairs(conns) do c:Disconnect() end
+            if spec then settings[settingKey] = spec end
+            btn.Text = tostring(settings[settingKey])
+            task.defer(function() KB.capturing = false end) -- after the toggle listener has seen this same press
+        end
+        local pendingMod, usedWithMod = nil, false
+        conns[#conns + 1] = UserInputService.InputBegan:Connect(function(input)
+            local ut = input.UserInputType
+            if ut == Enum.UserInputType.Keyboard then
+                local kc = input.KeyCode
+                if MOD_NAMES[kc] then pendingMod = kc return end   -- might be a combo, might be the bind itself
+                if kc == Enum.KeyCode.Escape then stop(nil) return end
+                if kc == Enum.KeyCode.Backspace or kc == Enum.KeyCode.Delete then stop("None") return end
+                stop(KB.prefix() .. kc.Name)                       -- e.g. Ctrl+U
+            elseif MOUSE[ut] then
+                stop(KB.prefix() .. MOUSE[ut])                     -- left / right / middle click, also with Ctrl+...
+            end
+        end)
+        -- a modifier pressed and released with nothing else = that modifier IS the bind (Right Ctrl etc.)
+        conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Keyboard and pendingMod and input.KeyCode == pendingMod then
+                stop(pendingMod.Name)
+            end
+        end)
+        for _, c in ipairs(conns) do track(c) end
+        -- the side buttons only exist through the executor, so poll them while listening
+        task.spawn(function()
+            local was = {}
+            for _, s in ipairs(KB.side) do was[s.name] = KB.sideDown(s.vk) end
+            while not done do
+                for _, s in ipairs(KB.side) do
+                    local down = KB.sideDown(s.vk)
+                    if down and not was[s.name] then stop(KB.prefix() .. s.name) end
+                    was[s.name] = down
+                end
+                RunService.Heartbeat:Wait()
+            end
+        end)
+    end)
+endKB.makeRow(24, "Anti-kick key", "antiKickKey")do
+    -- tells you whether the hooks are really in place (so you're not guessing)
+    local st = Instance.new("TextLabel")
+    st.Size = UDim2.new(1, -16, 0, 14)
+    st.LayoutOrder = 25
+    st.BackgroundTransparency = 1
+    st.Font = Enum.Font.Gotham
+    st.TextSize = 10
+    st.TextColor3 = COLORS.sub
+    st.TextXAlignment = Enum.TextXAlignment.Left
+    st.TextTruncate = Enum.TextTruncate.AtEnd
+    st.Parent = content
+    antiKickStatusSink = function() st.Text = "  anti-kick: " .. antiKickStatus end
+    antiKickStatusSink()
+end
+
+-- number boxes (type a value, press Enter or click away)
+local function makeNumberBox(y, labelText, key, minV, maxV)
+    local row = makeRow(y, labelText)
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.fromOffset(46, 18)
+    box.Position = UDim2.new(1, -52, 0.5, -9)
+    box.BackgroundColor3 = COLORS.bg
+    box.BorderSizePixel = 0
+    box.Font = Enum.Font.GothamBold
+    box.TextSize = 10
+    box.TextColor3 = COLORS.text
+    box.Text = tostring(settings[key])
+    box.ClearTextOnFocus = false
+    box.Parent = row
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+    box.FocusLost:Connect(function()
+        local n = tonumber(box.Text)
+        if n then settings[key] = math.clamp(n, minV, maxV) end
+        box.Text = tostring(settings[key])
+    end)
+end
+
+makeWhitelist(43, "HBE whitelist", "hbe")
+makeNumberBox(44, "Hitbox size", "hbeSize", 2, 50)
+-- 0 = solid (easiest to see), 1 = invisible
+makeNumberBox(45, "Transparency (0-1)", "hbeTransparency", 0, 1)
+
+-- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
+makeSwitch(51, "ESP (through walls)", settings.esp, function(on) settings.esp = on end)
+makeSwitch(52, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end)
+makeSwitch(53, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end)
+makeSwitch(54, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end)
+makeWhitelist(55, "ESP whitelist", "esp")
+-- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
+-- parry too LATE (you get hit first) -> lower it (negative is fine).
+-- With "Parry follows ping" ON this is added on top of your (negated) live ping.
+makeNumberBox(31, "Parry timing (ms)", "parryOffset", -500, 500)
+-- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
+makeSwitch(32, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
+
+------------------------------------------------------------------------
+-- Password lock. The panel shows only this screen until the right password is
+-- typed. Only a hash is stored here, not the password itself.
+-- NOTE: this keeps casual users out of the menu; it isn't real security (anyone
+-- who reads/edits the script on GitHub can remove it).
+------------------------------------------------------------------------
+local PASSWORD_HASH = 1815920161
+local function hashPassword(s)
+    local h = 5381
+    for i = 1, #s do
+        h = bit32.bxor((h * 33) % 4294967296, string.byte(s, i))
+    end
+    return h
+end
+
+local lock = Instance.new("Frame")
+lock.Size = UDim2.new(1, 0, 1, -36)
+lock.Position = UDim2.fromOffset(0, 36)
+lock.BackgroundTransparency = 1
+lock.BorderSizePixel = 0
+lock.Parent = frame
+
+local lockLabel = Instance.new("TextLabel")
+lockLabel.Size = UDim2.new(1, -16, 0, 40)
+lockLabel.Position = UDim2.fromOffset(8, 40)
+lockLabel.BackgroundTransparency = 1
+lockLabel.Font = Enum.Font.Gotham
+lockLabel.TextSize = 13
+lockLabel.TextWrapped = true
+lockLabel.TextColor3 = COLORS.sub
+lockLabel.Text = "Locked. Enter the password to see the features."
+lockLabel.Parent = lock
+
+local pwBox = Instance.new("TextBox")
+pwBox.Size = UDim2.new(1, -16, 0, 32)
+pwBox.Position = UDim2.fromOffset(8, 96)
+pwBox.BackgroundColor3 = COLORS.panel
+pwBox.BorderSizePixel = 0
+pwBox.Font = Enum.Font.GothamBold
+pwBox.TextSize = 13
+pwBox.TextColor3 = COLORS.text
+pwBox.PlaceholderText = "Password"
+pwBox.PlaceholderColor3 = COLORS.sub
+pwBox.Text = ""
+pwBox.ClearTextOnFocus = false
+pwBox.Parent = lock
+Instance.new("UICorner", pwBox).CornerRadius = UDim.new(0, 6)
+
+local unlockBtn = Instance.new("TextButton")
+unlockBtn.Size = UDim2.new(1, -16, 0, 32)
+unlockBtn.Position = UDim2.fromOffset(8, 138)
+unlockBtn.BackgroundColor3 = COLORS.on
+unlockBtn.BorderSizePixel = 0
+unlockBtn.Font = Enum.Font.GothamBold
+unlockBtn.TextSize = 13
+unlockBtn.TextColor3 = Color3.new(1, 1, 1)
+unlockBtn.Text = "Unlock"
+unlockBtn.Parent = lock
+Instance.new("UICorner", unlockBtn).CornerRadius = UDim.new(0, 6)
+
+local function tryUnlock()
+    if hashPassword(pwBox.Text) == PASSWORD_HASH then
+        pwBox.Text = ""
+        lock.Visible = false
+        content.Visible = true
+        log("unlocked")
+    else
+        pwBox.Text = ""
+        lockLabel.Text = "Wrong password."
+        lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
+    end
+end
+unlockBtn.MouseButton1Click:Connect(tryUnlock)
+pwBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then tryUnlock() end
+end)
+
+-- dragging
+do
+    local dragging, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+end
+
+local function onList()
+    local on = {}
+    if settings.force then table.insert(on, "Force") end
+    if settings.block then table.insert(on, "Block") end
+    if settings.parry then table.insert(on, "Parry") end
+    if settings.kick then table.insert(on, "Kicks") end
+    if settings.autoParry then table.insert(on, "AutoParry") end
+    if settings.autoEvade then table.insert(on, "AutoEvade") end
+    if settings.parryChase then table.insert(on, "ParryChase") end
+    if settings.dashGuard then table.insert(on, "DashGuard") end
+    if settings.hbe then table.insert(on, "HBE") end
+    return #on > 0 and table.concat(on, ", ") or "nothing"
+end
+
+--[[
+    Ctrl + H fully hides/shows the menu - nothing is left on screen.
+    Glitch-proofing:
+      - Hiding ONLY flips `frame.Visible`. No feature reads the panel, the switches,
+        or `Visible`; they all read the `settings` table, which hiding never touches.
+      - The gui itself stays Enabled and parented, so nothing gets destroyed or
+        garbage-collected while hidden.
+      - The 2s self-heal loop keeps re-applying ON features while hidden.
+      - Instead of an on-screen status line, F9 prints what's still ON each time
+        you hide it, so you can check without anything showing.
+]]
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or input.KeyCode ~= Enum.KeyCode.H then return end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
+        frame.Visible = not frame.Visible
+        if frame.Visible then
+            log("menu shown")
+        else
+            log("menu hidden (Ctrl+H to bring it back) - still ON: " .. onList())
+        end
+    end
+end))
+
+------------------------------------------------------------------------
+-- cleanup (used when you re-execute the script)
+------------------------------------------------------------------------
+local function cleanup()
+    setForce(false)
+    setBlock(false)
+    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
+    settings.autoEvade = false
+    settings.parryChase = false
+    settings.antiKick = false
+    settings.esp = false
+    if espClear then espClear() end
+    setHBE(false)
+    for _, c in ipairs(connections) do
+        if type(c) == "thread" then
+            pcall(task.cancel, c)
+        else
+            pcall(function() c:Disconnect() end)
+        end
+    end
+    if gui then pcall(function() local i = gui.Parent and gui.Parent:FindFirstChild("ForceHBE_Intro"); if i then i:Destroy() end end) end
+    if gui then gui:Destroy() end
+end
+if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
+
+log("loaded (build 17: no log box) - Ctrl+H toggles the panel")
