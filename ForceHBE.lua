@@ -50,7 +50,7 @@ local settings = {
     parry = false,
     kick = false,
     autoParry = false,
-    parryOffset = 0,       -- ms: Auto Parry timing, + = later, - = earlier
+    parryOffset = -100,    -- ms: Auto Parry timing, + = later, - = earlier
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
     hbeTransparency = 0.7, -- so you can see the box
@@ -501,11 +501,14 @@ local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 30,      -- studs: ignore attackers further than this
     BODY_RADIUS = 2.5,   -- studs: blade counts as "landed" this close to your center
-    MIN_COMMIT = 0.04,   -- s the swing must have run (feint filter)
+    MIN_SWING_SPEED = 14, -- studs/s: blade speed relative to THEIR body that counts as a swing
+    HIT_RADIUS = 3.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
+    MIN_CLOSING = 8,     -- studs/s: blade must be heading toward you at least this fast
+    MIN_COMMIT = 0.03,   -- s the swing must have run (feint filter)
     MAX_PHASE = 0.85,    -- ignore swings nearly finished
     AIM = 0.18,          -- s: we want the hit to land this long AFTER our parry is active
     TIME_VARIANCE = 0.12, -- per-swing random +-12% on the trigger time
-    JITTER_MAX = 0.04,   -- extra human delay 0..40ms (triangular, ~20ms average)
+    JITTER_MAX = 0.025,  -- extra human delay 0..25ms (triangular, ~12ms average)
     FALLBACK_HIT = 0.25, -- s into a swing the hit lands, only if no blade parts are found
 }
 
@@ -576,7 +579,7 @@ local function updateSwings(myHrp, dt)
             else
                 local st = swingState[plr]
                 if not st or st.trk ~= trk then
-                    st = { trk = trk, prev = nil, speed = {}, ttc = nil }
+                    st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil }
                     swingState[plr] = st
                 end
                 local pts = {}
@@ -588,18 +591,39 @@ local function updateSwings(myHrp, dt)
                         pts[#pts + 1] = cf.Position - cf.UpVector * half
                     end
                 end
+                -- enemy body velocity from position change (to separate SWING motion
+                -- from simply walking / strafing around you)
+                local hrpE = char:FindFirstChild("HumanoidRootPart")
+                local ePos = hrpE and hrpE.Position
+                local eVel = (ePos and st.prevE and dt > 0) and (ePos - st.prevE) / dt or Vector3.zero
+                st.prevE = ePos
+
                 local best
                 if st.prev and #pts == #st.prev and dt > 0 then
                     for i, pt in ipairs(pts) do
-                        local rel = (pt - st.prev[i]) / dt - myVel
-                        local toMe = myPos - pt
-                        local dist = math.max(toMe.Magnitude, 0.01)
-                        local s = rel:Dot(toMe / dist)
+                        local worldVel = (pt - st.prev[i]) / dt
                         -- smooth so a single jittery frame can't trigger it
-                        st.speed[i] = (st.speed[i] or s) * 0.5 + s * 0.5
-                        if st.speed[i] > 2 then
-                            local t = math.max(dist - AP.BODY_RADIUS, 0) / st.speed[i]
-                            if not best or t < best then best = t end
+                        local rel = worldVel - myVel                -- blade motion as YOU see it
+                        local swing = worldVel - eVel               -- blade motion relative to their body
+                        st.relV[i] = (st.relV[i] or rel) * 0.5 + rel * 0.5
+                        st.swingV[i] = (st.swingV[i] or swing) * 0.5 + swing * 0.5
+                        local relV = st.relV[i]
+                        local relSpeed = relV.Magnitude
+                        -- 1) it must be a real swing: blade moving fast relative to THEIR body
+                        --    (walking past you / idle sway is far below this)
+                        if st.swingV[i].Magnitude >= AP.MIN_SWING_SPEED and relSpeed > 0.01 then
+                            local toMe = myPos - pt
+                            -- 2) it must be heading AT you: follow the blade's path forward and
+                            --    check how close it passes to your center (closest approach)
+                            local tStar = toMe:Dot(relV) / (relSpeed * relSpeed)
+                            if tStar >= 0 and tStar < 1 then
+                                local miss = (toMe - relV * tStar).Magnitude
+                                if miss <= AP.HIT_RADIUS and relV:Dot(toMe) / math.max(toMe.Magnitude, 0.01) >= AP.MIN_CLOSING then
+                                    -- time until the blade is within body radius of you
+                                    local t = math.max(tStar - AP.BODY_RADIUS / relSpeed, 0)
+                                    if not best or t < best then best = t end
+                                end
+                            end
                         end
                     end
                 end
@@ -802,7 +826,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Swift heh"
+title.Text = "Force + HBE"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
