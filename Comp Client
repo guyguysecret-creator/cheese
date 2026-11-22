@@ -63,8 +63,6 @@ local settings = {
     -- mouse button except RIGHT CLICK is swallowed) simply follows Stun Evade: sink is
     -- armed while autoEvade is ON and released the moment it is turned OFF.
     chaseMulti = false,    -- after your parry stuns someone: dash to them and multi
-    evadeKey = "",         -- keybind that toggles Stun evade ("" = none): one key, a combo
-                           -- like "CTRL+T", or a mouse button ("MB3" side button, "MB4")
 }
 
 -- shared so the block-break hook (installed once per game session) always reads the
@@ -293,19 +291,16 @@ local function hookBlockBreakStun()
             end
         end
     end
-    if type(fireFn) ~= "function" then return false end
-    -- hookfunction returns the ORIGINAL function: keep it in a local and call it from
-    -- inside the new function. (Calling a value that may be any? is a Luau type error,
-    -- so the original is handed over as a plain local, never via a reassigned one.)
-    local original = fireFn
+    if not fireFn then return false end
+    local old
     local okH = pcall(function()
-        local hooked = hookfunction(original, function(payload, ...)
+        old = hookfunction(fireFn, function(payload, ...)
             local s = env().StunEvade_Settings
             if s and s.block and type(payload) == "table"
                 and (payload.BlockBreak == true or payload.StunType == STUN_BLOCK_BROKEN) then
                 return
             end
-            return hooked(payload, ...)
+            return old(payload, ...)
         end)
     end)
     if okH then
@@ -602,7 +597,6 @@ local AP = {
     DASH_CLOSING = 22,
     DEBUG = false,
     FALLBACK_HIT = 0.25,
-    _lastDbg = 0,  -- s: when an ignored swing was last logged (rate limit)
 }
 
 -- every swing animation id used by the game's forms
@@ -1730,31 +1724,25 @@ local function installAntiKick()
         end
         return { sab = sabClass, fsm = fsmClass }
     end)
-    if not okC or not classes.sab or type(rawget(classes.sab, "HandleSignal")) ~= "function" then
-        return fail("couldn't find HandleSignal")
-    end
-    if classes.fsm and type(rawget(classes.fsm, "Input")) ~= "function" then classes.fsm = nil end
+    if not okC or not classes.sab then return fail("couldn't find HandleSignal") end
 
-    -- hookfunction gives back the original; hold it in a local and call it from inside
-    -- the new function (see hook 1)
-    local hookHandle = rawget(classes.sab, "HandleSignal")
-    local hookInput = (classes.fsm and rawget(classes.fsm, "Input")) or nil
+    local oldHandle, oldInput
     local okH, err = pcall(function()
-        local hookedHandle = hookfunction(hookHandle, function(self, req, payload, ...)
+        oldHandle = hookfunction(rawget(classes.sab, "HandleSignal"), function(self, req, payload, ...)
             local s = e.StunEvade_Settings
             local pred = e.StunEvade_IsKickStun
             if s and s.antiKick and req == 15 and pred and pred(payload) then return end -- 15 = STUN
-            return hookedHandle(self, req, payload, ...)
+            return oldHandle(self, req, payload, ...)
         end)
-        if hookInput then
-            local hookedInput = hookfunction(hookInput, function(self, name, data, ...)
+        if classes.fsm then
+            oldInput = hookfunction(rawget(classes.fsm, "Input"), function(self, name, data, ...)
                 local s = e.StunEvade_Settings
                 local pred = e.StunEvade_IsKickStun
                 if s and s.antiKick and name == "stun_request" and type(data) == "table"
                     and pred and pred(data.StunData) then
                     return false
                 end
-                return hookedInput(self, name, data, ...)
+                return oldInput(self, name, data, ...)
             end)
         end
     end)
@@ -1782,15 +1770,15 @@ local function installEvadeHook()
         if type(mt.__index) == "table" and type(rawget(mt.__index, "HandleSignal")) == "function" then return mt.__index end
         return nil
     end)
-    if not okC or not class or type(rawget(class, "HandleSignal")) ~= "function" then return false end
-    local hookSignal = rawget(class, "HandleSignal")
+    if not okC or not class then return false end
+    local old
     local okH = pcall(function()
-        local hookedSignal = hookfunction(hookSignal, function(self, req, payload, ...)
+        old = hookfunction(rawget(class, "HandleSignal"), function(self, req, payload, ...)
             local s = e.StunEvade_Settings
             if s and s.autoEvade and req == 15 and e.StunEvade_OnStun then
                 pcall(e.StunEvade_OnStun, payload)
             end
-            return hookedSignal(self, req, payload, ...)
+            return old(self, req, payload, ...)
         end)
     end)
     if okH then e.StunEvade_EvadeHook = true end
@@ -1870,12 +1858,12 @@ do
         local function wrap(fnName)
             local fn = rawget(audio, fnName)
             if type(fn) ~= "function" then return end
-            local hookFn = fn
+            local old
             pcall(function()
-                local hooked = hookfunction(hookFn, function(self, name, ...)
+                old = hookfunction(fn, function(self, name, ...)
                     local win, bad = e.StunEvade_InKickWindow, e.StunEvade_BadSound
                     if win and bad and type(name) == "string" and win() and bad(name) then return end
-                    return hooked(self, name, ...)
+                    return old(self, name, ...)
                 end)
             end)
         end
@@ -1944,10 +1932,7 @@ do
                 for _, d in ipairs(SoundService:GetDescendants()) do
                     if d:IsA("Sound") then muteSound(d, false) end
                 end
-                -- (pcall(workspace.GetPartBoundsInRadius, workspace, ..., ...) is a 4-argument
-                --  pcall, which the game's Luau type checker rejects)
-                local wsRef, centre = workspace, hrp.Position
-                local okP, parts = pcall(function() return wsRef:GetPartBoundsInRadius(centre, 16) end)
+                local okP, parts = pcall(workspace.GetPartBoundsInRadius, workspace, hrp.Position, 16)
                 if okP and parts then
                     for _, part in ipairs(parts) do
                         if not part:IsDescendantOf(char) then
@@ -1970,35 +1955,9 @@ end
 
 -- keybind: press the chosen key to toggle (set the key in the panel)
 local capturingKey = false
--- does this input match a bind string like "CTRL+T" / "MB4" / "F"?
-local function matchesBind(bind, input)
-    if bind == "" then return false end
-    local base = bind:match("([^+]+)$")
-    local pressed
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then pressed = "MB3"
-    elseif input.UserInputType == Enum.UserInputType.MouseButton3 then pressed = "MB4"
-    elseif input.UserInputType == Enum.UserInputType.Keyboard then pressed = input.KeyCode.Name
-    else return false end
-    if pressed ~= base then return false end
-    local ctrl = UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl)
-    local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
-    local alt = UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt)
-    if (bind:find("CTRL") ~= nil) ~= ctrl then return false end
-    if (bind:find("SHIFT") ~= nil) ~= shift then return false end
-    if (bind:find("ALT") ~= nil) ~= alt then return false end
-    return true
-end
 track(UserInputService.InputBegan:Connect(function(input, processed)
-    if capturingKey then return end -- a bind is being recorded: don't also toggle
-    if processed then return end
-    if matchesBind(settings.evadeKey, input) then
-        setEvade(not settings.autoEvade)
-        return
-    end
-    if input.UserInputType == Enum.UserInputType.Keyboard
-        and input.KeyCode.Name == settings.antiKickKey then
-        setAntiKick(not settings.antiKick)
-    end
+    if processed or capturingKey or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.KeyCode.Name == settings.antiKickKey then setAntiKick(not settings.antiKick) end
 end))
 
 ------------------------------------------------------------------------
@@ -2117,10 +2076,8 @@ end
 -- moves them into `content` once the image is gone, so the scroll list starts at the top.
 local splashHolder = Instance.new("Frame")
 splashHolder.Name = "StunEvade_CodeHolder"
-local splashDone = false -- set by the intro section below (declared here so earlier code can read it)
 local function codeHolder()
-    if splashDone then return content end
-    return splashHolder
+    return splashHolder.Parent and splashHolder or content
 end
 
 local function makeRow(y, labelText)
@@ -2223,90 +2180,13 @@ end)
 makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 makeSwitch(28, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold W + dash (E) away, faster than human timing
--- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
--- (the switch and the keybind below both call setEvade, so they can never disagree)
-local evadeSwitch
-function setEvade(on)
+makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
-    if evadeSwitch then evadeSwitch(on, true) end -- redraw the switch, no callback
-    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying)
-    log("Stun evade " .. (on and "ON" or "OFF"))
-end
-evadeSwitch = makeSwitch(21, "Stun evade", settings.autoEvade, function(on) setEvade(on) end)
-
-------------------------------------------------------------------------
--- Stun evade keybind - the row right under the switch. Click the button, then
--- press what you want: a single key (F), a combo while holding the modifiers
--- (CTRL+T, SHIFT+CTRL+F), or a mouse side button (MB3 = the side button most mice
--- have, MB4). Esc while recording cancels and keeps the old bind.
-------------------------------------------------------------------------
-do
-    local row = makeRow(21.5, "Stun evade key")
-    local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(46, 18)
-    btn.Position = UDim2.new(1, -52, 0.5, -9)
-    btn.BackgroundColor3 = COLORS.bg
-    btn.BorderSizePixel = 0
-    btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 10
-    btn.TextColor3 = COLORS.text
-    btn.Text = (settings.evadeKey ~= "" and settings.evadeKey) or "none"
-    btn.AutoButtonColor = true
-    btn.Parent = row
-    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
-
-    -- "CTRL+SHIFT+T" / "MB4" for whatever was just pressed
-    local function nameOf(input)
-        local mods = {}
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
-            mods[#mods + 1] = "CTRL"
-        end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) or UserInputService:IsKeyDown(Enum.KeyCode.RightShift) then
-            mods[#mods + 1] = "SHIFT"
-        end
-        if UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt) or UserInputService:IsKeyDown(Enum.KeyCode.RightAlt) then
-            mods[#mods + 1] = "ALT"
-        end
-        local base
-        if input.UserInputType == Enum.UserInputType.MouseButton2 then base = "MB3"
-        elseif input.UserInputType == Enum.UserInputType.MouseButton3 then base = "MB4"
-        else
-            local kc = input.KeyCode
-            local isMod = kc == Enum.KeyCode.LeftControl or kc == Enum.KeyCode.RightControl
-                or kc == Enum.KeyCode.LeftShift or kc == Enum.KeyCode.RightShift
-                or kc == Enum.KeyCode.LeftAlt or kc == Enum.KeyCode.RightAlt
-            if isMod then
-                base, mods = kc.Name, {} -- a modifier on its own is the whole bind
-            else
-                base = kc.Name
-            end
-        end
-        mods[#mods + 1] = base
-        return table.concat(mods, "+")
-    end
-
-    local listening, conn = false, nil
-    btn.MouseButton1Click:Connect(function()
-        if listening then return end
-        listening = true
-        capturingKey = true
-        btn.Text = "..."
-        conn = UserInputService.InputBegan:Connect(function(input)
-            local isMouse = input.UserInputType == Enum.UserInputType.MouseButton2
-                or input.UserInputType == Enum.UserInputType.MouseButton3
-            if input.UserInputType ~= Enum.UserInputType.Keyboard and not isMouse then return end
-            if conn then conn:Disconnect() conn = nil end
-            listening = false
-            task.defer(function() capturingKey = false end) -- after the toggle listener saw this press
-            if input.KeyCode ~= Enum.KeyCode.Escape then
-                settings.evadeKey = nameOf(input)
-                log("Stun evade keybind: " .. settings.evadeKey)
-            end
-            btn.Text = (settings.evadeKey ~= "" and settings.evadeKey) or "none"
-        end)
-        track(conn)
-    end)
-end
+    syncSink() -- Stun Evade ON = every key/mouse button except right click is swallowed
+    if on then installEvadeHook() end
+    log(on and "Stun evade ON - keys locked (only right click gets through)"
+        or "Stun evade OFF - keys unlocked")
+end)
 antiKickSwitch = makeSwitch(22, "Anti-kick", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end)
@@ -2524,8 +2404,7 @@ local function tryUnlock()
     if hashPassword(pwBox.Text) == PASSWORD_HASH then
         pwBox.Text = ""
         lock.Visible = false
-        if type(releaseSplash) == "function" then releaseSplash() end
-        content.Visible = true -- the intro may still be up: the list shows over its last frames
+        releaseSplash()
         log("unlocked")
     else
         pwBox.Text = ""
@@ -2533,6 +2412,150 @@ local function tryUnlock()
         lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
     end
 end
+
+------------------------------------------------------------------------
+-- INTRO IMAGE  (the artwork pops up when the script runs, glows, then fades away)
+--   Full-screen overlay (not inside the small panel, so the art shows at its real size
+--   on any screen): the picture fades in, a soft aura of the same picture pulses behind
+--   it, then everything fades out and disappears after a few seconds.
+--   LEFT CLICK skips it. Nothing extra is downloaded: the glow is the picture itself.
+--   ART: an uploaded Roblox image id, e.g. "rbxassetid://1234567890" (upload the PNG on
+--   create.roblox.com, copy its Image / Decal asset id). Leave it "loading" until then -
+--   the intro is skipped and the panel shows as normal.
+------------------------------------------------------------------------
+local ART = "loading"
+-- SHOW: seconds the picture stays before it fades.  HOLD: fraction of that it stays
+-- fully visible (the rest is the fade-out).
+local INTRO_SHOW, INTRO_HOLD = 4.5, 0.8
+local splash = Instance.new("Frame")
+splash.Name = "StunEvade_Splash"
+splash.Size = UDim2.new(1, 0, 1, 0)
+splash.Position = UDim2.fromOffset(0, 0)
+splash.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+splash.BackgroundTransparency = 0.35
+splash.BorderSizePixel = 0
+splash.ZIndex = 60
+splash.Parent = gui
+
+local splashBox = Instance.new("Frame")
+splashBox.Size = UDim2.new(1, 0, 0.86, 0)
+splashBox.Position = UDim2.new(0, 0, 0.5, 0)
+splashBox.AnchorPoint = Vector2.new(0.5, 0.5)
+splashBox.BackgroundTransparency = 1
+splashBox.ZIndex = 61
+splashBox.Parent = splash
+
+-- the glow: the picture itself, enlarged and see-through, pulsing
+local splashGlow = Instance.new("ImageLabel")
+splashGlow.Name = "Glow"
+splashGlow.Size = UDim2.new(1, 40, 1, 40)
+splashGlow.Position = UDim2.fromOffset(-20, -20)
+splashGlow.BackgroundTransparency = 1
+splashGlow.Image = ART
+splashGlow.ImageTransparency = 1
+splashGlow.ScaleType = Enum.ScaleType.Fit
+splashGlow.ZIndex = 62
+splashGlow.Parent = splashBox
+
+local splashImg = Instance.new("ImageLabel")
+splashImg.Name = "Art"
+splashImg.Size = UDim2.new(1, 0, 1, 0)
+splashImg.BackgroundTransparency = 1
+splashImg.Image = ART
+splashImg.ImageTransparency = 1
+splashImg.ScaleType = Enum.ScaleType.Fit
+splashImg.ZIndex = 63
+splashImg.Parent = splashBox
+
+-- a thin glowing edge around the picture
+-- a glowing edge that hugs the picture (the image's own alpha decides its shape)
+local splashEdge = Instance.new("ImageLabel")
+splashEdge.Name = "Edge"
+splashEdge.Size = UDim2.new(1, 0, 1, 0)
+splashEdge.BackgroundTransparency = 1
+splashEdge.Image = ART
+splashEdge.ImageColor3 = Color3.fromRGB(90, 160, 255)
+splashEdge.ImageTransparency = 1
+splashEdge.ScaleType = Enum.ScaleType.Fit
+splashEdge.ZIndex = 62
+splashEdge.Parent = splashBox
+
+local splashTweens = {}
+local function tweenIn(obj, info, props)
+    local t = ts:Create(obj, info, props)
+    table.insert(splashTweens, t)
+    t:Play()
+    return t
+end
+
+local splashDone = false
+local function releaseSplash()
+    if splashDone then return end
+    splashDone = true
+    -- stop the breathing glow
+    for _, t in ipairs(splashTweens) do pcall(function() t:Cancel() end) end
+    table.clear(splashTweens)
+    if splashImg:GetAttribute("fading") then return end -- the fade-out is already running
+    splash:Destroy()
+    splashHolder:ClearAllChildren()
+    splashHolder:Destroy()
+    content.Active = true
+    if not lock.Visible then content.Visible = true end
+end
+
+local function splashIntro()
+    if ART == "loading" then
+        -- no picture set yet: do not cover the panel with nothing
+        releaseSplash()
+        return
+    end
+    -- 1) pop in: the picture fades in while it grows a touch (the glow with it)
+    splashImg.ImageTransparency = 1
+    splashGlow.ImageTransparency = 1
+    splashEdge.ImageTransparency = 1
+    splashImg.Size = UDim2.new(0.94, 0, 0.94, 0)
+    splashImg.Position = UDim2.new(0.03, 0, 0.03, 0)
+    splashGlow.Size = UDim2.new(1.0, 40, 1.0, 40)
+    tweenIn(splashImg, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+        { ImageTransparency = 0, Size = UDim2.new(1, 0, 1, 0), Position = UDim2.fromOffset(0, 0) })
+    tweenIn(splashEdge, TweenInfo.new(0.5), { ImageTransparency = 0.75 })
+    tweenIn(splashGlow, TweenInfo.new(0.6), { ImageTransparency = 0.55 })
+    -- 2) the glow breathes for as long as the picture is up
+    task.spawn(function()
+        while not splashDone do
+            local t1 = tweenIn(splashGlow, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+                { ImageTransparency = 0.8, Size = UDim2.new(1.06, 40, 1.06, 40) })
+            t1.Completed:Wait()
+            if splashDone then break end
+            local t2 = tweenIn(splashGlow, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+                { ImageTransparency = 0.5, Size = UDim2.new(1.0, 40, 1.0, 40) })
+            t2.Completed:Wait()
+        end
+    end)
+    -- 3) stay up, then fade everything out and get out of the way
+    local fade = INTRO_SHOW * (1 - INTRO_HOLD)
+    task.delay(INTRO_SHOW * INTRO_HOLD, function()
+        if splashDone or not splash.Parent then return end
+        splashImg:SetAttribute("fading", true)
+        local info = TweenInfo.new(fade, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+        tweenIn(splashImg, info, { ImageTransparency = 1 })
+        tweenIn(splashEdge, info, { ImageTransparency = 1 })
+        tweenIn(splashGlow, info, { ImageTransparency = 1 })
+        local done = tweenIn(splash, info, { BackgroundTransparency = 1 })
+        done.Completed:Once(function()
+            releaseSplash()
+        end)
+    end)
+    -- skip: click the picture
+    local skipBtn = Instance.new("TextButton")
+    skipBtn.Text = ""
+    skipBtn.BackgroundTransparency = 1
+    skipBtn.Size = UDim2.new(1, 0, 1, 0)
+    skipBtn.ZIndex = 70
+    skipBtn.Parent = splash
+    skipBtn.MouseButton1Click:Connect(releaseSplash)
+end
+
 unlockBtn.MouseButton1Click:Connect(tryUnlock)
 pwBox.FocusLost:Connect(function(enterPressed)
     if enterPressed then tryUnlock() end
@@ -2567,11 +2590,15 @@ local function onList()
     if settings.autoEvade then table.insert(on, "AutoEvade") end
     if settings.dashGuard then table.insert(on, "DashGuard") end
     if settings.chaseMulti then table.insert(on, "ChaseMulti") end
+    if settings.autoEvade then table.insert(on, "KeysLocked") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
 end
 
--- Ctrl + H fully hides/shows the menu - nothing is left on screen.
+--[[
+    Ctrl + H fully hides/shows the menu - nothing is left on screen.
+    Hiding ONLY flips `frame.Visible`; no feature reads the panel or the switches.
+]]
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.KeyCode ~= Enum.KeyCode.H then return end
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
@@ -2583,3 +2610,79 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
         end
     end
 end))
+
+------------------------------------------------------------------------
+-- RE-EXECUTE HANDLING
+--   Executing the script again replaces the old copy completely:
+--     1) the previous copy's cleanup runs FIRST (bottom of this file), so its panel, its
+--        loops, its connections, its input sink and its ON features all go away
+--     2) this copy then builds one fresh panel
+--   Anything left over from an older build (a panel under another name, a stale
+--   Ctrl+H / drag / input listener, an armed sink) is swept too, so you can never end up
+--   with two panels on screen or two copies both pressing keys.
+------------------------------------------------------------------------
+local function sweepOldPanels()
+    local places = {}
+    if gethui then places[#places + 1] = gethui() end
+    pcall(function() places[#places + 1] = game:GetService("CoreGui") end)
+    pcall(function() places[#places + 1] = LocalPlayer:FindFirstChildOfClass("PlayerGui") end)
+    for _, parent in ipairs(places) do
+        pcall(function()
+            for _, obj in ipairs(parent:GetChildren()) do
+                if obj:IsA("ScreenGui") and (obj.Name == GUI_NAME
+                    or string.match(obj.Name, "^StunEvade") or string.match(obj.Name, "^ForceHBE")) then
+                    obj:Destroy()
+                end
+            end
+        end)
+    end
+end
+
+-- close the previous copy, then sweep whatever else of ours is still there
+do
+    local e = env()
+    local oldCleanup = e.StunEvade_Cleanup
+    e.StunEvade_Cleanup = nil
+    if type(oldCleanup) == "function" then pcall(oldCleanup) end
+    -- a copy that died half way may have left the sink armed: release every key first
+    pcall(function() ContextActionService:UnbindAction(SINK_NAME) end)
+    sweepOldPanels()
+end
+
+------------------------------------------------------------------------
+-- cleanup (runs when the script is executed again - see RE-EXECUTE HANDLING above)
+------------------------------------------------------------------------
+local function cleanup()
+    if env().StunEvade_Cleanup == cleanup then env().StunEvade_Cleanup = nil end
+    -- 1) every loop, every listener and every pending task this copy made
+    for _, c in ipairs(connections) do
+        if type(c) == "thread" then
+            pcall(task.cancel, c)
+        else
+            pcall(function() c:Disconnect() end)
+        end
+    end
+    table.clear(connections)
+    -- 2) features off - the chase releases W/E, the sink releases every key
+    pcall(chaseStop, nil)
+    pcall(sinkSet, false)
+    pcall(function() setForce(false) end)
+    pcall(function() setBlock(false) end)
+    pcall(function() setHBE(false) end)
+    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
+    settings.autoEvade, settings.antiKick, settings.chaseMulti = false, false, false
+    -- 3) render-step / action bindings and the panel itself
+    pcall(function() RunService:UnbindFromRenderStep("StunEvade_EvadeMove") end)
+    pcall(function() RunService:UnbindFromRenderStep("StunEvade_ChaseMove") end)
+    pcall(function() ContextActionService:UnbindAction("StunEvade_EvadeSink") end)
+    pcall(function() ContextActionService:UnbindAction(SINK_NAME) end)
+    pcall(releaseSplash)
+    pcall(function() if gui then gui:Destroy() end end)
+    pcall(sweepOldPanels)
+end
+env().StunEvade_Cleanup = cleanup
+
+-- the intro image (needs this copy alive, so it starts at the very end of the load)
+task.spawn(splashIntro)
+
+log("loaded (build 24) - Ctrl+H toggles the panel; executing it again replaces this one")
