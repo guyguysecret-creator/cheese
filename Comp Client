@@ -88,7 +88,7 @@ local settings = {
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
     antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
-    antiKickKey = "K",     -- keyboard key that toggles Anti-kick (change it in the panel)
+    antiKickKey = "RightControl", -- key that toggles Anti-kick (change it in the panel)
     parryOffset = recommendedParryOffset(), -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping). Starts at the value recommended for YOUR ping when you run the script
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
@@ -3322,7 +3322,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v59"
+hint.Text = "Ctrl+H = hide  |  v60"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
