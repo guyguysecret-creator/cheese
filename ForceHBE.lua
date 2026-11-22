@@ -122,8 +122,9 @@ end))
 -- everything is also kept in a buffer that the menu shows in a small box under the panel.
 local logEntries = {}  -- { who = player name or nil (system line), msg = text }
 local logSink -- set once the UI exists
+local VERBOSE = false -- set true to get "[ForceHBE]" lines in your executor console again
 local function pushLog(who, msg)
-    pcall(print, "[ForceHBE]", msg)
+    if VERBOSE then pcall(print, "[ForceHBE]", msg) end
     table.insert(logEntries, { who = who, msg = msg })
     if #logEntries > 120 then table.remove(logEntries, 1) end
     if logSink then pcall(logSink) end
@@ -544,7 +545,7 @@ local AP = {
     TIME_VARIANCE = 0.12, -- per-swing random +-12% on the trigger time
     JITTER_MAX = 0.025,  -- extra human delay 0..25ms (triangular, ~12ms average)
     DASH_CLOSING = 22,   -- studs/s: attacker body rushing at you this fast = dash attack
-    DEBUG = true,        -- prints to F9 why a swing was ignored (turn off once it works well)
+    DEBUG = false,       -- (only matters when VERBOSE is on) explains why a swing/kick was ignored
     FALLBACK_HIT = 0.25, -- s into a swing the hit lands, only if no blade parts are found
 }
 
