@@ -1970,6 +1970,7 @@ end
 
 -- keybind: press the chosen key to toggle (set the key in the panel)
 local capturingKey = false
+-- does this input match a bind string like "CTRL+T" / "MB4" / "F"?
 local function matchesBind(bind, input)
     if bind == "" then return false end
     local base = bind:match("([^+]+)$")
@@ -1988,7 +1989,7 @@ local function matchesBind(bind, input)
     return true
 end
 track(UserInputService.InputBegan:Connect(function(input, processed)
-    if capturingKey then return end -- a keybind is being recorded: don't also toggle
+    if capturingKey then return end -- a bind is being recorded: don't also toggle
     if processed then return end
     if matchesBind(settings.evadeKey, input) then
         setEvade(not settings.autoEvade)
@@ -2222,25 +2223,22 @@ end)
 makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 makeSwitch(28, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold W + dash (E) away, faster than human timing
--- the switch and the keybind below both go through setEvade, so they never disagree
+-- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
+-- (the switch and the keybind below both call setEvade, so they can never disagree)
 local evadeSwitch
 function setEvade(on)
     settings.autoEvade = on
-    if evadeSwitch then evadeSwitch(on, true) end -- redraw the switch only
-    syncSink() -- Stun Evade ON = every key/mouse button except right click is swallowed
-    if on then installEvadeHook() end
-    log(on and "Stun evade ON - keys locked (only right click gets through)"
-        or "Stun evade OFF - keys unlocked")
+    if evadeSwitch then evadeSwitch(on, true) end -- redraw the switch, no callback
+    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying)
+    log("Stun evade " .. (on and "ON" or "OFF"))
 end
-evadeSwitch = makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
-    setEvade(on)
-end)
+evadeSwitch = makeSwitch(21, "Stun evade", settings.autoEvade, function(on) setEvade(on) end)
 
 ------------------------------------------------------------------------
 -- Stun evade keybind - the row right under the switch. Click the button, then
--- press the key you want: a single key (F), a combo while holding the modifiers
--- (CTRL+T, SHIFT+CTRL+F), or a mouse button (MB3 = the side button most mice have,
--- MB4). Esc while recording cancels and leaves the old bind alone.
+-- press what you want: a single key (F), a combo while holding the modifiers
+-- (CTRL+T, SHIFT+CTRL+F), or a mouse side button (MB3 = the side button most mice
+-- have, MB4). Esc while recording cancels and keeps the old bind.
 ------------------------------------------------------------------------
 do
     local row = makeRow(21.5, "Stun evade key")
