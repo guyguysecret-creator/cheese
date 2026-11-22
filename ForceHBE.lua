@@ -519,7 +519,8 @@ local AP = {
     HIT_RADIUS = 4.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
     MIN_CLOSING = 5,     -- studs/s: blade must be heading toward you at least this fast
     KICK_RESPONSE = "parry", -- what to do about an incoming kick: "parry" or "dash" (taps E)
-    KICK_RANGE = 9,      -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
+    KICK_TOL = 3,        -- studs of forgiveness around the kick's real hit box
+    KICK_RANGE = 9,     -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
     KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
     KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
@@ -790,9 +791,24 @@ local function assessThreat(plr, myHrp)
         local sinceStart = os.clock() - st.t0 + pingEma
         if sinceStart > AP.KICK_WINDUP + 0.75 + pingEma then return no("kick was already over") end
         local closingK = math.min(math.max(st.bodyClosing or 0, 0), 70)
+        -- slack: with high ping BOTH positions are stale (the kicker's by a ping, yours by
+        -- the time the kick lands), so the faster anyone is moving the less exact "d" is
+        local slack = math.min(pingEma, 0.5)
+            * (math.min(myHrp.AssemblyLinearVelocity.Magnitude, 60) + math.min(hrp.AssemblyLinearVelocity.Magnitude, 60)) * 0.5
+        -- Test 1 (geometry): is your body inside the kick's real hit box (4.5-stud cube
+        -- in front of the kicker) once we add tolerance for turning / ping drift?
+        local rel = hrp.CFrame:PointToObjectSpace(myHrp.Position)
+        local tol = AP.KICK_TOL + slack
+        local inBox = (-rel.Z) >= -1.5 and (-rel.Z) <= 4.5 + tol
+            and math.abs(rel.X) <= 2.25 + tol and math.abs(rel.Y) <= 2.25 + tol
+        -- Test 2 (old rule, now ping-aware): close enough + roughly facing you
         local reach = d - closingK * (AP.KICK_WINDUP + pingEma)
-        if reach > AP.KICK_RANGE then return no(("kicker too far (%.0f studs)"):format(d)) end
-        if face < AP.KICK_CONE and d > AP.NEAR_RANGE then return no("kicker not facing you") end
+        local coneK = AP.KICK_CONE - math.min(pingEma, 0.4) * 0.8 -- laggier = more forgiving aim
+        local nearOK = reach <= AP.KICK_RANGE + slack and (face >= coneK or d <= AP.NEAR_RANGE)
+        if not inBox and not nearOK then
+            if reach > AP.KICK_RANGE + slack then return no(("kicker too far (%.0f studs)"):format(d)) end
+            return no("kicker not facing you")
+        end
         -- a kick can't be cancelled and its windup is fixed, so there is nothing to wait
         -- for: answer the moment we recognise it (any waiting only costs ping-time we lack)
         return math.max(AP.KICK_WINDUP - sinceStart, 0), trk
@@ -866,6 +882,23 @@ local function sendParryClick()
     return pcall(function()
         saberComp.CombatStateMachine:Input("ATTACK", { inputState = Enum.UserInputState.Begin })
     end)
+end
+
+-- Parry through the game's own input handler - the exact function a real left-click
+-- calls (Lightsaber:ProcessInput), minus the delay of the OS mouse pipeline. If the
+-- game didn't start a parry (parry cooldown still not running after 80ms) we click.
+local function sendParryDirect()
+    local ok = pcall(function()
+        saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+    end)
+    if not ok then return sendParryClick() end
+    task.delay(0.08, function()
+        local sc = saberComp
+        if not sc or not saberStillValid(sc) then return end
+        local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") end)
+        if okC and not onCd then sendParryClick() end -- parry didn't register: real click
+    end)
+    return true
 end
 
 -- optional kick answer: tap E (Force Dash) to get out of the kick's hit box
@@ -958,7 +991,11 @@ track(RunService.Heartbeat:Connect(function(dt)
             end
         end
 
-        if sendParryClick() and not apLoggedFirst then
+        -- kicks are the time-critical case: use the game's own input path (no OS mouse
+        -- latency), with a real click as a back-up if it didn't take
+        local sent
+        if st2 and st2.isKick then sent = sendParryDirect() else sent = sendParryClick() end
+        if sent and not apLoggedFirst then
             apLoggedFirst = true
             log(("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
         end
@@ -1328,4 +1365,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 8: on-screen log) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 9: high-ping kicks) - Ctrl+H toggles the panel")
