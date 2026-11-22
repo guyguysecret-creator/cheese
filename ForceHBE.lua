@@ -1227,18 +1227,25 @@ local function doEvade()
 
         -- 2) hold W (the game's dash reads "is W down?" for the direction)
         if haveKeys then pcall(keypress, KEY_W) end
-        RunService.Heartbeat:Wait()                              -- let the game see the key
-        if saberStillValid(saberComp) then
-            pcall(function()
-                saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
-            end)
+        RunService.RenderStepped:Wait()                          -- earliest moment the game can see the key
+        local function sendDash()
+            if saberStillValid(saberComp) then
+                pcall(function()
+                    saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
+                end)
+            end
         end
-        RunService.Heartbeat:Wait()
-        RunService.Heartbeat:Wait()
-        if haveKeys and movementState() ~= "dashing" then       -- didn't take: real E tap
-            pcall(keypress, KEY_E)
-            task.wait(0.03)
-            pcall(keyrelease, KEY_E)
+        sendDash()
+        -- the dash starts synchronously, so ONE frame is enough to know whether it took.
+        -- If not: try the game's input again, and if that fails too a real E tap
+        RunService.RenderStepped:Wait()
+        if movementState() ~= "dashing" then
+            sendDash()
+            if haveKeys and movementState() ~= "dashing" then
+                pcall(keypress, KEY_E)
+                task.wait(0.02)
+                pcall(keyrelease, KEY_E)
+            end
         end
         task.wait(0.4)                                           -- keep W held through the dash
         if haveKeys then pcall(keyrelease, KEY_W) end
@@ -1349,6 +1356,42 @@ local function installAntiKick()
     antiKickStatus = classes.fsm and "active" or "active (partial)"
     pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end) -- mute stun sounds too
     return true
+end
+
+-- Auto Evade, EARLY trigger: hook the exact spot where the server's stun message arrives
+-- (Lightsaber:HandleSignal, request 15) and start the evade right there - before the game
+-- has even finished switching to its Stunned state - instead of waiting to notice the
+-- state change. doEvade waits one frame before dashing, so the stun has fully started by
+-- then. If Anti-kick is going to drop this stun there's nothing to escape, so skip it.
+local function installEvadeHook()
+    local env = (getgenv and getgenv()) or _G
+    -- each run points the hook at ITS doEvade/settings
+    env.ForceHBE_OnStun = function(payload)
+        if settings.antiKick and isKickStun(env, payload) then return end
+        doEvade()
+    end
+    if env.ForceHBE_EvadeHook then return true end
+    if type(hookfunction) ~= "function" or not saberStillValid(saberComp) then return false end
+    local okC, class = pcall(function()
+        local mt = getmetatable(saberComp)
+        if type(mt) ~= "table" then return nil end
+        if type(rawget(mt, "HandleSignal")) == "function" then return mt end
+        if type(mt.__index) == "table" and type(rawget(mt.__index, "HandleSignal")) == "function" then return mt.__index end
+        return nil
+    end)
+    if not okC or not class then return false end
+    local old
+    local okH = pcall(function()
+        old = hookfunction(rawget(class, "HandleSignal"), function(self, req, payload, ...)
+            local s = env.ForceHBE_Settings
+            if s and s.autoEvade and req == 15 and env.ForceHBE_OnStun then
+                pcall(env.ForceHBE_OnStun, payload)
+            end
+            return old(self, req, payload, ...)
+        end)
+    end)
+    if okH then env.ForceHBE_EvadeHook = true end
+    return okH
 end
 
 local antiKickSwitch -- set by the UI so the key can flip the on-screen switch too
@@ -1493,6 +1536,7 @@ track(task.spawn(function()
             if settings.block and blockMode == "delete" and blockHookedChar ~= char then
                 blockDeleteHook(char)
             end
+            if settings.autoEvade then installEvadeHook() end -- keeps retrying until it can hook
             if settings.antiKick then -- keeps retrying until it can hook
                 installAntiKick()
                 if antiKickStatusSink then antiKickStatusSink() end
@@ -1551,7 +1595,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v23"
+hint.Text = "Ctrl+H = hide  |  v24"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -1659,7 +1703,10 @@ makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
 makeSwitch(358, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
-makeSwitch(362, "Auto evade (stun)", settings.autoEvade, function(on) settings.autoEvade = on end)
+makeSwitch(362, "Auto evade (stun)", settings.autoEvade, function(on)
+    settings.autoEvade = on
+    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
+end)
 
 -- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
 antiKickSwitch = makeSwitch(364, "Anti-kick", settings.antiKick, function(on)
