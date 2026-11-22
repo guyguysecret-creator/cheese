@@ -1916,7 +1916,7 @@ do
     warn.TextSize = 10
     warn.TextColor3 = Color3.fromRGB(230, 150, 80)
     warn.TextXAlignment = Enum.TextXAlignment.Left
-    warn.Text = "  (Blatant - use at your own  discretion)"
+    warn.Text = "  (*Warning* Blatant)"
     warn.Parent = content
 end
 
