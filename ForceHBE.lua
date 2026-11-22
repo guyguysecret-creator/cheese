@@ -652,11 +652,25 @@ local function getCores(char)
 end
 
 -- called once per frame: refresh every attacker's blade speed + time-to-hit
+local plrVel, plrLastPos = {}, {} -- every player's body velocity, tracked all the time
+
 local function updateSwings(myHrp, dt)
     local myPos, myVel = myHrp.Position, myHrp.AssemblyLinearVelocity
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             local char = plr.Character
+            -- always know how fast everyone is moving, so the very first frame of a kick
+            -- already has a velocity to predict with (no 2-frame warm-up)
+            local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp0 and dt > 0 then
+                local last = plrLastPos[plr]
+                if last then
+                    local v = (hrp0.Position - last) / dt
+                    if v.Magnitude > 150 then v = Vector3.zero end -- respawn / teleport
+                    plrVel[plr] = (plrVel[plr] or v) * 0.5 + v * 0.5
+                end
+                plrLastPos[plr] = hrp0.Position
+            end
             local trk, isKick, isUnknown
             if char then trk, isKick, isUnknown = findAttackTrack(char) end
             local old = swingState[plr]
@@ -693,7 +707,7 @@ local function updateSwings(myHrp, dt)
                 -- from simply walking / strafing around you)
                 local hrpE = char:FindFirstChild("HumanoidRootPart")
                 local ePos = hrpE and hrpE.Position
-                local eVel = (ePos and st.prevE and dt > 0) and (ePos - st.prevE) / dt or Vector3.zero
+                local eVel = plrVel[plr] or Vector3.zero
                 st.prevE = ePos
                 st.eVel = eVel
 
@@ -930,6 +944,7 @@ local function responseAvailable(st, canParry)
     return canParry
 end
 
+local apStep
 track(RunService.Heartbeat:Connect(function(dt)
     if not settings.autoParry then return end
 
@@ -940,7 +955,13 @@ track(RunService.Heartbeat:Connect(function(dt)
         local rate = (p > pingEma) and 8 or 1.5
         pingEma = pingEma + (p - pingEma) * math.min(1, dt * rate)
     end
+    apStep(dt)
+end))
 
+-- the whole Auto Parry decision. Runs every frame AND the instant a kick animation starts
+-- (see the AnimationPlayed hook below), so we don't lose up to a frame waiting for the
+-- next Heartbeat - a tiny but real amount of time when you have high ping.
+apStep = function(dt)
     local char = LocalPlayer.Character
     local myHrp = char and char:FindFirstChild("HumanoidRootPart")
     if not myHrp then return end
@@ -1027,7 +1048,30 @@ track(RunService.Heartbeat:Connect(function(dt)
         end
     end
     if delay <= 0 then task.spawn(respond) else task.delay(delay, respond) end
-end))
+end
+
+-- the instant ANY player's kick animation starts playing, decide right away (event-driven)
+do
+    local function hook(plr)
+        if plr == LocalPlayer then return end
+        local function onChar(char)
+            task.spawn(function()
+                local hum = char:WaitForChild("Humanoid", 10)
+                local animator = hum and hum:WaitForChild("Animator", 10)
+                if not animator then return end
+                track(animator.AnimationPlayed:Connect(function(t)
+                    if not settings.autoParry then return end
+                    local ok, id = pcall(function() return string.match(t.Animation.AnimationId, "%d+") end)
+                    if ok and id == KICK_ID then apStep(0) end
+                end))
+            end)
+        end
+        if plr.Character then onChar(plr.Character) end
+        track(plr.CharacterAdded:Connect(onChar))
+    end
+    for _, plr in ipairs(Players:GetPlayers()) do hook(plr) end
+    track(Players.PlayerAdded:Connect(hook))
+end
 
 ------------------------------------------------------------------------
 -- Self-heal: every 2s re-check that ON features are really applied to your
@@ -1527,4 +1571,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 12: kick prediction) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 13: instant kick reaction) - Ctrl+H toggles the panel")
