@@ -50,7 +50,8 @@ local settings = {
     parry = false,
     kick = false,
     autoParry = false,
-    parryOffset = -100,    -- ms: Auto Parry timing, + = later, - = earlier
+    pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
+    parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping)
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
     hbeTransparency = 0.7, -- so you can see the box
@@ -725,6 +726,12 @@ local function triggerTime(trk)
         swingVariance[trk] = v
     end
     local offset = (settings.parryOffset or 0) / 1000 -- + = later, - = earlier
+    if settings.pingAdjust then
+        -- "ping sweet spot": your own ping, flipped negative, plus the box value on top
+        -- (e.g. 80ms ping + box -75 => -155ms). Because pingEma follows your live ping, a
+        -- spike makes it fire earlier and a drop makes it fire later, automatically.
+        offset = offset - pingEma
+    end
     return math.max((pingEma + AP.AIM) * v - offset, 0.02)
 end
 
@@ -859,7 +866,12 @@ track(RunService.Heartbeat:Connect(function(dt)
     if not settings.autoParry then return end
 
     local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
-    if okP and type(p) == "number" then pingEma = pingEma + (p - pingEma) * math.min(1, dt * 2) end
+    if okP and type(p) == "number" then
+        -- follow a spike quickly (so we compensate right away) but come back down gently
+        -- (so one lucky low reading doesn't make us late)
+        local rate = (p > pingEma) and 8 or 1.5
+        pingEma = pingEma + (p - pingEma) * math.min(1, dt * rate)
+    end
 
     local char = LocalPlayer.Character
     local myHrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -923,7 +935,7 @@ track(RunService.Heartbeat:Connect(function(dt)
 
         if sendParryClick() and not apLoggedFirst then
             apLoggedFirst = true
-            log("Auto Parry fired (first one this session) vs " .. bestPlr.Name)
+            log(("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
         end
     end
     if delay <= 0 then task.spawn(respond) else task.delay(delay, respond) end
@@ -973,8 +985,8 @@ local COLORS = {
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 440)
-frame.Position = UDim2.new(0, 20, 0.5, -220)
+frame.Size = UDim2.fromOffset(250, 480)
+frame.Position = UDim2.new(0, 20, 0.5, -240)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -989,7 +1001,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Swift heh"
+title.Text = "Force + HBE"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
@@ -1066,6 +1078,7 @@ makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on
 makeSwitch(198, "Auto Parry", settings.autoParry, function(on) settings.autoParry = on end)
 makeSwitch(238, "Hitbox Expander", settings.hbe, setHBE)
 makeSwitch(278, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
+makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -1089,12 +1102,13 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(318, "Hitbox size", "hbeSize", 2, 50)
+makeNumberBox(358, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(358, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(398, "Transparency (0-1)", "hbeTransparency", 0, 1)
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
--- parry too LATE (you get hit first) -> lower it (negative is fine)
-makeNumberBox(398, "Parry timing (ms)", "parryOffset", -500, 500)
+-- parry too LATE (you get hit first) -> lower it (negative is fine).
+-- With "Parry follows ping" ON this is added on top of your (negated) live ping.
+makeNumberBox(438, "Parry timing (ms)", "parryOffset", -500, 500)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
