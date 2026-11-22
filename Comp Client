@@ -1780,7 +1780,7 @@ warn.Font = Enum.Font.GothamMedium
 warn.TextSize = 10
 warn.TextColor3 = Color3.fromRGB(230, 150, 80)
 warn.TextXAlignment = Enum.TextXAlignment.Left
-warn.Text = "  (Blatant - use at your own discretion)"
+warn.Text = "  (Very blatant - use at your own discretion)"
 warn.Parent = content
 end
 -- keybind row: click the button, then press the key you want (Esc cancels)
