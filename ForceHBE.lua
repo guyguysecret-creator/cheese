@@ -1200,6 +1200,35 @@ local function movementState()
     return ok and st or nil
 end
 
+-- BLOCK BUFFER: the game doesn't let you block while dashing or while stunned (blocking is
+-- refused when the movement state is dashing/running/flipping/skidding, and the combat
+-- state during a stun isn't a state that accepts block at all), and the key-press that
+-- happens during that time is simply lost - you'd have to let go and press again after
+-- the dash. This remembers that you're holding right-click and presses block for you the
+-- very first moment the game allows it - the same input a real right-click sends - so the
+-- block is up right as the evade ends. (It can't make you block DURING the dash/stun:
+-- that would mean telling the server you're blocking when the game says you can't.)
+local function blockBuffer()
+    local t0 = os.clock()
+    while os.clock() - t0 < 3 and settings.autoEvade do
+        local sc = saberComp
+        if saberStillValid(sc) then
+            local okS, cs = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+            if okS and cs == "blocking" then return end
+            if okS and cs == "ignited"
+                and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+                local ms = movementState()
+                if ms ~= "dashing" and ms ~= "flipping" and ms ~= "low_flipping" and ms ~= "skidding" then
+                    pcall(function()
+                        sc:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.Begin })
+                    end)
+                end
+            end
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
 local function doEvade()
     if evadeBusy or not settings.autoEvade then return end
     evadeBusy = true
@@ -1247,6 +1276,7 @@ local function doEvade()
                 pcall(keyrelease, KEY_E)
             end
         end
+        task.spawn(blockBuffer)                                  -- hold right-click => block the instant it's allowed
         task.wait(0.4)                                           -- keep W held through the dash
         if haveKeys then pcall(keyrelease, KEY_W) end
         if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end -- camera back to normal
@@ -1595,7 +1625,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v24"
+hint.Text = "Ctrl+H = hide  |  v25"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
