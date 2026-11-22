@@ -657,6 +657,11 @@ local function updateSwings(myHrp, dt)
                     st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil,
                            isKick = isKick, unknown = isUnknown, t0 = os.clock(), maxSwing = 0 }
                     swingState[plr] = st
+                    if isKick and AP.DEBUG then
+                        local hrpK = char:FindFirstChild("HumanoidRootPart")
+                        log(("Auto Parry SAW a kick from %s (%.0f studs away)"):format(
+                            plr.Name, hrpK and (hrpK.Position - myPos).Magnitude or -1))
+                    end
                 end
                 local pts = {}
                 for _, core in ipairs(getCores(char)) do
@@ -1083,7 +1088,19 @@ makeSwitch(38, "Infinite Force", settings.force, setForce)
 makeSwitch(78, "Infinite Block", settings.block, setBlock)
 makeSwitch(118, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
 makeSwitch(158, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(198, "Auto Parry", settings.autoParry, function(on) settings.autoParry = on end)
+makeSwitch(198, "Auto Parry", settings.autoParry, function(on)
+    settings.autoParry = on
+    if on then
+        -- self-test so you can see in F9 whether everything Auto Parry needs is there
+        task.delay(2.5, function()
+            if not settings.autoParry then return end
+            log(("Auto Parry ON | lightsaber component: %s | click function: %s | live ping %.0f ms"):format(
+                saberStillValid(saberComp) and "found" or "NOT FOUND (equip + ignite your saber; needs getgc)",
+                (type(mouse1click) == "function" or type(mouse1press) == "function") and "yes" or "NO (executor has no mouse1click)",
+                pingEma * 1000))
+        end)
+    end
+end)
 makeSwitch(238, "Hitbox Expander", settings.hbe, setHBE)
 makeSwitch(278, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
@@ -1267,4 +1284,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-print("[ForceHBE] loaded - Ctrl+H toggles the panel")
+print("[ForceHBE] loaded (auto-parry build 7: kick debug) - Ctrl+H toggles the panel")
