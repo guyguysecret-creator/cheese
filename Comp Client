@@ -1,8 +1,4 @@
-# Roblox Stun Evade script
-
-## User
-
-Fix my script based on the stuff I have right now and this Roblox place if you need. Fix my Stun Evade script to where none of your keyboard keys or mouse buttons register in the game EXCEPT FOR RIGHT CLICK, because when you tap some keys it interrupts and stops the Stun Evade so fix that for me. And then create a new feature and add the toggle for it in the UI to where when you parry and stun someone, you automatically dash to where they evade or move to and then multi hit right after continuously THEN STOP immediately when their stun animation ends. The way you multi is W then E IMMEDIATELY AFTER AND THEN LEFT CLICK TO SWING SABER. Make sure the multis are as fast as you can while still executing them properly. Also finally fix my auto parry script so when I parry someone I can immediately chase them after because right now there is a delay. --[[
+--[[
     Infinite Force + Hitbox Expander - one script, one small UI (made for Potassium)
 
     Infinite Force (same as InfiniteForce.lua v5):
@@ -984,4 +980,4 @@ local function sendParryDirect()
     task.delay(0.08, function()
         local sc = saberComp
         if not sc or not saberStillValid(sc) then return end
-        local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") ... (61 KB left)
+     ... (55 KB left)
