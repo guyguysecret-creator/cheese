@@ -1274,7 +1274,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide"
+hint.Text = "Ctrl+H = hide  |  v17"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -1604,4 +1604,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (build 16: anti-kick + compact scrolling menu) - Ctrl+H toggles the panel")
+log("loaded (build 17: no log box) - Ctrl+H toggles the panel")
