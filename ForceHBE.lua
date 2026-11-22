@@ -52,6 +52,8 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
+    antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
+    antiKickKey = "K",     -- keyboard key that toggles Anti-kick (change it in the panel)
     parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping)
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
@@ -377,7 +379,7 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock or settings.autoParry) then return end
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.antiKick) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
         -- the component is rebuilt when you equip/respawn; rescan every 2s until found
@@ -1122,6 +1124,77 @@ do
 end
 
 ------------------------------------------------------------------------
+-- Anti-kick
+--   When a kick lands, the SERVER sends your game a "stun" message (type BLOCK_KICKED
+--   or PARRY_KICKED) and your game then puts you in the Stunned state: you can't act
+--   and the camera shakes. This hooks the saber component's HandleSignal (the function
+--   that receives that message) and drops those two stun types, so on YOUR screen you
+--   simply aren't stunned and keep full control.
+--   Honest limits: the server still decided the kick connected, so your block/parry
+--   state or any damage on the server side is not undone, and if the server also locks
+--   your actions while "stunned" you may still be blocked from some of them. It does
+--   not turn a landed kick into a real parry - that can't be done from the client.
+--   Needs hookfunction + getgc (same as the other getgc features).
+------------------------------------------------------------------------
+local function installAntiKick()
+    local env = (getgenv and getgenv()) or _G
+    -- each (re)run of this script points the hook's notifier at ITS log
+    env.ForceHBE_KickNotify = function(stunType)
+        logP("kick-stun", "Anti-kick: ignored a " .. (stunType == 3 and "block-breaking" or "parry-breaking") .. " kick stun")
+    end
+    if env.ForceHBE_KickHooked then return true end
+    if type(hookfunction) ~= "function" then return false, "your executor has no hookfunction" end
+    if not saberStillValid(saberComp) then return false, "lightsaber component not found yet (equip + ignite your saber)" end
+    local okC, class = pcall(function()
+        local mt = getmetatable(saberComp)
+        if type(mt) ~= "table" then return nil end
+        if type(rawget(mt, "HandleSignal")) == "function" then return mt end
+        if type(mt.__index) == "table" and type(rawget(mt.__index, "HandleSignal")) == "function" then return mt.__index end
+        return nil
+    end)
+    if not okC or not class then return false, "couldn't find the saber class (HandleSignal)" end
+    local fn = rawget(class, "HandleSignal")
+    local old
+    local okH, err = pcall(function()
+        old = hookfunction(fn, function(self, req, payload, ...)
+            local s = env.ForceHBE_Settings
+            if s and s.antiKick and req == 15 and type(payload) == "table" then -- 15 = STUN
+                local t = payload.StunType
+                if t == 3 or t == 4 then -- BLOCK_KICKED / PARRY_KICKED
+                    local n = env.ForceHBE_KickNotify
+                    if n then pcall(n, t) end
+                    return
+                end
+            end
+            return old(self, req, payload, ...)
+        end)
+    end)
+    if not okH then return false, "hook failed: " .. tostring(err) end
+    env.ForceHBE_KickHooked = true
+    return true
+end
+
+local antiKickSwitch -- set by the UI so the key can flip the on-screen switch too
+local function setAntiKick(on)
+    settings.antiKick = on
+    if antiKickSwitch then antiKickSwitch(on, true) end
+    if on then
+        local ok, why = installAntiKick()
+        if ok then log("Anti-kick ON - kick stuns are ignored on your screen")
+        else log("Anti-kick ON but not active yet: " .. tostring(why) .. " (retrying every 2s)") end
+    else
+        log("Anti-kick OFF")
+    end
+end
+
+-- keybind: press the chosen key to toggle (set the key in the panel)
+local capturingKey = false -- true while you're choosing a new key in the panel
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or capturingKey or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+    if input.KeyCode.Name == settings.antiKickKey then setAntiKick(not settings.antiKick) end
+end))
+
+------------------------------------------------------------------------
 -- Self-heal: every 2s re-check that ON features are really applied to your
 -- CURRENT character (covers respawns, the game resetting attributes, etc.).
 -- Features never depend on the panel being visible.
@@ -1137,6 +1210,14 @@ track(task.spawn(function()
             end
             if settings.block and blockMode == "delete" and blockHookedChar ~= char then
                 blockDeleteHook(char)
+            end
+            if settings.antiKick then
+                local ok = installAntiKick()
+                local env = (getgenv and getgenv()) or _G
+                if ok and not env.ForceHBE_KickLogged then
+                    env.ForceHBE_KickLogged = true
+                    log("Anti-kick is active")
+                end
             end
         end
     end
@@ -1165,8 +1246,8 @@ local COLORS = {
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 520)
-frame.Position = UDim2.new(0, 20, 0.5, -260)
+frame.Size = UDim2.fromOffset(210, 320) -- compact; the rows scroll (mouse wheel)
+frame.Position = UDim2.new(0, 20, 0.5, -160)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -1174,22 +1255,22 @@ frame.Parent = gui
 Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
 local title = Instance.new("TextLabel")
-title.Size = UDim2.new(1, -16, 0, 28)
-title.Position = UDim2.fromOffset(8, 4)
+title.Size = UDim2.new(1, -16, 0, 26)
+title.Position = UDim2.fromOffset(8, 2)
 title.BackgroundTransparency = 1
 title.Font = Enum.Font.GothamBold
-title.TextSize = 14
+title.TextSize = 13
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
 title.Text = "comp"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
-hint.Size = UDim2.new(1, -16, 0, 28)
-hint.Position = UDim2.fromOffset(8, 4)
+hint.Size = UDim2.new(1, -16, 0, 26)
+hint.Position = UDim2.fromOffset(8, 2)
 hint.BackgroundTransparency = 1
 hint.Font = Enum.Font.Gotham
-hint.TextSize = 11
+hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
 hint.Text = "Ctrl+H = hide"
@@ -1197,28 +1278,47 @@ hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
 -- password is entered
-local content = Instance.new("Frame")
-content.Size = UDim2.fromScale(1, 1)
+-- a scrolling list: mouse wheel (or drag the thin bar) to scroll; rows stack in the order
+-- they're created (the first number given to makeRow/makeSwitch is just the sort order)
+local content = Instance.new("ScrollingFrame")
+content.Size = UDim2.new(1, 0, 1, -30)
+content.Position = UDim2.fromOffset(0, 30)
 content.BackgroundTransparency = 1
 content.BorderSizePixel = 0
+content.ScrollBarThickness = 4
+content.ScrollBarImageColor3 = COLORS.sub
+content.ScrollingDirection = Enum.ScrollingDirection.Y
+content.CanvasSize = UDim2.new(0, 0, 0, 0)
+content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.Visible = false
 content.Parent = frame
+do
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 4)
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    layout.Parent = content
+    local pad = Instance.new("UIPadding")
+    pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 2), UDim.new(0, 8)
+    pad.Parent = content
+end
 
 local function makeRow(y, labelText)
     local row = Instance.new("Frame")
-    row.Size = UDim2.new(1, -16, 0, 34)
-    row.Position = UDim2.fromOffset(8, y)
+    row.Size = UDim2.new(1, -16, 0, 26)
+    row.LayoutOrder = y
     row.BackgroundColor3 = COLORS.panel
     row.BorderSizePixel = 0
     row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -80, 1, 0)
-    label.Position = UDim2.fromOffset(10, 0)
+    label.Size = UDim2.new(1, -70, 1, 0)
+    label.Position = UDim2.fromOffset(8, 0)
     label.BackgroundTransparency = 1
     label.Font = Enum.Font.Gotham
-    label.TextSize = 13
+    label.TextSize = 11
+    label.TextTruncate = Enum.TextTruncate.AtEnd
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextColor3 = COLORS.text
     label.Text = labelText
@@ -1230,11 +1330,11 @@ local function makeSwitch(y, labelText, initial, onChanged)
     local row = makeRow(y, labelText)
     local state = initial
     local btn = Instance.new("TextButton")
-    btn.Size = UDim2.fromOffset(56, 22)
-    btn.Position = UDim2.new(1, -64, 0.5, -11)
+    btn.Size = UDim2.fromOffset(46, 18)
+    btn.Position = UDim2.new(1, -52, 0.5, -9)
     btn.BorderSizePixel = 0
     btn.Font = Enum.Font.GothamBold
-    btn.TextSize = 12
+    btn.TextSize = 10
     btn.TextColor3 = Color3.new(1, 1, 1)
     btn.AutoButtonColor = true
     btn.Parent = row
@@ -1249,6 +1349,12 @@ local function makeSwitch(y, labelText, initial, onChanged)
         onChanged(state)
     end)
     render()
+    -- lets other code (e.g. a keybind) flip this switch: setter(on, skipCallback)
+    return function(on, skipCallback)
+        state = on
+        render()
+        if not skipCallback then onChanged(on) end
+    end
 end
 
 makeSwitch(38, "Infinite Force", settings.force, setForce)
@@ -1275,16 +1381,57 @@ makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
 makeSwitch(358, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 
+-- Anti-kick: toggle here or with its key (rebindable right below)
+antiKickSwitch = makeSwitch(362, "Anti-kick", settings.antiKick, function(on)
+    if on ~= settings.antiKick then setAntiKick(on) end
+end)
+
+-- keybind row: click the button, then press the key you want (Esc cancels)
+do
+    local row = makeRow(364, "Anti-kick key")
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.fromOffset(46, 18)
+    btn.Position = UDim2.new(1, -52, 0.5, -9)
+    btn.BackgroundColor3 = COLORS.bg
+    btn.BorderSizePixel = 0
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 10
+    btn.TextColor3 = COLORS.text
+    btn.Text = settings.antiKickKey
+    btn.AutoButtonColor = true
+    btn.Parent = row
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+    local listening, conn = false, nil
+    btn.MouseButton1Click:Connect(function()
+        if listening then return end
+        listening = true
+        capturingKey = true
+        btn.Text = "..."
+        conn = UserInputService.InputBegan:Connect(function(input)
+            if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+            if conn then conn:Disconnect() conn = nil end
+            listening = false
+            task.defer(function() capturingKey = false end) -- after the toggle listener has seen this same press
+            if input.KeyCode ~= Enum.KeyCode.Escape then
+                settings.antiKickKey = input.KeyCode.Name
+            end
+            btn.Text = settings.antiKickKey
+        end)
+        track(conn)
+    end)
+end
+
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
     local row = makeRow(y, labelText)
     local box = Instance.new("TextBox")
-    box.Size = UDim2.fromOffset(56, 22)
-    box.Position = UDim2.new(1, -64, 0.5, -11)
+    box.Size = UDim2.fromOffset(46, 18)
+    box.Position = UDim2.new(1, -52, 0.5, -9)
     box.BackgroundColor3 = COLORS.bg
     box.BorderSizePixel = 0
     box.Font = Enum.Font.GothamBold
-    box.TextSize = 12
+    box.TextSize = 10
     box.TextColor3 = COLORS.text
     box.Text = tostring(settings[key])
     box.ClearTextOnFocus = false
@@ -1392,7 +1539,7 @@ do
     -- Starts at the bottom-left, drag it anywhere. Shows/hides with the menu (Ctrl+H) and
     -- only after you've unlocked.
     local box = Instance.new("Frame")
-    box.Size = UDim2.fromOffset(300, 190)
+    box.Size = UDim2.fromOffset(250, 160)
     box.AnchorPoint = Vector2.new(0, 1)
     box.Position = UDim2.new(0, 20, 1, -20)
     box.BackgroundColor3 = COLORS.bg
@@ -1611,6 +1758,7 @@ local function cleanup()
     setForce(false)
     setBlock(false)
     settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
+    settings.antiKick = false
     setHBE(false)
     for _, c in ipairs(connections) do
         if type(c) == "thread" then
@@ -1623,4 +1771,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 15: dash guard + stable combos) - Ctrl+H toggles the panel")
+log("loaded (build 16: anti-kick + compact scrolling menu) - Ctrl+H toggles the panel")
