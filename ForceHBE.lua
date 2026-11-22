@@ -117,17 +117,21 @@ end))
 
 -- Some executors send print() to their OWN console instead of Roblox's F9 console, so
 -- everything is also kept in a buffer that the menu shows in a small box under the panel.
-local logLines = {}
+local logEntries = {}  -- { who = player name or nil (system line), msg = text }
 local logSink -- set once the UI exists
-local function log(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-    local msg = table.concat(parts, " ")
+local function pushLog(who, msg)
     pcall(print, "[ForceHBE]", msg)
-    table.insert(logLines, msg)
-    if #logLines > 40 then table.remove(logLines, 1) end
+    table.insert(logEntries, { who = who, msg = msg })
+    if #logEntries > 120 then table.remove(logEntries, 1) end
     if logSink then pcall(logSink) end
 end
+local function joinArgs(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    return table.concat(parts, " ")
+end
+local function log(...) pushLog(nil, joinArgs(...)) end            -- system line
+local function logP(who, ...) pushLog(who, joinArgs(...)) end      -- line about one player
 
 ------------------------------------------------------------------------
 -- Infinite Block
@@ -616,7 +620,7 @@ local function findAttackTrack(char)
         if hasBlade then
             if AP.DEBUG and not loggedUnknown[unknown[2]] then
                 loggedUnknown[unknown[2]] = true
-                log("Auto Parry: treating unrecognised animation " .. unknown[2] .. " as a swing (custom attack pack?)")
+                logP(char.Name, "Auto Parry: treating unrecognised animation " .. unknown[2] .. " from " .. char.Name .. " as a swing (custom attack pack?)")
             end
             return unknown[1], false, true
         end
@@ -660,7 +664,7 @@ local function updateSwings(myHrp, dt)
                 and old.why ~= "too early" and os.clock() - (AP._lastDbg or 0) > 0.7 then
                 -- that swing/kick ended without us answering it: say why (rate-limited)
                 AP._lastDbg = os.clock()
-                log(("Auto Parry ignored %s from %s: %s"):format(old.isKick and "kick" or "swing", plr.Name, old.why))
+                logP(plr.Name, ("Auto Parry ignored %s from %s: %s"):format(old.isKick and "kick" or "swing", plr.Name, old.why))
             end
             if not trk then
                 swingState[plr] = nil
@@ -672,7 +676,7 @@ local function updateSwings(myHrp, dt)
                     swingState[plr] = st
                     if isKick and AP.DEBUG then
                         local hrpK = char:FindFirstChild("HumanoidRootPart")
-                        log(("Auto Parry SAW a kick from %s (%.0f studs away)"):format(
+                        logP(plr.Name, ("Auto Parry SAW a kick from %s (%.0f studs away)"):format(
                             plr.Name, hrpK and (hrpK.Position - myPos).Magnitude or -1))
                     end
                 end
@@ -997,7 +1001,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         if st2 and st2.isKick then sent = sendParryDirect() else sent = sendParryClick() end
         if sent and not apLoggedFirst then
             apLoggedFirst = true
-            log(("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
+            logP(bestPlr.Name, ("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
         end
     end
     if delay <= 0 then task.spawn(respond) else task.delay(delay, respond) end
@@ -1264,8 +1268,11 @@ end)
 -- on-screen log box (under the panel, moves/hides with it): the same lines the script
 -- prints to F9, in case your executor doesn't show print() there
 do
+    local selected = {}   -- [player name] = true ; empty = show everything
+    local nSelected = 0
+
     local box = Instance.new("Frame")
-    box.Size = UDim2.new(1, 0, 0, 170)
+    box.Size = UDim2.new(1, 0, 0, 190)
     box.Position = UDim2.new(0, 0, 1, 6)
     box.BackgroundColor3 = COLORS.bg
     box.BackgroundTransparency = 0.15
@@ -1273,9 +1280,23 @@ do
     box.Parent = content
     Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
 
+    -- "Track: ..." button that opens the player list
+    local pick = Instance.new("TextButton")
+    pick.Size = UDim2.new(1, -12, 0, 24)
+    pick.Position = UDim2.fromOffset(6, 6)
+    pick.BackgroundColor3 = COLORS.panel
+    pick.BorderSizePixel = 0
+    pick.Font = Enum.Font.GothamBold
+    pick.TextSize = 12
+    pick.TextColor3 = COLORS.text
+    pick.TextTruncate = Enum.TextTruncate.AtEnd
+    pick.AutoButtonColor = true
+    pick.Parent = box
+    Instance.new("UICorner", pick).CornerRadius = UDim.new(0, 6)
+
     local lbl = Instance.new("TextLabel")
-    lbl.Size = UDim2.new(1, -12, 1, -8)
-    lbl.Position = UDim2.fromOffset(6, 4)
+    lbl.Size = UDim2.new(1, -12, 1, -38)
+    lbl.Position = UDim2.fromOffset(6, 34)
     lbl.BackgroundTransparency = 1
     lbl.Font = Enum.Font.Code
     lbl.TextSize = 11
@@ -1286,11 +1307,100 @@ do
     lbl.Text = ""
     lbl.Parent = box
 
-    logSink = function()
-        local from = math.max(1, #logLines - 11)
-        lbl.Text = table.concat(logLines, "\n", from, #logLines)
+    -- the drop-down list (opens over the log text)
+    local list = Instance.new("ScrollingFrame")
+    list.Size = UDim2.new(1, -12, 0, 150)
+    list.Position = UDim2.fromOffset(6, 32)
+    list.BackgroundColor3 = COLORS.panel
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 4
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.Visible = false
+    list.ZIndex = 5
+    list.Parent = box
+    Instance.new("UICorner", list).CornerRadius = UDim.new(0, 6)
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = list
+
+    local function render()
+        -- button text
+        if nSelected == 0 then
+            pick.Text = "Track: everyone  v"
+        else
+            local names = {}
+            for n in pairs(selected) do names[#names + 1] = n end
+            table.sort(names)
+            pick.Text = "Track: " .. table.concat(names, ", ") .. "  v"
+        end
+        -- log text: only lines about selected players (system lines only when tracking everyone)
+        local out = {}
+        for i = #logEntries, 1, -1 do
+            local e = logEntries[i]
+            local show
+            if nSelected == 0 then show = true else show = e.who ~= nil and selected[e.who] == true end
+            if show then
+                table.insert(out, 1, e.msg)
+                if #out >= 12 then break end
+            end
+        end
+        lbl.Text = (#out > 0) and table.concat(out, "\n")
+            or (nSelected > 0 and "(nothing yet from the selected players)" or "")
     end
-    logSink()
+    logSink = render
+
+    local function entry(order, text, isOn, onClick)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -6, 0, 22)
+        b.LayoutOrder = order
+        b.BackgroundColor3 = isOn and COLORS.on or COLORS.panel
+        b.BackgroundTransparency = isOn and 0.35 or 0
+        b.BorderSizePixel = 0
+        b.Font = Enum.Font.Gotham
+        b.TextSize = 12
+        b.TextColor3 = COLORS.text
+        b.TextXAlignment = Enum.TextXAlignment.Left
+        b.Text = "  " .. (isOn and "[x] " or "[ ] ") .. text
+        b.ZIndex = 6
+        b.Parent = list
+        b.MouseButton1Click:Connect(onClick)
+        return b
+    end
+
+    local function rebuildList()
+        for _, c in ipairs(list:GetChildren()) do
+            if c:IsA("TextButton") then c:Destroy() end
+        end
+        entry(0, "Everyone (clear selection)", nSelected == 0, function()
+            table.clear(selected); nSelected = 0
+            rebuildList(); render()
+        end)
+        local names = {}
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer then names[#names + 1] = plr.Name end
+        end
+        table.sort(names)
+        for i, name in ipairs(names) do
+            entry(i, name, selected[name] == true, function()
+                if selected[name] then selected[name] = nil; nSelected -= 1
+                else selected[name] = true; nSelected += 1 end
+                rebuildList(); render()
+            end)
+        end
+    end
+
+    pick.MouseButton1Click:Connect(function()
+        list.Visible = not list.Visible
+        if list.Visible then rebuildList() end
+    end)
+    track(Players.PlayerAdded:Connect(function() if list.Visible then rebuildList() end end))
+    track(Players.PlayerRemoving:Connect(function(p)
+        if selected[p.Name] then selected[p.Name] = nil; nSelected -= 1 end
+        task.defer(function() if list.Visible then rebuildList() end; render() end)
+    end))
+
+    render()
 end
 
 -- dragging
@@ -1365,4 +1475,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 9: high-ping kicks) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 10: player filter) - Ctrl+H toggles the panel")
