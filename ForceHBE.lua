@@ -522,6 +522,7 @@ end
 local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
+    EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
     DASH_GUARD_SPEED = 25, -- studs/s toward you that counts as "dashing at you"
     DASH_GUARD_RANGE = 70, -- studs
     DASH_GUARD_LEAD = 0.1, -- s extra lead (on top of ping) for the dash-guard parry
@@ -1166,9 +1167,17 @@ end
 local evadeBusy, wasStunned, lastCSM = false, false, nil
 local KEY_W, KEY_E = 0x57, 0x45
 
--- which way is AWAY? from whoever is attacking you (a player with a swing/kick/dash in
--- progress first), otherwise the nearest enemy within 60 studs. Flat (no up/down).
-local function awayDirection(hrp)
+local KEY_A, KEY_D = 0x41, 0x44
+
+-- WHERE TO GO. The attacker = whoever has a swing/kick/dash in progress first, otherwise
+-- the nearest player within 60 studs. All vectors are flat (no up/down).
+--   * attacker NOT looking straight at you: evade OPPOSITE to where they're looking
+--     (-lookVector) - i.e. away from the side they're facing, never into their swing.
+--   * attacker looking DIRECTLY at you (the case where "opposite of their look" would send
+--     you straight past/through them): turn away from them and slip out DIAGONALLY,
+--     W+A or W+D, picked at random.
+-- returns faceDir, moveDir, sideKey (a virtual-key code or nil)
+local function evadePlan(hrp)
     local best, bestPri, bestD
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
@@ -1184,13 +1193,25 @@ local function awayDirection(hrp)
             end
         end
     end
-    local v
-    if best then v = Vector3.new(hrp.Position.X - best.Position.X, 0, hrp.Position.Z - best.Position.Z) end
-    if not v or v.Magnitude < 0.1 then
-        local look = hrp.CFrame.LookVector
-        v = Vector3.new(-look.X, 0, -look.Z) -- nobody near: just turn around
+    local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+    local function unit(v, fallback)
+        if v.Magnitude < 0.05 then return fallback end
+        return v.Unit
     end
-    return v.Unit
+    local myLook = unit(flat(hrp.CFrame.LookVector), Vector3.new(0, 0, -1))
+    if not best then
+        local back = -myLook -- nobody near: just turn around
+        return back, back, nil
+    end
+    local away = unit(flat(hrp.Position - best.Position), -myLook)        -- from attacker to you
+    local f = unit(flat(best.CFrame.LookVector), away)                    -- where the attacker looks
+    local facingYou = f:Dot(away)                                         -- 1 = looking straight at you
+    if facingYou >= AP.EVADE_FACING then
+        local side = (math.random(2) == 1) and 1 or -1                    -- +1 = left (A), -1 = right (D)
+        local move = CFrame.Angles(0, math.rad(45 * side), 0):VectorToWorldSpace(away)
+        return away, move, (side == 1) and KEY_A or KEY_D
+    end
+    return -f, -f, nil
 end
 
 local function movementState()
@@ -1234,28 +1255,47 @@ local function doEvade()
     evadeBusy = true
     task.spawn(function()
         local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
-
-        -- 1) TURN AROUND instantly: face away from the attacker (character + camera, since
-        --    W moves you the way the camera points), then dash FORWARD (W) = away from them
         local cam = workspace.CurrentCamera
-        local prevCamType
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        if hrp then
-            local away = awayDirection(hrp)
-            pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + away) end)
-            if cam then
-                pcall(function()
-                    prevCamType = cam.CameraType
-                    cam.CameraType = Enum.CameraType.Scriptable
-                    local eye = hrp.Position - away * 10 + Vector3.new(0, 4, 0)
-                    cam.CFrame = CFrame.lookAt(eye, hrp.Position + away * 20)
-                end)
-            end
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if not hrp then evadeBusy = false return end
+
+        -- 1) DECIDE the direction, TURN instantly (character + camera: the game moves you
+        --    the way the camera points), and press the matching keys: W, plus A or D when
+        --    slipping out diagonally
+        local faceDir, moveDir, sideKey = evadePlan(hrp)
+        local prevCamType
+        pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
+        if cam then
+            pcall(function()
+                prevCamType = cam.CameraType
+                cam.CameraType = Enum.CameraType.Scriptable
+                local eye = hrp.Position - faceDir * 10 + Vector3.new(0, 4, 0)
+                cam.CFrame = CFrame.lookAt(eye, hrp.Position + faceDir * 20)
+            end)
         end
 
-        -- 2) hold W (the game's dash reads "is W down?" for the direction)
-        if haveKeys then pcall(keypress, KEY_W) end
+        -- 2) NO KEY CAN MESS IT UP: a sink bound above the game's own bindings swallows
+        --    W/A/S/D (and the mouse attack button) while the evade runs, and we steer the
+        --    character ourselves every frame. (The game only asks "is W down?" through
+        --    UserInputService:IsKeyDown, which the sink does not affect.)
+        local CAS = game:GetService("ContextActionService")
+        pcall(function()
+            CAS:BindActionAtPriority("ForceHBE_EvadeSink", function() return Enum.ContextActionResult.Sink end,
+                false, 9000, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1)
+        end)
+        pcall(function()
+            RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
+                if hum then hum:Move(moveDir, false) end
+            end)
+        end)
+
+        if haveKeys then
+            pcall(keypress, KEY_W)
+            if sideKey then pcall(keypress, sideKey) end
+        end
         RunService.RenderStepped:Wait()                          -- earliest moment the game can see the key
         local function sendDash()
             if saberStillValid(saberComp) then
@@ -1276,9 +1316,23 @@ local function doEvade()
                 pcall(keyrelease, KEY_E)
             end
         end
+        -- the game cancels a dash when ANY of W/A/S/D/left-click is pressed (an input
+        -- listener it adds when the dash starts). Take that listener out for this dash.
+        pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
         task.spawn(blockBuffer)                                  -- hold right-click => block the instant it's allowed
-        task.wait(0.4)                                           -- keep W held through the dash
-        if haveKeys then pcall(keyrelease, KEY_W) end
+
+        -- 3) steer until the dash really ends (at least 0.15s, at most 0.9s)
+        local t0 = os.clock()
+        while os.clock() - t0 < 0.9 and (os.clock() - t0 < 0.15 or movementState() == "dashing") do
+            RunService.RenderStepped:Wait()
+        end
+
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EvadeMove") end)
+        pcall(function() CAS:UnbindAction("ForceHBE_EvadeSink") end)
+        if haveKeys then
+            pcall(keyrelease, KEY_W)
+            if sideKey then pcall(keyrelease, sideKey) end
+        end
         if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end -- camera back to normal
         evadeBusy = false
     end)
@@ -1712,7 +1766,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v29"
+hint.Text = "Ctrl+H = hide  |  v30"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
