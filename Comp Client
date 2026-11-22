@@ -1,43 +1,45 @@
 --[[
-    Stun Evade / Auto Parry client - build 20
-    (Infinite Force, Infinite Block, Infinite Parry/Kicks, Hitbox Expander,
-     Auto Parry, Auto Evade, Anti-kick, Chase Multi, input sink)
+    Infinite Force + Hitbox Expander - one script, one small UI (made for Potassium)
 
-    WHAT CHANGED IN THIS BUILD (all of it is in the notes below)
-      1) INPUT SINK - "keys can't interrupt Stun Evade" (section: Input Sink)
-         Every keyboard key and every mouse button is swallowed before the game can
-         see it - EXCEPT RIGHT CLICK, which stays fully live (block / parry).
-         Nothing is faked and no input event is mutated: a ContextActionService
-         binding at priority 9000 sinks the key/button, and the game's own bindings
-         are moved below it once per character. Camera, menu and script features
-         still work because they read raw input or drive the game's own functions.
+    Infinite Force (same as InfiniteForce.lua v5):
+      - ForceRegenMultiplier = huge      -> normal refill is instant
+      - AfflictionForceDrainPerTick = -450 -> +1 full bar every second, no 2.5s wait
 
-      2) CHASE MULTI - new toggle in the panel (section: Chase Multi)
-         When YOUR parry stuns somebody you dash to where they went and multi them:
-             W  ->  E (force dash, one frame later)  ->  LEFT CLICK (swing)
-         and the cycle repeats on its own as fast as the game allows (it is driven by
-         the saber's own animation events, not by a fixed timer).
-         It stops the instant their stun animation ends, and it never presses
-         anything while you hold RIGHT CLICK (so your block/parry is never broken).
+    Hitbox Expander (written from scratch, replaces the obfuscated ScriptBlox one):
+      - The game's lightsaber hits are client raycasts from your blade: any part of
+        a character the ray touches counts. So each enemy gets an extra anchored,
+        non-colliding box (only you see it) that follows them every frame.
+        Their real body is never touched, so no frozen/glitchy players.
+      - Turning it off deletes the boxes.
 
-      3) AUTO PARRY CHASE FIX
-         The old "did the parry really start?" 80-150ms delayed click is gone, so
-         nothing is queued that could fire a swing while you are chasing, and a
-         "chase" flag is raised the moment a parry is sent so Chase Multi starts on
-         the first stun frame instead of hunting for a target.
+    Infinite Block:
+      - hook mode (getgc + hookfunction): hit-block animation still plays, meter is
+        pinned at full, and only the client's own "block broken" stun is dropped.
+      - delete mode (fallback, e.g. Xeno): deletes the server's "Block" value on your
+        side; works, but the hit-block animation won't play.
 
-    The rest of the features are the ones from the previous build, kept intact.
+    Every ON feature re-checks itself every 2s, and hiding the panel (Ctrl+H) never
+    turns anything off. Hidden = fully gone; F9 prints what's still ON.
+
+    Infinite Parry / Infinite Kicks (need a real getgc - NOT Xeno):
+      - finds your Lightsaber component in memory and keeps ParriesLeft = 5, KicksLeft = 3.
+
+    Auto Parry (needs getgc; hold right-click with your saber ignited): clicks left-click
+      for you when a swing is really aimed at you - see the "Auto Parry" section below.
+
+    UI: draggable panel, ON/OFF switches (force, block, parry, kicks, auto parry, HBE, team check),
+    hitbox size + transparency boxes.
+    Ctrl + H hides/shows the panel.
 ]]
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local ContextActionService = game:GetService("ContextActionService")
 local LocalPlayer = Players.LocalPlayer
 
--- re-executing: the FULL cleanup at the bottom of this file (previous copy's connections,
--- loops, features, input sink and panel) runs first, then this copy builds a fresh panel.
-local GUI_NAME = "StunEvade_UI"
+-- clean up an older copy if you re-execute
+local GUI_NAME = "ForceHBE_UI"
+if getgenv and getgenv().ForceHBE_Cleanup then pcall(getgenv().ForceHBE_Cleanup) end
 
 ------------------------------------------------------------------------
 -- Settings
@@ -48,157 +50,27 @@ local settings = {
     parry = false,
     kick = false,
     autoParry = false,
-    pingAdjust = true,     -- Auto Parry follows your live ping
-    dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you
-    autoEvade = false,     -- when you get stunned: hold W + dash (E) away, faster than human timing
-    antiKick = false,      -- ignore the game's kick stun on your screen
-    antiKickKey = "K",     -- key that toggles Anti-kick (change it in the panel)
-    parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier
+    pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
+    dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
+    autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
+    antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
+    antiKickKey = "K",     -- keyboard key that toggles Anti-kick (change it in the panel)
+    parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping)
     hbe = false,
-    hbeSize = 12,
-    hbeTransparency = 0.7,
-    teamCheck = true,
-
-    -- NOTE: there is no "block keys" toggle any more. The input sink (every key and
-    -- mouse button except RIGHT CLICK is swallowed) simply follows Stun Evade: sink is
-    -- armed while autoEvade is ON and released the moment it is turned OFF.
-    chaseMulti = false,    -- after your parry stuns someone: dash to them and multi
+    hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
+    hbeTransparency = 0.7, -- so you can see the box
+    teamCheck = true,      -- don't expand teammates
 }
 
 -- shared so the block-break hook (installed once per game session) always reads the
 -- settings of the copy of this script that's currently running
 do
     local env = (getgenv and getgenv()) or _G
-    env.StunEvade_Settings = settings
+    env.ForceHBE_Settings = settings
 end
 
 local connections = {}
 local function track(c) table.insert(connections, c); return c end
-local function env() return (getgenv and getgenv()) or _G end
-
-------------------------------------------------------------------------
--- Log buffer (F9 has no log box any more; this is kept so nothing else breaks)
-------------------------------------------------------------------------
-local logEntries = {}
-local logSink
-local VERBOSE = false
-local function pushLog(who, msg)
-    if VERBOSE then pcall(print, "[StunEvade]", msg) end
-    table.insert(logEntries, { who = who, msg = msg })
-    if #logEntries > 120 then table.remove(logEntries, 1) end
-    if logSink then pcall(logSink) end
-end
-local function joinArgs(...)
-    local parts = {}
-    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
-    return table.concat(parts, " ")
-end
-local function log(...) pushLog(nil, joinArgs(...)) end
-local function logP(who, ...) pushLog(who, joinArgs(...)) end
-
-------------------------------------------------------------------------
--- Shared state
---   `saberComp` is found by the parry/kicks pin and used by everything else, so it is
---   declared here instead of inside that section.
-------------------------------------------------------------------------
-local saberComp
-local lastScan = 0
-local warnedNoGC = false
-local MAX_PARRIES, MAX_KICKS = 5, 3
-
-------------------------------------------------------------------------
--- Input Sink  (this is the "keys can't stop the Stun Evade" fix)
---
---   NO TOGGLE: the sink is tied to Stun Evade (autoEvade). Turning Stun Evade ON arms it,
---   turning it OFF releases every key again. While it is armed only RIGHT CLICK reaches
---   the game - every key and left/middle mouse are swallowed.
---
---   WHY THE OLD BLOCKER NEVER WORKED: it tried to "eat" keys by rewriting
---   `input.UserInputType = Enum.UserInputType.None` inside UserInputService.InputBegan.
---   Roblox fires InputBegan to every listener and the game had already been given the
---   same event object, so the game still saw the key. Same for mouse buttons.
---
---   WHAT ACTUALLY WORKS: ContextActionService. A binding at a higher priority than the
---   game's own bindings, returning Enum.ContextActionResult.Sink, stops the input before
---   the game's action handlers run. We bind it for every keyboard key and for left /
---   middle mouse, and never for MouseButton2 (right click = block / parry).
---
---   The game binds its own actions while it sets up (and again on respawn), so the sink
---   is (re)applied one frame after every character spawn - that moves the game's
---   bindings below ours.
---
---   Feature presses (parry click, E dash, W) are NOT blocked: they either call the
---   game's own functions (saber:ProcessInput) or feed the state machine, so they skip
---   the input layer entirely. That is also why a blocked key can never cancel a dash.
-------------------------------------------------------------------------
-local SINK_NAME = "StunEvade_InputSink"
-local SINK_PRIORITY = 9000
--- keys the sink lets through on purpose: H (Ctrl+H hides the panel), the anti-kick key,
--- and Escape. Nothing else gets past, so no key can cancel a dash / stun evade.
-local SINK_PASS = { [Enum.KeyCode.H] = true, [Enum.KeyCode.Escape] = true }
-local sinkApplied = false
-local sinkFrame = 0
-
-local function sinkActionList()
-    local list = {}
-    for _, kc in ipairs(Enum.KeyCode:GetEnumItems()) do
-        if kc ~= Enum.KeyCode.Unknown then list[#list + 1] = kc end
-    end
-    list[#list + 1] = Enum.UserInputType.MouseButton1
-    list[#list + 1] = Enum.UserInputType.MouseButton3
-    list[#list + 1] = Enum.UserInputType.MouseMovement
-    return list
-end
-
--- arm (on = true) or release (on = false) the sink. Called by the Stun Evade toggle and
--- re-called after every spawn.
-local function sinkSet(on)
-    if not on then
-        if sinkApplied then
-            pcall(function() ContextActionService:UnbindAction(SINK_NAME) end)
-            sinkApplied = false
-        end
-        return
-    end
-    local pass = SINK_PASS
-    if settings.antiKickKey and Enum.KeyCode[settings.antiKickKey] then
-        pass = table.clone(SINK_PASS)
-        pass[Enum.KeyCode[settings.antiKickKey]] = true
-    end
-    pcall(function()
-        ContextActionService:UnbindAction(SINK_NAME)
-        ContextActionService:BindActionAtPriority(SINK_NAME, function(_, state, input)
-            local key = input and input.KeyCode
-            if key and pass[key] then return Enum.ContextActionResult.Pass end
-            if state == Enum.UserInputState.Begin or state == Enum.UserInputState.Change then
-                return Enum.ContextActionResult.Sink
-            end
-            return Enum.ContextActionResult.Pass
-        end, false, SINK_PRIORITY, table.unpack(sinkActionList()))
-        sinkApplied = true
-    end)
-end
-
--- keep the sink in step with Stun Evade; called by the toggle and by the self-heal loop
-local function syncSink()
-    sinkSet(settings.autoEvade)
-end
-
--- re-apply a moment after every spawn (the game rebuilds its bindings then)
-local function armSink()
-    task.delay(0.1, syncSink)
-    task.delay(0.6, syncSink)
-end
-track(LocalPlayer.CharacterAdded:Connect(armSink))
-task.delay(0.1, syncSink) -- a re-execute while Stun Evade is already ON re-arms it
-
--- safety net: while Stun Evade is ON the sink must be up (a respawn or a game rebind can
--- push it under the game's bindings), and while it is OFF it must be gone
-track(RunService.Heartbeat:Connect(function()
-    sinkFrame = sinkFrame + 1
-    if sinkFrame % 300 ~= 0 then return end          -- every ~5s, cheap safety net
-    if settings.autoEvade ~= sinkApplied then syncSink() end
-end))
 
 ------------------------------------------------------------------------
 -- Infinite Force
@@ -247,27 +119,61 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
     end
 end))
 
+-- Some executors send print() to their OWN console instead of Roblox's F9 console, so
+-- everything is also kept in a buffer that the menu shows in a small box under the panel.
+local logEntries = {}  -- { who = player name or nil (system line), msg = text }
+local logSink -- set once the UI exists
+local VERBOSE = false -- set true to get "[ForceHBE]" lines in your executor console again
+local function pushLog(who, msg)
+    if VERBOSE then pcall(print, "[ForceHBE]", msg) end
+    table.insert(logEntries, { who = who, msg = msg })
+    if #logEntries > 120 then table.remove(logEntries, 1) end
+    if logSink then pcall(logSink) end
+end
+local function joinArgs(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    return table.concat(parts, " ")
+end
+local function log(...) pushLog(nil, joinArgs(...)) end            -- system line
+local function logP(who, ...) pushLog(who, joinArgs(...)) end      -- line about one player
+
 ------------------------------------------------------------------------
 -- Infinite Block
---   The server puts a NumberValue "Block" on your character and lowers it per hit;
---   your client plays the hit-block animation and, at 0, reports a block break.
---   hook mode: leave the value alone (animation plays), drop only the block-break stun,
---              and pin BlocksLeft at full so the meter never empties.
---   delete mode: delete the server's Block value on your side (no animation).
+--   How the game does it (Lightsaber.States.Combat.Blocking):
+--     The server puts a NumberValue "Block" on your character and lowers it per hit.
+--     Your client's handler then: sets BlocksLeft = Value, PLAYS THE HIT-BLOCK
+--     ANIMATION + camera shake, and if BlocksLeft <= 0 fires
+--     zap.LightsaberStunFromClient.Fire({ BlockBreak = true, StunType = 2 }).
+--
+--   MODE "hook" (executor has getgc + hookfunction) - keeps the animation:
+--     - leave the Block value alone, so the handler + animation run on every hit
+--     - hook LightsaberStunFromClient.Fire and drop only block-break stuns
+--     - keep your Lightsaber component's BlocksLeft pinned at 140 (full) every frame,
+--       so the meter stays full and each new block reports a full meter to the server
+--   MODE "delete" (fallback, e.g. Xeno) - no animation:
+--     - delete the Block value on your side so hits never reach the client
 ------------------------------------------------------------------------
-local MAX_BLOCK = 140
-local STUN_BLOCK_BROKEN = 2
-local blockMode = nil
+local MAX_BLOCK = 140         -- CombatConstants.BLOCK.MAXIMUM
+local STUN_BLOCK_BROKEN = 2   -- CombatConstants.ENUM.STUN_TYPE.BLOCK_BROKEN
+local blockMode = nil         -- "hook" or "delete", decided the first time block is turned on
 local blockConn, blockHookedChar
 local stunHooked = false
 
+-- find zap's LightsaberStunFromClient.Fire and hook it (once per game session)
 local function hookBlockBreakStun()
     if stunHooked then return true end
-    if env().StunEvade_StunHooked then stunHooked = true return true end
+    local env = (getgenv and getgenv()) or _G
+    if env.ForceHBE_StunHooked then
+        stunHooked = true
+        return true
+    end
     if type(getgc) ~= "function" or type(hookfunction) ~= "function" then return false end
+
     local fireFn
     local ok, list = pcall(getgc, true)
     if not ok or type(list) ~= "table" then return false end
+    -- 1) the zap module's export table: { LightsaberStunFromClient = { Fire = fn }, LightsaberBlock = ... }
     for _, t in ipairs(list) do
         if type(t) == "table" then
             local entry = rawget(t, "LightsaberStunFromClient")
@@ -278,6 +184,7 @@ local function hookBlockBreakStun()
             end
         end
     end
+    -- 2) fallback: the function whose constants include its profiler label
     if not fireFn and debug.getconstants then
         for _, f in ipairs(list) do
             if type(f) == "function" and (not iscclosure or not iscclosure(f)) then
@@ -292,20 +199,22 @@ local function hookBlockBreakStun()
         end
     end
     if not fireFn then return false end
+
     local old
     local okH = pcall(function()
         old = hookfunction(fireFn, function(payload, ...)
-            local s = env().StunEvade_Settings
+            -- read live settings through the global so a re-executed script stays in control
+            local s = env.ForceHBE_Settings
             if s and s.block and type(payload) == "table"
                 and (payload.BlockBreak == true or payload.StunType == STUN_BLOCK_BROKEN) then
-                return
+                return -- swallow the self-reported block break
             end
             return old(payload, ...)
         end)
     end)
     if okH then
         stunHooked = true
-        env().StunEvade_StunHooked = true
+        env.ForceHBE_StunHooked = true
     end
     return okH
 end
@@ -315,7 +224,7 @@ local function isBlockValue(obj)
 end
 
 local function killBlockValue(obj)
-    task.defer(function()
+    task.defer(function() -- deferred: reparenting inside ChildAdded can error
         if settings.block and blockMode == "delete" and obj.Parent then
             pcall(function() obj:Destroy() end)
         end
@@ -346,7 +255,7 @@ local function setBlock(on)
             log("Infinite Block: delete mode (no getgc/hookfunction - hit animation won't play)")
         end
     end
-    blockDeleteHook(LocalPlayer.Character)
+    blockDeleteHook(LocalPlayer.Character) -- only does anything in delete mode
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(char)
@@ -354,8 +263,18 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
 end))
 
 ------------------------------------------------------------------------
--- Infinite Parry + Infinite Kicks
+-- Infinite Parry + Infinite Kicks  (needs an executor with a REAL getgc)
+--   Both counters live on your Lightsaber component (Client.Components.Lightsaber):
+--     ParriesLeft (max 5)  -> Parrying state does ParriesLeft -= 1
+--     KicksLeft   (max 3)  -> Kicking state does KicksLeft -= 1
+--   We find YOUR component in memory (has ParriesLeft + KicksLeft and Local == true)
+--   and keep both at max every frame. SetParries/SetKicks refresh the circles on the HUD.
 ------------------------------------------------------------------------
+local MAX_PARRIES, MAX_KICKS = 5, 3
+local saberComp
+local lastScan = 0
+local warnedNoGC = false
+
 local function isMySaber(t)
     if type(t) ~= "table" then return false end
     if type(rawget(t, "ParriesLeft")) ~= "number" or type(rawget(t, "KicksLeft")) ~= "number" then return false end
@@ -373,6 +292,7 @@ end
 
 local function scanForSaber()
     lastScan = os.clock()
+    -- filtergc is faster where it exists; fall back to a full getgc walk
     if type(filtergc) == "function" then
         local ok, res = pcall(filtergc, "table", { Keys = { "ParriesLeft", "KicksLeft" } })
         if ok and type(res) == "table" then
@@ -393,16 +313,17 @@ local function scanForSaber()
     return nil
 end
 
--- one accessor for everything that needs the saber: cached, rescanned every 2s
-local function getSaber()
-    if saberStillValid(saberComp) then return saberComp end
-    saberComp = nil
-    if os.clock() - lastScan < 0.5 then return nil end
-    return scanForSaber()
-end
-
 ------------------------------------------------------------------------
--- Force pin (the game's drain loop skips a bar that is exactly 0)
+-- Force pin (fix for "force randomly stops until I toggle it")
+--   Cause: the game's drain loop (Character component) only runs
+--     `if not (Force <= 0) then Force -= drain end`
+--   so with our negative drain it ADDS force - except when Force is exactly 0.
+--   And RechargeForce skips normal regen while the drain attribute exists.
+--   So once the bar hit 0 (a move costing more than you had, an enemy
+--   affliction draining you, etc.) nothing refilled it until you toggled
+--   (toggling clears the attribute -> RechargeForce runs -> bar refills).
+--   Fix: with getgc, find YOUR Character component and hold Force at MaxForce
+--   directly. The attributes stay on as a backup.
 ------------------------------------------------------------------------
 local charComp
 local lastCharScan = 0
@@ -420,6 +341,7 @@ end
 
 local function scanForCharComp()
     lastCharScan = os.clock()
+    -- quickest: the saber component points at it
     if saberComp then
         local cc = rawget(saberComp, "CharacterComponent")
         if isMyCharComp(cc) then return cc end
@@ -459,34 +381,46 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock or settings.autoParry
-        or settings.autoEvade or settings.antiKick or settings.chaseMulti) then return end
-    local sc = getSaber()
-    if not sc then return end
-    if settings.parry and rawget(sc, "ParriesLeft") < MAX_PARRIES then
-        sc.ParriesLeft = MAX_PARRIES
-        pcall(function() sc:SetParries() end)
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick) then return end
+    if not saberStillValid(saberComp) then
+        saberComp = nil
+        -- the component is rebuilt when you equip/respawn; rescan every 2s until found
+        if os.clock() - lastScan < 2 then return end
+        saberComp = scanForSaber()
+        if not saberComp then return end
+        log("found your lightsaber component")
     end
-    if settings.kick and rawget(sc, "KicksLeft") < MAX_KICKS then
-        sc.KicksLeft = MAX_KICKS
-        pcall(function() sc:SetKicks() end)
+    if settings.parry and rawget(saberComp, "ParriesLeft") < MAX_PARRIES then
+        saberComp.ParriesLeft = MAX_PARRIES
+        pcall(function() saberComp:SetParries() end)
+    end
+    if settings.kick and rawget(saberComp, "KicksLeft") < MAX_KICKS then
+        saberComp.KicksLeft = MAX_KICKS
+        pcall(function() saberComp:SetKicks() end)
     end
     if pinBlock then
-        local b = rawget(sc, "BlocksLeft")
+        local b = rawget(saberComp, "BlocksLeft")
         if type(b) == "number" and b < MAX_BLOCK then
-            sc.BlocksLeft = MAX_BLOCK
-            pcall(function() sc:SetBlock() end)
+            saberComp.BlocksLeft = MAX_BLOCK
+            pcall(function() saberComp:SetBlock() end)
         end
     end
 end))
 
 ------------------------------------------------------------------------
 -- Hitbox Expander
---   Each enemy gets a separate ANCHORED box inside their character model that follows
---   their root part every frame. Their real body is never touched, so no frozen players.
 ------------------------------------------------------------------------
+--[[
+    v2: we no longer touch the player's real HumanoidRootPart (resizing it broke their
+    character physics on your screen = frozen/glitchy players).
+    Instead each enemy gets a separate ANCHORED box inside their character model that
+    just follows their root part every frame. It's not welded to them, so it can't
+    affect their physics. The game's hit check (DamageUtil.GetHumanoidFromHitPart)
+    walks up from the hit part to the character's Humanoid, so a ray hitting the box
+    counts as hitting that player.
+]]
 local BOX_NAME = "HBE_Box"
-local boxes = {}
+local boxes = {} -- [character] = box part
 
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
@@ -510,19 +444,21 @@ local function getBox(char)
     if box and box.Parent == char then return box end
     box = Instance.new("Part")
     box.Name = BOX_NAME
-    box.Anchored = true
-    box.CanCollide = false
-    box.CanTouch = false
-    box.CanQuery = true
+    box.Anchored = true       -- not welded to the player = no physics side effects
+    box.CanCollide = false    -- nobody bumps into it
+    box.CanTouch = false      -- doesn't fire .Touched on anything
+    box.CanQuery = true       -- raycasts (your saber) CAN hit it
     box.Massless = true
     box.CastShadow = false
     box.Material = Enum.Material.SmoothPlastic
     box.Color = Color3.fromRGB(255, 60, 60)
-    box.Parent = char
+    box.Parent = char         -- must be inside the character so the hit maps to its Humanoid
     boxes[char] = box
     return box
 end
 
+-- RenderStepped runs before Heartbeat, where the game does its blade raycasts,
+-- so the boxes are already in place when the game checks for hits.
 track(RunService.RenderStepped:Connect(function()
     if not settings.hbe then return end
     local s = settings.hbeSize
@@ -540,6 +476,7 @@ track(RunService.RenderStepped:Connect(function()
             seen[char] = true
         end
     end
+    -- remove boxes for teammates, dead players, players who left
     for char in pairs(boxes) do
         if not seen[char] then removeBox(char) end
     end
@@ -549,57 +486,72 @@ local function setHBE(on)
     settings.hbe = on
     if not on then removeAllBoxes() end
 end
+
 ------------------------------------------------------------------------
 -- Auto Parry
---   You hold right-click (saber ignited); the script presses left-click for you when
---   an incoming swing is really aimed at you.
+--   You hold right-click (saber ignited, state "blocking"); the script presses
+--   left-click for you when an incoming swing is really aimed at you.
 --
---   Detection: attackers' swing animations replicate to your client, so we watch every
---   other player's Animator for one of the game's attack animations (Attack_1-4 for every
---   form + dash attacks) and read its TimePosition.
+--   How it detects swings: attackers' swing animations replicate to your client, so
+--   we look at every other player's Animator for one of the game's attack animations
+--   (Attack_1-4 for every form + dash attacks) and read its TimePosition.
 --
---   A swing is a THREAT only if it is aimed at you (facing), about to land (blade path /
---   closing speed vs your ping), and committed (not a feint). All of the tuning is in AP.
+--   A swing counts as a THREAT only if ALL of these hold:
+--     - aimed at you: attacker's facing is within ~65 deg of the line to you
+--       (stray swings at other people / at nothing are ignored)
+--     - about to land: we track their blade and predict the time until it reaches you
+--       (distance / closing speed), and click when that is <= ping + 0.18s - so fast
+--       dash attacks and high ping automatically trigger from further away
+--     - committed: swing has been running >= 50ms (a feint that's cancelled instantly
+--       never gets a parry), and it isn't past ~70% of the animation (hit already done)
+--   Parry in the game stays active ~0.7s, so firing a little early is safe.
 --
---   CHASE FIX (this build): the old version clicked, then waited 80-150ms to ask "did the
---   parry really start?" and clicked AGAIN if not. That second click could land while you
---   were already dashing at the stunned enemy and swing instead of parry, and it also
---   kept the parry coroutine alive long after you had moved on. It is gone: a parry is
---   sent exactly once, on the frame it is needed, through the game's own input function.
+--   Multiple attackers: all threats are scored each frame, ONE parry covers every swing
+--   in that window, and each swing (animation instance) can only trigger once - so
+--   combo follow-ups are new swings and get their own check once the 1.5s cooldown ends.
+--   Baits: right before clicking the threat is re-checked; if the swing was cancelled
+--   in the meantime, that attacker gets a "bait score" that makes us wait slightly
+--   longer on their next swings.
+--   Timing: a small random delay (0-40ms) and a per-swing random +-12% on the trigger
+--   time, so it isn't frame-perfect every time. "Parry timing (ms)" in the panel
+--   shifts everything: + = later, - = earlier.
+--
+--   Safety: never clicks unless your saber is in the BLOCKING state, you have parries
+--   left and the parry cooldown is over - otherwise a click would swing instead.
 ------------------------------------------------------------------------
 local AP = {
-    CONE_COS = 0.3,
-    MAX_RANGE = 55,
-    EVADE_FACING = 0.5,
-    DASH_GUARD_SPEED = 25,
-    DASH_GUARD_RANGE = 70,
-    DASH_GUARD_LEAD = 0.1,
-    DASH_REACH = 8,
-    BODY_RADIUS = 2.5,
-    MIN_SWING_SPEED = 9,
-    HIT_RADIUS = 4.5,
-    MIN_CLOSING = 5,
+    CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
+    MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
+    EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
+    DASH_GUARD_SPEED = 25, -- studs/s toward you that counts as "dashing at you"
+    DASH_GUARD_RANGE = 70, -- studs
+    DASH_GUARD_LEAD = 0.1, -- s extra lead (on top of ping) for the dash-guard parry
+    DASH_REACH = 8,     -- studs in front of a dashing attacker that their blade can hit
+    BODY_RADIUS = 2.5,   -- studs: blade counts as "landed" this close to your center
+    MIN_SWING_SPEED = 9, -- studs/s: blade speed relative to THEIR body that counts as a swing
+    HIT_RADIUS = 4.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
+    MIN_CLOSING = 5,     -- studs/s: blade must be heading toward you at least this fast
     KICK_RESPONSE = "parry", -- what to do about an incoming kick: "parry" or "dash" (taps E)
-    KICK_TOL = 3,
-    KICK_RANGE = 9,
-    KICK_CONE = 0.45,
-    KICK_WINDUP = 0.4,
-    NEAR_RANGE = 7,
-    CLOSE_COMMIT = 0.015,
-    CLOSE_RANGE = 12,
-    CLOSE_CONE = 0.55,
-    CLOSE_MISS = 6.5,
-    MIN_COMMIT = 0.03,
-    MAX_PHASE = 0.85,
-    AIM = 0.18,
-    TIME_VARIANCE = 0.12,
-    JITTER_MAX = 0.025,
-    DASH_CLOSING = 22,
-    DEBUG = false,
-    FALLBACK_HIT = 0.25,
+    KICK_TOL = 3,        -- studs of forgiveness around the kick's real hit box
+    KICK_RANGE = 9,     -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
+    KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
+    KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
+    NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
+    CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
+    CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
+    CLOSE_CONE = 0.55,   -- cos(~57 deg): how directly they must face you for the close rule
+    CLOSE_MISS = 6.5,    -- studs: close rule is skipped if the blade clearly passes this far from you
+    MIN_COMMIT = 0.03,   -- s the swing must have run (feint filter)
+    MAX_PHASE = 0.85,    -- ignore swings nearly finished
+    AIM = 0.18,          -- s: we want the hit to land this long AFTER our parry is active
+    TIME_VARIANCE = 0.12, -- per-swing random +-12% on the trigger time
+    JITTER_MAX = 0.025,  -- extra human delay 0..25ms (triangular, ~12ms average)
+    DASH_CLOSING = 22,   -- studs/s: attacker body rushing at you this fast = dash attack
+    DEBUG = false,       -- (only matters when VERBOSE is on) explains why a swing/kick was ignored
+    FALLBACK_HIT = 0.25, -- s into a swing the hit lands, only if no blade parts are found
 }
 
--- every swing animation id used by the game's forms
+-- every swing animation id used by the game's forms (Shared.Modules.SaberModule.Animations)
 local ATTACK_IDS = {}
 for _, id in ipairs({
     6317098079, 6317098902, 6317099741, 6317100331,                 -- single / double
@@ -611,38 +563,42 @@ for _, id in ipairs({
     98442653394978, 6368651662,                                     -- dash attacks
 }) do ATTACK_IDS[tostring(id)] = true end
 
-local KICK_ID = "13552157283"      -- ParryBreak (kick)
-local DASH_ID = "6302511048"       -- Dash_Animation (force dash, E)
-
--- every animation id the game ships that is NOT an attack; any other non-looping
--- animation on a player whose saber is out is treated as a swing (custom attack packs)
-local NON_ATTACK_IDS = {}
-for _, id in ipairs({
-    6312272936, 6312274072, 6317093733, 6317094309, 6728895746,
-    6584511045, 7873070812,
-    72741768067322, 89740527877951, 128004514519482, 108843758967999,
-    91879086197386, 117020519174436,
-    13552166958, 13552173835, 13552177816, 13552182822,
-    6322860474, 6669642689, 101135636991956, 6753364277, 10443668308,
-    6297531803, 6322313635, 6322315386,
-    6291932252, 6291933169, 6292610264, 6292625270, 6292146811, 6292155163,
-    6291934524, 6291935220, 6292615823, 6292632003,
-    6317096682, 6688720735, 6753335745, 6860753522, 10443588041, 109060630722907,
-    6317097513, 6312280575, 6312281206, 6312281779, 6312282511, 6669641262,
-    7101397703, 6736233297, 7101402353, 6861038808, 6861088961, 6860799757,
-    7101356513, 6753361279, 6860759883, 109369432331476,
-    6302511048, 6302512079, 6382639524, 6392682622,
-}) do NON_ATTACK_IDS[tostring(id)] = true end
-local loggedUnknown = {}
+-- the kick uses the "ParryBreak" animation (Client.Components.Lightsaber.States.Combat.Kicking)
+local KICK_ID = "13552157283"
+local DASH_ID = "6302511048" -- Dash_Animation (force dash, E)
 
 local pingEma = 0.08
-local baitScore = {}
-local handledSwing = setmetatable({}, { __mode = "k" })
-local swingVariance = setmetatable({}, { __mode = "k" })
+local baitScore = {}                              -- [player] = n
+local handledSwing = setmetatable({}, { __mode = "k" }) -- swing track -> true
+local swingVariance = setmetatable({}, { __mode = "k" }) -- swing track -> random factor
 local apBusy = false
 local apLoggedFirst = false
 
--- returns track, isKick, isUnknownAnim, isDash
+-- The game can SWAP a player's attack/block/parry animation ids at runtime (custom
+-- animation packs: Animations.ChangeTempleGuard & co), so a fixed attack-id list misses
+-- those players. Fix: every animation id the game ships that is NOT an attack is listed
+-- here; any other non-looping animation on a player whose saber is out is treated as a
+-- swing too ("unknown" attack) - and the id is printed once so you can see it.
+local NON_ATTACK_IDS = {}
+for _, id in ipairs({
+    6312272936, 6312274072, 6317093733, 6317094309, 6728895746,           -- flips, roll
+    6584511045, 7873070812,                                               -- throws
+    72741768067322, 89740527877951, 128004514519482, 108843758967999,
+    91879086197386, 117020519174436,                                      -- force powers
+    13552166958, 13552173835, 13552177816, 13552182822,                   -- skids
+    6322860474, 6669642689, 101135636991956, 6753364277, 10443668308,     -- parries
+    6297531803, 6322313635, 6322315386,                                   -- stuns
+    6291932252, 6291933169, 6292610264, 6292625270, 6292146811, 6292155163,
+    6291934524, 6291935220, 6292615823, 6292632003,                       -- equip / sheathe
+    6317096682, 6688720735, 6753335745, 6860753522, 10443588041, 109060630722907, -- idles
+    6317097513, 6312280575, 6312281206, 6312281779, 6312282511, 6669641262,
+    7101397703, 6736233297, 7101402353, 6861038808, 6861088961, 6860799757,
+    7101356513, 6753361279, 6860759883, 109369432331476,                  -- blocks
+    6302511048, 6302512079, 6382639524, 6392682622,                       -- dashes (movement)
+}) do NON_ATTACK_IDS[tostring(id)] = true end
+local loggedUnknown = {}
+
+-- returns track, isKick, isUnknownAnim
 local function findAttackTrack(char)
     local hum = char:FindFirstChildOfClass("Humanoid")
     local animator = hum and hum:FindFirstChildOfClass("Animator")
@@ -654,10 +610,13 @@ local function findAttackTrack(char)
     for _, trk in ipairs(tracks) do
         local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
         if okId and id then
-            -- a KICK wins over everything (the fading swing used to hide it)
+            -- a KICK wins over everything: the swing animation that was playing a moment
+            -- earlier can still be fading out and used to hide the kick from us
             if id == KICK_ID then return trk, true, false end
             if ATTACK_IDS[id] then
-                -- fast combos: always follow the NEWEST swing (smallest TimePosition)
+                -- fast combos: the old swing is still fading while the next one starts.
+                -- Always follow the NEWEST one (smallest TimePosition) so we never flip
+                -- back and forth between the two and lose our blade-speed history.
                 local okP, pos = pcall(function() return trk.TimePosition end)
                 if okP and pos < attackPos then attack, attackPos = trk, pos end
             elseif id == DASH_ID then
@@ -669,8 +628,11 @@ local function findAttackTrack(char)
         end
     end
     if attack then return attack, false, false end
+    -- DASH GUARD (optional): a force-dash toward you is the first half of dash-kicks and
+    -- dash-attacks, so it is also a (early) warning for high-ping players
     if dash and settings.dashGuard then return dash, false, false, true end
     if unknown then
+        -- only count it if their saber is actually out (blade parts exist) - filters emotes
         local hasBlade = false
         for _, d in ipairs(char:GetDescendants()) do
             if d.Name == "Core" and d.Parent and string.match(d.Parent.Name, "Blade") then hasBlade = true break end
@@ -686,9 +648,15 @@ local function findAttackTrack(char)
     return nil
 end
 
--- Timing model: predict WHEN the blade reaches you instead of "are they within X studs".
-local bladeCache = setmetatable({}, { __mode = "k" })
-local swingState = {}
+-- Timing model (v2): instead of "are they within X studs" we predict WHEN the blade
+-- will reach you. Every frame we track points along each attacker's blade (the "Core"
+-- parts inside their "Blade" models - the same parts the game raycasts from), measure
+-- how fast they're moving toward you (minus your own movement), and compute
+--     timeToHit = (distance - bodyRadius) / closingSpeed
+-- We click when timeToHit <= ping + AIM (+ your offset), i.e. so the parry is already
+-- active when the hit lands but hasn't run out yet (it lasts ~0.7s).
+local bladeCache = setmetatable({}, { __mode = "k" }) -- character -> { cores, t }
+local swingState = {}                                  -- [player] = { trk, prev, speed, ttc }
 
 local function getCores(char)
     local c = bladeCache[char]
@@ -703,13 +671,16 @@ local function getCores(char)
     return cores
 end
 
-local plrVel, plrVelFast, plrLastPos, plrPeak = {}, {}, {}, {}
+-- called once per frame: refresh every attacker's blade speed + time-to-hit
+local plrVel, plrVelFast, plrLastPos, plrPeak = {}, {}, {}, {} -- every player's body velocity, tracked all the time
 
 local function updateSwings(myHrp, dt)
     local myPos, myVel = myHrp.Position, myHrp.AssemblyLinearVelocity
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             local char = plr.Character
+            -- always know how fast everyone is moving, so the very first frame of a kick
+            -- already has a velocity to predict with (no 2-frame warm-up)
             local hrp0 = char and char:FindFirstChild("HumanoidRootPart")
             if hrp0 and dt > 0 then
                 local last = plrLastPos[plr]
@@ -717,7 +688,10 @@ local function updateSwings(myHrp, dt)
                     local v = (hrp0.Position - last) / dt
                     if v.Magnitude > 150 then v = Vector3.zero end -- respawn / teleport
                     plrVel[plr] = (plrVel[plr] or v) * 0.5 + v * 0.5
+                    -- fast-reacting version (70% newest sample): a dash takes off in 1-2
+                    -- frames and the slow average above would still read "standing still"
                     plrVelFast[plr] = (plrVelFast[plr] or v) * 0.3 + v * 0.7
+                    -- peak speed over roughly the last 0.7s (decays), for dash-kicks
                     plrPeak[plr] = math.max(plrVelFast[plr].Magnitude, (plrPeak[plr] or 0) * math.max(0, 1 - dt * 1.5))
                 end
                 plrLastPos[plr] = hrp0.Position
@@ -727,6 +701,7 @@ local function updateSwings(myHrp, dt)
             local old = swingState[plr]
             if old and (not trk or old.trk ~= trk) and AP.DEBUG and not handledSwing[old.trk] and old.why
                 and old.why ~= "too early" and os.clock() - (AP._lastDbg or 0) > 0.7 then
+                -- that swing/kick ended without us answering it: say why (rate-limited)
                 AP._lastDbg = os.clock()
                 logP(plr.Name, ("Auto Parry ignored %s from %s: %s"):format(old.isKick and "kick" or "swing", plr.Name, old.why))
             end
@@ -734,16 +709,26 @@ local function updateSwings(myHrp, dt)
                 swingState[plr] = nil
             else
                 local st = swingState[plr]
+                -- remember "someone near me is kicking" for Anti-kick (unknown stun types)
                 if isKick then
                     local hk = char:FindFirstChild("HumanoidRootPart")
-                    if hk and (hk.Position - myPos).Magnitude <= 70 then
-                        env().StunEvade_LastKick = os.clock()
+                    if hk and (hk.Position - myPos).Magnitude <= 70 then -- 70: a dash-kicker is drawn FAR away
+                        ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
                     end
                 end
                 if not st or st.trk ~= trk then
                     st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil,
                            isKick = isKick, unknown = isUnknown, isDash = isDash, t0 = os.clock(), maxSwing = 0 }
                     swingState[plr] = st
+                    if isDash and AP.DEBUG then
+                        logP(plr.Name, ("Auto Parry SAW %s dash (%.0f studs away)"):format(plr.Name,
+                            (char:FindFirstChild("HumanoidRootPart") and (char.HumanoidRootPart.Position - myPos).Magnitude) or -1))
+                    end
+                    if isKick and AP.DEBUG then
+                        local hrpK = char:FindFirstChild("HumanoidRootPart")
+                        logP(plr.Name, ("Auto Parry SAW a kick from %s (%.0f studs away)"):format(
+                            plr.Name, hrpK and (hrpK.Position - myPos).Magnitude or -1))
+                    end
                 end
                 local pts = {}
                 for _, core in ipairs(getCores(char)) do
@@ -754,12 +739,15 @@ local function updateSwings(myHrp, dt)
                         pts[#pts + 1] = cf.Position - cf.UpVector * half
                     end
                 end
+                -- enemy body velocity from position change (to separate SWING motion
+                -- from simply walking / strafing around you)
                 local hrpE = char:FindFirstChild("HumanoidRootPart")
                 local ePos = hrpE and hrpE.Position
                 local eVel = plrVel[plr] or Vector3.zero
                 st.prevE = ePos
                 st.eVel = eVel
 
+                -- how fast is their whole BODY rushing at you? (dash attacks come from far away)
                 local bodyClosing = 0
                 if ePos then
                     local toMeB = myPos - ePos
@@ -771,8 +759,9 @@ local function updateSwings(myHrp, dt)
                 if st.prev and #pts == #st.prev and dt > 0 then
                     for i, pt in ipairs(pts) do
                         local worldVel = (pt - st.prev[i]) / dt
-                        local rel = worldVel - myVel
-                        local swing = worldVel - eVel
+                        -- smooth so a single jittery frame can't trigger it
+                        local rel = worldVel - myVel                -- blade motion as YOU see it
+                        local swing = worldVel - eVel               -- blade motion relative to their body
                         st.relV[i] = (st.relV[i] or rel) * 0.5 + rel * 0.5
                         st.swingV[i] = (st.swingV[i] or swing) * 0.5 + swing * 0.5
                         if st.swingV[i].Magnitude > st.maxSwing then st.maxSwing = st.swingV[i].Magnitude end
@@ -780,10 +769,13 @@ local function updateSwings(myHrp, dt)
                         local relSpeed = relV.Magnitude
                         if relSpeed > 3 then
                             local toMe = myPos - pt
+                            -- follow the blade's path forward: where does it pass closest to you?
                             local tStar = toMe:Dot(relV) / (relSpeed * relSpeed)
                             if tStar >= 0 and tStar < 1 then
                                 local miss = (toMe - relV * tStar).Magnitude
                                 if not missMin or miss < missMin then missMin = miss end
+                                -- path threat: a real swing (fast relative to THEIR body, so walking
+                                -- past you doesn't count) that passes through you
                                 if (st.swingV[i].Magnitude >= AP.MIN_SWING_SPEED or bodyClosing >= AP.DASH_CLOSING)
                                     and miss <= AP.HIT_RADIUS
                                     and relV:Dot(toMe) / math.max(toMe.Magnitude, 0.01) >= AP.MIN_CLOSING then
@@ -803,6 +795,7 @@ local function updateSwings(myHrp, dt)
     end
 end
 
+-- when to click: parry must be active by the time the hit lands
 local function triggerTime(trk)
     local v = swingVariance[trk]
     if not v then
@@ -811,6 +804,9 @@ local function triggerTime(trk)
     end
     local offset = (settings.parryOffset or 0) / 1000 -- + = later, - = earlier
     if settings.pingAdjust then
+        -- "ping sweet spot": your own ping, flipped negative, plus the box value on top
+        -- (e.g. 80ms ping + box -75 => -155ms). Because pingEma follows your live ping, a
+        -- spike makes it fire earlier and a drop makes it fire later, automatically.
         offset = offset - pingEma
     end
     return math.max((pingEma + AP.AIM) * v - offset, 0.02)
@@ -840,7 +836,9 @@ local function assessThreat(plr, myHrp)
     local d = math.max(toMe.Magnitude, 0.01)
     local face = hrp.CFrame.LookVector:Dot(toMe / d)
 
-    -- DASH GUARD: an enemy force-dashing straight at you (early warning on high ping)
+    -- DASH GUARD: an enemy force-dashing straight at you. Their dash-kick / dash-attack
+    -- comes the moment they land, so on high ping this is the early warning we need.
+    -- We parry so that the parry is up as they ARRIVE (it then covers the ~0.7s after).
     if st.isDash then
         if not settings.dashGuard then return no("dash guard is off") end
         local fast = plrVelFast[plr] or Vector3.zero
@@ -849,27 +847,45 @@ local function assessThreat(plr, myHrp)
         if toward < AP.DASH_GUARD_SPEED then return no("dash isn't heading at you") end
         if d > AP.DASH_GUARD_RANGE then return no(("dasher too far (%.0f studs)"):format(d)) end
         if face < 0.45 then return no("dasher not facing you") end
+        -- what we see is a ping old, so they are already closer than they look
         local tArrive = math.max(d - AP.DASH_REACH, 0) / toward - pingEma
         if tArrive > pingEma + AP.DASH_GUARD_LEAD then return no("too early") end
         return math.max(tArrive, 0), trk
     end
 
-    -- KICK: no blade involved; the hit box switches on KICK_WINDUP after the kick starts
+    -- KICK: no blade involved. The kick's hit box is a ~4.5 stud cube in front of the
+    -- kicker that switches on 0.4s after the kick starts (Kicking state: KICK_WINDUP),
+    -- so: kicker is close (or rushing in), facing you, and the active moment is near.
     if st.isKick then
+        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
+        -- kicker's position we see is that old too. So: (1) the kick is further along than
+        -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
         local sinceStart = os.clock() - st.t0 + pingEma
         if sinceStart > AP.KICK_WINDUP + 0.75 + pingEma then return no("kick was already over") end
+        -- WHERE WILL YOU BOTH BE when the hit box switches on? The kicker's position we see
+        -- is one ping old and the box turns on KICK_WINDUP after the kick began. A kicker
+        -- 26 studs away who is not closing in can never hit, so it is NOT answered
+        -- (answering it only burns the 1.5s parry cooldown, then the real kick lands).
         local tAct = math.max(AP.KICK_WINDUP - sinceStart, 0)
         local eVel = plrVelFast[plr] or st.eVel or Vector3.zero
         local kPred = hrp.Position + eVel * (tAct + pingEma)
         local mePred = myHrp.Position + myHrp.AssemblyLinearVelocity * tAct
         local dAct = (mePred - kPred).Magnitude
-        local slack = math.min(math.min(pingEma, 0.5) * 12, 4)
+        local slack = math.min(math.min(pingEma, 0.5) * 12, 4) -- a little extra forgiveness, capped
+        -- DASH-KICK: you can only kick when you are NOT dashing, so a dash-kicker dashes in
+        -- first and kicks the moment they land. On a laggy screen that kicker is still drawn
+        -- partway through the dash (ping x dash speed studs behind where they really are),
+        -- and their speed has already dropped to ~0. So remember how fast they were going in
+        -- the last ~0.7s and allow for that much "hidden" distance.
         local hidden = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
+        -- Test 1 (geometry): is your body inside the kick's real hit box (4.5-stud cube
+        -- in front of the kicker) once we add tolerance for turning / ping drift?
         local rel = hrp.CFrame:PointToObjectSpace(myHrp.Position)
         local tol = AP.KICK_TOL + slack
         local inBox = d <= 14 and (-rel.Z) >= -1.5 and (-rel.Z) <= 4.5 + tol
             and math.abs(rel.X) <= 2.25 + tol and math.abs(rel.Y) <= 2.25 + tol
-        local coneK = AP.KICK_CONE - math.min(pingEma, 0.4) * 0.8
+        -- Test 2 (old rule, now ping-aware): close enough + roughly facing you
+        local coneK = AP.KICK_CONE - math.min(pingEma, 0.4) * 0.8 -- laggier = more forgiving aim
         local inReach = dAct <= AP.KICK_RANGE + slack or d <= AP.KICK_RANGE + slack + hidden
         local nearOK = inReach and (face >= coneK or d <= AP.NEAR_RANGE)
         if not inBox and not nearOK then
@@ -878,23 +894,34 @@ local function assessThreat(plr, myHrp)
             end
             return no("kicker not facing you")
         end
+        -- a kick can't be cancelled and its windup is fixed, so there is nothing to wait
+        -- for: answer the moment we recognise it (any waiting only costs ping-time we lack)
         return math.max(AP.KICK_WINDUP - sinceStart, 0), trk
     end
 
     local elapsed = timePos / math.max(speed, 0.1)
+    -- up close there is almost no time, so the feint filter is much shorter there
     local minCommit = (d <= AP.CLOSE_RANGE and AP.CLOSE_COMMIT or AP.MIN_COMMIT)
         + math.min(0.12, (baitScore[plr] or 0) * 0.03)
-    if elapsed < minCommit then return no("too early") end
+    if elapsed < minCommit then return no("too early") end                -- feint filter
     if length > 0 and timePos / length > AP.MAX_PHASE then return no("swing was nearly over") end
 
     if d > AP.MAX_RANGE then return no(("attacker too far (%.0f studs)"):format(d)) end
+    -- facing only matters at range: someone beside you can sweep the blade across you
+    -- without their body facing you, so inside NEAR_RANGE the blade path decides instead
     if face < AP.CONE_COS and d > AP.NEAR_RANGE then return no("attacker not facing you") end
 
     local ttc = st.ttc
+    -- DASH ATTACK: their whole body is rushing at you - no need for the blade path
     local bodyClosing = st.bodyClosing or 0
     if not ttc and bodyClosing >= AP.DASH_CLOSING then
         ttc = math.max(d - AP.DASH_REACH, 0) / bodyClosing
     end
+    -- CLOSE-RANGE RULE: slow regular swings and fast multi-hit combos right next to you
+    -- don't move fast enough for the path check, so up close the swing animation itself
+    -- is the signal: attacker is near, facing you, and the blade isn't clearly going
+    -- somewhere else -> parry right away. (Unknown/custom animations must show some
+    -- real blade movement first.)
     if not ttc and d <= AP.CLOSE_RANGE
         and (face >= AP.CLOSE_CONE or d <= AP.NEAR_RANGE)
         and (st.missMin == nil or st.missMin <= AP.CLOSE_MISS)
@@ -902,6 +929,7 @@ local function assessThreat(plr, myHrp)
         ttc = 0
     end
     if not st.hasBlade then
+        -- no blade parts found on this player: fall back to swing-animation timing
         ttc = math.max(AP.FALLBACK_HIT - elapsed, 0)
     end
     if not ttc then
@@ -935,23 +963,26 @@ local function sendParryClick()
             return true
         end
     end
+    -- last resort (best effort): feed the saber's own state machine the attack input
     return pcall(function()
         saberComp.CombatStateMachine:Input("ATTACK", { inputState = Enum.UserInputState.Begin })
     end)
 end
 
--- Parry through the game's own input handler (the exact function a real left-click calls).
--- NO delayed re-click any more: that was what made the chase feel laggy and could fire a
--- stray swing once you were already moving.
-local function sendParryDirect(parryTarget)
-    local sc = saberComp
+-- Parry through the game's own input handler - the exact function a real left-click
+-- calls (Lightsaber:ProcessInput), minus the delay of the OS mouse pipeline. If the
+-- game didn't start a parry (parry cooldown still not running after 80ms) we click.
+local function sendParryDirect()
     local ok = pcall(function()
-        sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+        saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
     end)
     if not ok then return sendParryClick() end
-    -- tell Chase Multi "a parry just went out, against this player" - it then only has
-    -- to wait for their stun animation to appear
-    env().StunEvade_Chase = { t = os.clock(), plr = parryTarget }
+    task.delay(0.08, function()
+        local sc = saberComp
+        if not sc or not saberStillValid(sc) then return end
+        local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") end)
+        if okC and not onCd then sendParryClick() end -- parry didn't register: real click
+    end)
     return true
 end
 
@@ -987,22 +1018,26 @@ track(RunService.Heartbeat:Connect(function(dt)
 
     local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if okP and type(p) == "number" then
-        -- follow a spike quickly, come back down gently
+        -- follow a spike quickly (so we compensate right away) but come back down gently
+        -- (so one lucky low reading doesn't make us late)
         local rate = (p > pingEma) and 8 or 1.5
         pingEma = pingEma + (p - pingEma) * math.min(1, dt * rate)
     end
     apStep(dt)
 end))
 
--- the whole Auto Parry decision (runs every frame and the instant a kick animation starts)
+-- the whole Auto Parry decision. Runs every frame AND the instant a kick animation starts
+-- (see the AnimationPlayed hook below), so we don't lose up to a frame waiting for the
+-- next Heartbeat - a tiny but real amount of time when you have high ping.
 apStep = function(dt)
     local char = LocalPlayer.Character
     local myHrp = char and char:FindFirstChild("HumanoidRootPart")
     if not myHrp then return end
-    updateSwings(myHrp, dt)
+    updateSwings(myHrp, dt) -- keep blade speeds fresh every frame, even before you block
     if apBusy then return end
     local canParry = canParryNow()
 
+    -- score every attacker, react to the most urgent swing/kick we can actually answer
     local bestEta, bestTrk, bestPlr
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
@@ -1040,6 +1075,7 @@ apStep = function(dt)
         baitScore[bestPlr] = math.max(0, (baitScore[bestPlr] or 0) - 0.5)
 
         if usesDash(st2) then
+            -- kick answered with a dash instead of a parry
             handledSwing[bestTrk] = true
             lastDash = os.clock()
             task.spawn(sendDash)
@@ -1055,9 +1091,26 @@ apStep = function(dt)
             end
         end
 
-        -- one press, the game's own input path (no mouse pipeline delay, no re-click)
-        sendParryDirect(bestPlr)
-        if not apLoggedFirst then
+        -- kicks are the time-critical case: use the game's own input path (no OS mouse
+        -- latency), with a real click as a back-up if it didn't take
+        local sent
+        if st2 and (st2.isKick or st2.isDash) then sent = sendParryDirect() else sent = sendParryClick() end
+        if AP.DEBUG then
+            -- "fired" only means we SENT it - this checks whether the game really started a parry
+            local tgt, wasKick = bestPlr.Name, st2 and st2.isKick
+            task.delay(0.15, function()
+                local sc = saberComp
+                if not sc then return end
+                local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") end)
+                local okS, state = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+                if okC and onCd then
+                    logP(tgt, ("Parry CONFIRMED vs %s%s"):format(tgt, wasKick and " (kick)" or ""))
+                else
+                    logP(tgt, ("Parry did NOT start vs %s (your state: %s)"):format(tgt, tostring(okS and state or "?")))
+                end
+            end)
+        end
+        if sent and not apLoggedFirst then
             apLoggedFirst = true
             logP(bestPlr.Name, ("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
         end
@@ -1077,11 +1130,13 @@ do
                 track(animator.AnimationPlayed:Connect(function(t)
                     local ok, id = pcall(function() return string.match(t.Animation.AnimationId, "%d+") end)
                     if ok and id == KICK_ID then
+                        -- Anti-kick: note "a kick just started near me" the instant it does
+                        -- (event-driven, so it's set before the stun can possibly arrive)
                         local mine = LocalPlayer.Character
                         local mh = mine and mine:FindFirstChild("HumanoidRootPart")
                         local kh = char:FindFirstChild("HumanoidRootPart")
                         if mh and kh and (mh.Position - kh.Position).Magnitude <= 70 then
-                            env().StunEvade_LastKick = os.clock()
+                            ((getgenv and getgenv()) or _G).ForceHBE_LastKick = os.clock()
                         end
                         if settings.autoParry then apStep(0) end
                     end
@@ -1094,69 +1149,34 @@ do
     for _, plr in ipairs(Players:GetPlayers()) do hook(plr) end
     track(Players.PlayerAdded:Connect(hook))
 end
+
 ------------------------------------------------------------------------
--- Auto Evade  (Stun Evade)
+-- Auto Evade
 --   The game gives you a short window right after you're stunned (STUN_DASH_WINDOW,
---   0.4s) in which a force dash is still allowed. A dash needs a movement key held, and
---   W makes it a FORWARD dash (the way you face). So the moment your saber enters the
---   "stunned" state we: snap your character (and the camera) around to face the escape
---   direction, hold W, wait one frame so the game sees it, then send the dash through the
---   game's own input function; if that didn't start a dash we tap a real E as a back-up.
---
---   WHY IT USED TO GET INTERRUPTED: the game adds a listener when a dash starts that
---   CANCELS the dash on any W/A/S/D/left-click press - so one stray key ended the evade.
---   The input sink swallows those keys now, and this also removes that listener for the
---   duration of the evade, so nothing you press can cut it short. Right click is still
---   free, and the block you hold is pressed for you the instant the game allows it.
---
---   AIRBORNE (build 23): a force dash needs both feet on the ground, so a stun that
---   lands while you are jumping (jump spamming gets you hit in the air constantly) has
---   no dash to give and the old code just skipped it. Now the stun is REMEMBERED while
---   you are airborne and the evade fires on the first frame you are actually standing
---   on something (Humanoid FloorMaterial ~= Air, not freefall/jumping, no upward speed).
---   The request stays alive for as long as you are stunned, plus a short grace after the
---   stun state ends (the game still refuses a dash for a moment), so a stun that ends
---   exactly as you touch down is still evaded.
+--   0.4s) in which a force dash is still allowed - after it, dashing is blocked until
+--   the stun ends. A dash needs a movement key held (the game checks W/S with
+--   UserInputService:IsKeyDown), and W makes it a FORWARD dash (the way you face).
+--   So the moment your saber enters the "stunned" state we: snap your character (and the
+--   camera) around to face AWAY from the attacker, hold W, wait one frame so the game
+--   sees it, then send the dash through the game's own input function (the same one the
+--   E key calls); if that didn't start a dash we tap a real E as a back-up; finally W is
+--   released and the camera is handed back. Needs Force for a dash (Infinite Force helps).
+--   Triggered both by the state machine's StateChanged event (instant) and a per-frame
+--   check (back-up).
 ------------------------------------------------------------------------
 local evadeBusy, wasStunned, lastCSM = false, false, nil
 local KEY_W, KEY_E = 0x57, 0x45
+
 local KEY_A, KEY_D = 0x41, 0x44
--- pending evade request: set the moment a stun is seen (air or ground), cleared when the
--- evade really runs or when the stun is long gone
-local evadeReq = { at = 0, active = false }
-local EVADE_GRACE = 0.35      -- s after the stun state ends that a landing still evades
-local EVADE_REQ_MAX = 4.0     -- s: never keep a request longer than this
-local LAND_VELOCITY = 3       -- studs/s: falling slower than this (and on a floor) = landed
 
--- are we standing on something the game will let a force dash start from?
-local function onGround()
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hum or not hrp or hum.Health <= 0 then return false end
-    local st = hum:GetState()
-    if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.Freefall
-        or st == Enum.HumanoidStateType.Jumping then
-        return false
-    end
-    local okF, floorMat = pcall(function() return hum.FloorMaterial end)
-    if okF and floorMat == Enum.Material.Air then return false end
-    local v = hrp.AssemblyLinearVelocity
-    if v.Y > LAND_VELOCITY then return false end        -- still going up (jump apex)
-    if v.Y < -LAND_VELOCITY then return false end       -- still falling
-    return true
-end
-
--- ask for an evade (this is what the stun hooks and the state check call)
-local function requestEvade()
-    if not settings.autoEvade then return end
-    evadeReq.active = true
-    evadeReq.at = os.clock()
-end
-
--- WHERE TO GO (flat vectors):
+-- WHERE TO GO. The attacker = whoever has a swing/kick/dash in progress first, otherwise
+-- the nearest player within 60 studs. All vectors are flat (no up/down).
 --   * attacker NOT looking straight at you: evade OPPOSITE to where they're looking
---   * attacker looking DIRECTLY at you: turn away and slip out DIAGONALLY (W+A / W+D)
+--     (-lookVector) - i.e. away from the side they're facing, never into their swing.
+--   * attacker looking DIRECTLY at you (the case where "opposite of their look" would send
+--     you straight past/through them): turn away from them and slip out DIAGONALLY,
+--     W+A or W+D, picked at random.
+-- returns faceDir, moveDir, sideKey (a virtual-key code or nil)
 local function evadePlan(hrp)
     local best, bestPri, bestD
     for _, plr in ipairs(Players:GetPlayers()) do
@@ -1201,9 +1221,14 @@ local function movementState()
     return ok and st or nil
 end
 
--- BLOCK BUFFER: the game refuses block while dashing / stunned, and a right-click press
--- during that time is lost. This presses block the first moment it's allowed, so the
--- block is up right as the evade ends.
+-- BLOCK BUFFER: the game doesn't let you block while dashing or while stunned (blocking is
+-- refused when the movement state is dashing/running/flipping/skidding, and the combat
+-- state during a stun isn't a state that accepts block at all), and the key-press that
+-- happens during that time is simply lost - you'd have to let go and press again after
+-- the dash. This remembers that you're holding right-click and presses block for you the
+-- very first moment the game allows it - the same input a real right-click sends - so the
+-- block is up right as the evade ends. (It can't make you block DURING the dash/stun:
+-- that would mean telling the server you're blocking when the game says you can't.)
 local function blockBuffer()
     local t0 = os.clock()
     while os.clock() - t0 < 3 and settings.autoEvade do
@@ -1225,8 +1250,7 @@ local function blockBuffer()
     end
 end
 
--- doEvade(allowWait): allowWait = true means "we are in the air, wait for the landing"
-local function doEvade(allowWait)
+local function doEvade()
     if evadeBusy or not settings.autoEvade then return end
     evadeBusy = true
     task.spawn(function()
@@ -1237,25 +1261,9 @@ local function doEvade(allowWait)
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not hrp then evadeBusy = false return end
 
-        -- 0) IN THE AIR: a force dash can't start, so stand by (no keys, no camera yet)
-        --    and fire the instant we touch the ground. The stun state is re-checked here,
-        --    and the request is dropped if the stun is over and we are still up there.
-        if allowWait and not onGround() then
-            local t0 = os.clock()
-            while os.clock() - t0 < 1.2 do
-                if not settings.autoEvade then evadeBusy = false return end
-                if not evadeReq.active and not wasStunned then break end
-                if onGround() then break end
-                RunService.Heartbeat:Wait()
-            end
-            if not onGround() then
-                evadeBusy = false
-                return -- still airborne: the pending request will fire on landing
-            end
-        end
-        evadeReq.active = false
-
-        -- 1) DECIDE the direction, TURN instantly (character + camera), press the keys
+        -- 1) DECIDE the direction, TURN instantly (character + camera: the game moves you
+        --    the way the camera points), and press the matching keys: W, plus A or D when
+        --    slipping out diagonally
         local faceDir, moveDir, sideKey = evadePlan(hrp)
         local prevCamType
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
@@ -1269,15 +1277,17 @@ local function doEvade(allowWait)
         end
 
         -- 2) NO KEY CAN MESS IT UP: a sink bound above the game's own bindings swallows
-        --    keys / left click while the evade runs, and we steer the character ourselves.
+        --    W/A/S/D (and the mouse attack button) while the evade runs, and we steer the
+        --    character ourselves every frame. (The game only asks "is W down?" through
+        --    UserInputService:IsKeyDown, which the sink does not affect.)
+        local CAS = game:GetService("ContextActionService")
         pcall(function()
-            ContextActionService:BindActionAtPriority("StunEvade_EvadeSink", function() return Enum.ContextActionResult.Sink end,
-                false, 9100, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1, Enum.KeyCode.E,
-                Enum.KeyCode.LeftControl, Enum.KeyCode.C)
+            CAS:BindActionAtPriority("ForceHBE_EvadeSink", function() return Enum.ContextActionResult.Sink end,
+                false, 9000, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
+                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1)
         end)
         pcall(function()
-            RunService:BindToRenderStep("StunEvade_EvadeMove", Enum.RenderPriority.Last.Value, function()
+            RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
                 if hum then hum:Move(moveDir, false) end
             end)
         end)
@@ -1286,27 +1296,30 @@ local function doEvade(allowWait)
             pcall(keypress, KEY_W)
             if sideKey then pcall(keypress, sideKey) end
         end
-        RunService.RenderStepped:Wait()
-        local function sendDashInput()
+        RunService.RenderStepped:Wait()                          -- earliest moment the game can see the key
+        local function sendDash()
             if saberStillValid(saberComp) then
                 pcall(function()
                     saberComp:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
                 end)
             end
         end
-        sendDashInput()
+        sendDash()
+        -- the dash starts synchronously, so ONE frame is enough to know whether it took.
+        -- If not: try the game's input again, and if that fails too a real E tap
         RunService.RenderStepped:Wait()
         if movementState() ~= "dashing" then
-            sendDashInput()
+            sendDash()
             if haveKeys and movementState() ~= "dashing" then
                 pcall(keypress, KEY_E)
                 task.wait(0.02)
                 pcall(keyrelease, KEY_E)
             end
         end
-        -- the game cancels a dash when W/A/S/D/left-click is pressed; drop that listener
+        -- the game cancels a dash when ANY of W/A/S/D/left-click is pressed (an input
+        -- listener it adds when the dash starts). Take that listener out for this dash.
         pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
-        task.spawn(blockBuffer)
+        task.spawn(blockBuffer)                                  -- hold right-click => block the instant it's allowed
 
         -- 3) steer until the dash really ends (at least 0.15s, at most 0.9s)
         local t0 = os.clock()
@@ -1314,24 +1327,20 @@ local function doEvade(allowWait)
             RunService.RenderStepped:Wait()
         end
 
-        pcall(function() RunService:UnbindFromRenderStep("StunEvade_EvadeMove") end)
-        pcall(function() ContextActionService:UnbindAction("StunEvade_EvadeSink") end)
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EvadeMove") end)
+        pcall(function() CAS:UnbindAction("ForceHBE_EvadeSink") end)
         if haveKeys then
             pcall(keyrelease, KEY_W)
             if sideKey then pcall(keyrelease, sideKey) end
         end
-        if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end
+        if cam and prevCamType then pcall(function() cam.CameraType = prevCamType end) end -- camera back to normal
         evadeBusy = false
     end)
 end
 
 track(RunService.Heartbeat:Connect(function()
-    if not settings.autoEvade then
-        wasStunned = false
-        evadeReq.active = false
-        return
-    end
-    local sc = getSaber()
+    if not settings.autoEvade then wasStunned = false return end
+    local sc = saberComp
     if not saberStillValid(sc) then return end
     local okS, csm = pcall(function() return rawget(sc, "CombatStateMachine") end)
     if not okS or not csm then return end
@@ -1340,369 +1349,62 @@ track(RunService.Heartbeat:Connect(function()
         lastCSM = csm
         pcall(function()
             track(csm.StateChanged:Connect(function(state)
-                if state == "stunned" and settings.autoEvade then
-                    requestEvade()      -- remember it even if we are in the air
-                    doEvade(true)       -- waits for the landing when airborne
-                end
+                if state == "stunned" and settings.autoEvade then doEvade() end
             end))
         end)
     end
     -- back-up path: per-frame check
     local okG, state = pcall(function() return csm:GetCurrentState() end)
     local stunned = okG and state == "stunned"
-    if stunned and not wasStunned then
-        requestEvade()
-        doEvade(true)
-    end
+    if stunned and not wasStunned then doEvade() end
     wasStunned = stunned
-
-    -- LANDING TRIGGER: a stun we could not evade in the air fires on the first grounded
-    -- frame - while the stun is still on, or within the short grace after it ends
-    if evadeReq.active and not evadeBusy then
-        local now = os.clock()
-        local fresh = (now - evadeReq.at) <= EVADE_REQ_MAX
-        local withinGrace = stunned or (now - evadeReq.at) <= (EVADE_REQ_MAX + EVADE_GRACE)
-        if not fresh then
-            evadeReq.active = false
-        elseif onGround() and (stunned or withinGrace) then
-            -- doEvade itself re-checks the movement state before it sends the dash, so a
-            -- landing during a swing just skips this frame instead of dropping the request
-            doEvade(false)
-        end
-    end
 end))
 
-------------------------------------------------------------------------
--- Chase Multi  (NEW)
---
---   What you asked for, in game terms:
---     * trigger: YOUR parry stuns somebody
---     * dash to where they went / move to
---     * then multi them, repeating continuously:
---           W  ->  E (force dash) one frame later  ->  LEFT CLICK (swing)
---     * stop IMMEDIATELY when their stun animation ends
---
---   How the stun is seen: a parried player is put in the STUNNED combat state, which
---   replicates to you as one of the game's stun animations (6297531803 / 6322313635 /
---   6322315386). So the target is whoever, among the players near the one you just
---   parried, is playing a stun animation. The stun is over the moment that track stops
---   or loops, or their Humanoid reports dead / GettingUp / freefall - checked every frame,
---   and the very same frame the stop is seen no further key is pressed.
---
---   Speed: the cycle is not on a timer. It re-arms from the saber's OWN animation events
---   (its swing finished / it went back to ignited), which is the earliest moment the game
---   accepts the next input. The gap between the three presses is ONE FRAME (that is the
---   fastest ordering the game can act on), and the swing itself is sent through the
---   saber's input function so no mouse pipeline delay is added.
---
---   Safety:
---     - never presses anything while you hold RIGHT CLICK (your block/parry wins)
---     - never presses anything while you are stunned, dashing, or dead
---     - all presses are released on the first frame the stun ends, so nothing is stuck
-------------------------------------------------------------------------
-local STUN_IDS = { ["6297531803"] = true, ["6322313635"] = true, ["6322315386"] = true }
-local CHASE_RANGE = 90        -- studs: give up if they get further than this
-local CHASE_PARRY_WINDOW = 1.2 -- s after one of your parries a new stun counts as "yours"
-local CHASE_ORPHAN = 0.35     -- s a stun with no parry of ours nearby is still claimed (chase toggle)
-
-local chase = {
-    active = false,
-    target = nil,      -- Player
-    stunTrack = nil,   -- the AnimationTrack that IS their stun
-    lastStunSeen = 0,
-    swingTrack = nil,
-    armed = 0,         -- os.clock() of the last re-arm
-    started = 0,
-    step = 0,          -- 0 idle, 1 W sent, 2 E sent, 3 click sent
-    phaseAt = 0,
-}
-
-local function stunTrackOf(char)
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not animator then return nil end
-    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
-    if not ok or type(tracks) ~= "table" then return nil end
-    for _, trk in ipairs(tracks) do
-        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
-        if okId and id and STUN_IDS[id] then
-            local okP, playing = pcall(function() return trk.IsPlaying end)
-            if okP and playing then return trk end
-        end
-    end
-    return nil
-end
-
-local function stunStillOn(plr, trk)
-    local char = plr and plr.Character
-    if not char or not trk then return false end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or hum.Health <= 0 then return false end
-    local st = hum:GetState()
-    if st == Enum.HumanoidStateType.Dead or st == Enum.HumanoidStateType.GettingUp then return false end
-    local okP, playing = pcall(function() return trk.IsPlaying end)
-    if not okP or not playing then return false end
-    -- a stun track never loops in this game; if it did loop, the loop means "over"
-    local okL, looped, pos, len = pcall(function() return trk.Looped, trk.TimePosition, trk.Length end)
-    if okL and looped and len and len > 0 and pos >= len - 0.02 then return false end
-    return true
-end
-
-local function keysDown()
-    return type(keypress) == "function" and type(keyrelease) == "function"
-end
-
-local function chaseReleaseAll()
-    if not keysDown() then return end
-    pcall(keyrelease, KEY_W)
-    pcall(keyrelease, KEY_E)
-end
-
-local function chaseStop(reason)
-    if not chase.active then return end
-    chase.active = false
-    chase.target, chase.stunTrack, chase.swingTrack = nil, nil, nil
-    chase.step = 0
-    chaseReleaseAll()
-    pcall(function() RunService:UnbindFromRenderStep("StunEvade_ChaseMove") end)
-    if reason then log("Chase Multi stopped: " .. reason) end
-end
-
--- who did we just stun?  the player near the last parried attacker who is playing a stun
-local function findChaseTarget(myHrp)
-    local now = os.clock()
-    local parryAt = env().StunEvade_Chase and env().StunEvade_Chase.t or 0
-    local sinceParry = now - parryAt
-    local parried = env().StunEvade_LastParryTarget
-    local best, bestD
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= LocalPlayer then
-            local char = plr.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if hrp and hum and hum.Health > 0 then
-                local trk = stunTrackOf(char)
-                if trk then
-                    local d = (hrp.Position - myHrp.Position).Magnitude
-                    local ours = (parried == plr and sinceParry <= CHASE_PARRY_WINDOW)
-                        or (sinceParry <= CHASE_PARRY_WINDOW and d <= 60)
-                        or (sinceParry > CHASE_PARRY_WINDOW and sinceParry <= CHASE_ORPHAN and d <= 60)
-                    if ours and d <= CHASE_RANGE and (not best or d < bestD) then
-                        best, bestD = plr, d
-                    end
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function chaseStart(plr)
-    local char = plr.Character
-    local trk = stunTrackOf(char)
-    if not trk then return end
-    chase.active = true
-    chase.target = plr
-    chase.stunTrack = trk
-    chase.lastStunSeen = os.clock()
-    chase.started = os.clock()
-    chase.step = 0
-    chase.armed = 0
-    chase.swingTrack = nil
-    log("Chase Multi: " .. plr.Name .. " is stunned - chasing and multi-ing")
-end
-
--- what state is your saber in right now?
-local function myCombatState()
-    local sc = saberComp
-    if not saberStillValid(sc) then return nil end
-    local ok, s = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
-    return ok and s or nil
-end
-
--- the swing the game is playing for us (used to know when the next one may start)
-local function mySwingTrack()
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if not animator then return nil end
-    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
-    if not ok or type(tracks) ~= "table" then return nil end
-    local best, bestPos = nil, math.huge
-    for _, trk in ipairs(tracks) do
-        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
-        if okId and id and ATTACK_IDS[id] then
-            local okP, pos, playing = pcall(function() return trk.TimePosition, trk.IsPlaying end)
-            if okP and playing and pos < bestPos then best, bestPos = trk, pos end
-        end
-    end
-    return best
-end
-
--- a left click is only "a swing" when the saber is ignited and not blocking
-local function canSwingNow()
-    local s = myCombatState()
-    return s == "ignited"
-end
-
-local function sendAttack()
-    local sc = saberComp
-    pcall(function()
-        sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
-    end)
-end
-
-local function sendForceDash()
-    local sc = saberComp
-    pcall(function()
-        sc:ProcessInput(true, { name = "FORCE_DASH", inputState = Enum.UserInputState.Begin })
-    end)
-end
-
--- face the target (character + camera: the game moves you where the camera looks)
-local function chaseFace(hrp, targetPos)
-    local dir = targetPos - hrp.Position
-    dir = Vector3.new(dir.X, 0, dir.Z)
-    if dir.Magnitude < 0.1 then return end
-    local cam = workspace.CurrentCamera
-    pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir.Unit) end)
-    if cam then
-        pcall(function()
-            local eye = hrp.Position - dir.Unit * 10 + Vector3.new(0, 4, 0)
-            cam.CFrame = CFrame.lookAt(eye, hrp.Position + dir.Unit * 20)
-        end)
-    end
-end
-
-track(RunService.RenderStepped:Connect(function()
-    if not settings.chaseMulti then
-        if chase.active then chaseStop(nil) end
-        return
-    end
-
-    local char = LocalPlayer.Character
-    local myHrp = char and char:FindFirstChild("HumanoidRootPart")
-    local myHum = char and char:FindFirstChildOfClass("Humanoid")
-    if not myHrp or not myHum or myHum.Health <= 0 then chaseStop(nil) return end
-    if not getSaber() then chaseStop(nil) return end
-
-    -- 1) STILL STUNNED?  this is the frame-accurate stop you asked for
-    if chase.active then
-        if not stunStillOn(chase.target, chase.stunTrack) then
-            local t = chase.target
-            chaseStop(nil)
-            log("Chase Multi stopped: " .. (t and t.Name or "target") .. "'s stun animation ended")
-            return
-        end
-        chase.lastStunSeen = os.clock()
-        local thrp = chase.target.Character and chase.target.Character:FindFirstChild("HumanoidRootPart")
-        if thrp and (thrp.Position - myHrp.Position).Magnitude > CHASE_RANGE then
-            chaseStop("they got too far away")
-            return
-        end
-    else
-        local target = findChaseTarget(myHrp)
-        if not target then return end
-        chaseStart(target)
-    end
-
-    -- 2) never fight the player's own inputs
-    local cs = myCombatState()
-    if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
-        -- you are holding block: keep the chase alive but do not press anything
-        if chase.step ~= 0 then chaseReleaseAll() chase.step = 0 end
-        return
-    end
-    if cs == "stunned" or cs == "kicking" or cs == "parrying" or cs == "blocking" then
-        if chase.step ~= 0 then chaseReleaseAll() chase.step = 0 end
-        return
-    end
-
-    local thrp = chase.target.Character and chase.target.Character:FindFirstChild("HumanoidRootPart")
-    if not thrp then return end
-    chaseFace(myHrp, thrp.Position)
-
-    local now = os.clock()
-    -- hold W so the force dash is a forward dash, and re-press it if something ate it
-    if keysDown() and chase.step < 2 and not UserInputService:IsKeyDown(Enum.KeyCode.W) then
-        pcall(keypress, KEY_W)
-    end
-
-    -- 3) THE CYCLE: W -> (1 frame) -> E -> (1 frame) -> LEFT CLICK, then re-arm on the swing
-    if chase.step == 0 then
-        -- only start a new cycle when the saber is ready to swing
-        if not canSwingNow() then return end
-        -- never start a swing while the previous one is still animating
-        local trk = mySwingTrack()
-        if trk then chase.swingTrack = trk return end
-        if now - chase.armed < 0.03 then return end
-        chase.armed = now
-        chase.step = 1
-        chase.phaseAt = now
-        if keysDown() then pcall(keypress, KEY_W) end
-        return
-    end
-
-    -- the three presses happen in three consecutive frames: that is the fastest order
-    -- the game can act on (same-frame input for the same button is not allowed)
-    if chase.step == 1 then
-        chase.step = 2
-        chase.phaseAt = now
-        sendForceDash()
-        if keysDown() then pcall(keypress, KEY_E) end
-        return
-    end
-
-    if chase.step == 2 then
-        chase.step = 3
-        chase.phaseAt = now
-        if keysDown() then pcall(keyrelease, KEY_E) end
-        -- the swing itself: the game's own attack input, no mouse pipeline in the way
-        if canSwingNow() then sendAttack() end
-        return
-    end
-
-    if chase.step == 3 then
-        -- the swing we just started is playing: hold this step until it finishes
-        local trk = mySwingTrack()
-        if trk then chase.swingTrack = trk return end
-        if now - chase.phaseAt < 0.1 then return end -- the click was eaten (blocked etc.)
-        chase.step = 0
-        chase.armed = now
-    end
-end))
-
--- nothing to poll: Auto Parry writes env().StunEvade_Chase (time + attacker) on every
--- parry it sends, and findChaseTarget reads it
 ------------------------------------------------------------------------
 -- Anti-kick
---   When a kick lands, the SERVER sends your game a stun message (type BLOCK_KICKED or
---   PARRY_KICKED) and your game puts you in the Stunned state. This hooks the saber
---   component's HandleSignal (where the message arrives) and the state machine's
---   "stun_request" (what actually enters Stunned) and drops kick stuns on your screen.
---   Needs hookfunction + getgc.
+--   When a kick lands, the SERVER sends your game a "stun" message (type BLOCK_KICKED
+--   or PARRY_KICKED) and your game then puts you in the Stunned state: you can't act
+--   and the camera shakes. This hooks the saber component's HandleSignal (the function
+--   that receives that message) and drops those two stun types, so on YOUR screen you
+--   simply aren't stunned and keep full control.
+--   Honest limits: the server still decided the kick connected, so your block/parry
+--   state or any damage on the server side is not undone, and it does NOT stun the
+--   kicker (only a real parry does that). If the server also locks your actions while
+--   "stunned" you may still be blocked from some of them.
+--   Needs hookfunction + getgc (same as the other getgc features).
 ------------------------------------------------------------------------
+-- Anti-kick v2. Two hooks, so no path into the stunned state is left open:
+--   (1) Lightsaber:HandleSignal  - where the server's stun message arrives
+--   (2) FiniteStateMachine:Input - the "stun_request" that actually enters Stunned
+--       (that is the thing that plays the stun animation + BlockBreak sound)
+-- A stun counts as a KICK stun if its type is BLOCK_KICKED/PARRY_KICKED (3/4), OR if a
+-- kick animation was seen on someone within ~20 studs of you in the last 1.5s (covers
+-- kicks on an un-blocking player, whose stun type we don't know).
 local antiKickStatus = "off"
-
-local function isKickStun(e, stunData)
+local function isKickStun(env, stunData)
     if type(stunData) ~= "table" then return false end
     local t = stunData.StunType
     if t == 3 or t == 4 then
-        e.StunEvade_LastKick = os.clock()
+        -- a kick stun just arrived: open the sparks/sound cleanup window NOW, even if we
+        -- never saw the kick animation (first time an animation plays on your screen it
+        -- can arrive late while its asset loads - the stun message doesn't wait for it)
+        env.ForceHBE_LastKick = os.clock()
         return true
     end
-    local lk = e.StunEvade_LastKick
+    local lk = env.ForceHBE_LastKick
     return lk ~= nil and os.clock() - lk < 2.2
 end
 
 local function installAntiKick()
-    local e = env()
-    -- the hooks live for the whole session and keep the code they were created with, so
-    -- they call THESE env entries, which every (re)run of the script refreshes
-    e.StunEvade_IsKickStun = function(stunData) return isKickStun(e, stunData) end
-    if e.StunEvade_KickHook3 then
+    local env = (getgenv and getgenv()) or _G
+    -- The hooks below live for the whole game session and keep the code they were created
+    -- with, so they never call this copy's functions directly: they call THESE env entries,
+    -- which every (re)run of the script refreshes. That way updating the script takes effect
+    -- without rejoining (an old hook running an old version was a cause of "works 85%").
+    env.ForceHBE_IsKickStun = function(stunData) return isKickStun(env, stunData) end
+    if env.ForceHBE_KickHook3 then
         antiKickStatus = "active"
-        pcall(function() if e.StunEvade_HookAudio then e.StunEvade_HookAudio() end end)
+        pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end)
         return true
     end
     local function fail(why) antiKickStatus = "NOT active: " .. why return false, why end
@@ -1729,15 +1431,15 @@ local function installAntiKick()
     local oldHandle, oldInput
     local okH, err = pcall(function()
         oldHandle = hookfunction(rawget(classes.sab, "HandleSignal"), function(self, req, payload, ...)
-            local s = e.StunEvade_Settings
-            local pred = e.StunEvade_IsKickStun
+            local s = env.ForceHBE_Settings -- always the settings of the copy currently running
+            local pred = env.ForceHBE_IsKickStun
             if s and s.antiKick and req == 15 and pred and pred(payload) then return end -- 15 = STUN
             return oldHandle(self, req, payload, ...)
         end)
         if classes.fsm then
             oldInput = hookfunction(rawget(classes.fsm, "Input"), function(self, name, data, ...)
-                local s = e.StunEvade_Settings
-                local pred = e.StunEvade_IsKickStun
+                local s = env.ForceHBE_Settings
+                local pred = env.ForceHBE_IsKickStun
                 if s and s.antiKick and name == "stun_request" and type(data) == "table"
                     and pred and pred(data.StunData) then
                     return false
@@ -1747,21 +1449,25 @@ local function installAntiKick()
         end
     end)
     if not okH then return fail("hook failed: " .. tostring(err)) end
-    e.StunEvade_KickHook3 = true
+    env.ForceHBE_KickHook3 = true
     antiKickStatus = classes.fsm and "active" or "active (partial)"
-    pcall(function() if e.StunEvade_HookAudio then e.StunEvade_HookAudio() end end)
+    pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end) -- mute stun sounds too
     return true
 end
 
 -- Auto Evade, EARLY trigger: hook the exact spot where the server's stun message arrives
+-- (Lightsaber:HandleSignal, request 15) and start the evade right there - before the game
+-- has even finished switching to its Stunned state - instead of waiting to notice the
+-- state change. doEvade waits one frame before dashing, so the stun has fully started by
+-- then. If Anti-kick is going to drop this stun there's nothing to escape, so skip it.
 local function installEvadeHook()
-    local e = env()
-    e.StunEvade_OnStun = function(payload)
-        if settings.antiKick and isKickStun(e, payload) then return end
-        requestEvade()
-        doEvade(true)
+    local env = (getgenv and getgenv()) or _G
+    -- each run points the hook at ITS doEvade/settings
+    env.ForceHBE_OnStun = function(payload)
+        if settings.antiKick and isKickStun(env, payload) then return end
+        doEvade()
     end
-    if e.StunEvade_EvadeHook then return true end
+    if env.ForceHBE_EvadeHook then return true end
     if type(hookfunction) ~= "function" or not saberStillValid(saberComp) then return false end
     local okC, class = pcall(function()
         local mt = getmetatable(saberComp)
@@ -1774,19 +1480,19 @@ local function installEvadeHook()
     local old
     local okH = pcall(function()
         old = hookfunction(rawget(class, "HandleSignal"), function(self, req, payload, ...)
-            local s = e.StunEvade_Settings
-            if s and s.autoEvade and req == 15 and e.StunEvade_OnStun then
-                pcall(e.StunEvade_OnStun, payload)
+            local s = env.ForceHBE_Settings
+            if s and s.autoEvade and req == 15 and env.ForceHBE_OnStun then
+                pcall(env.ForceHBE_OnStun, payload)
             end
             return old(self, req, payload, ...)
         end)
     end)
-    if okH then e.StunEvade_EvadeHook = true end
+    if okH then env.ForceHBE_EvadeHook = true end
     return okH
 end
 
-local antiKickSwitch
-local antiKickStatusSink
+local antiKickSwitch -- set by the UI so the key can flip the on-screen switch too
+local antiKickStatusSink -- set by the UI: shows antiKickStatus under the key row
 local function setAntiKick(on)
     settings.antiKick = on
     if antiKickSwitch then antiKickSwitch(on, true) end
@@ -1801,12 +1507,21 @@ local function setAntiKick(on)
     if antiKickStatusSink then antiKickStatusSink() end
 end
 
--- Anti-kick FX cleanup: the stun SPARKS and SOUND for ~2.2s after a nearby kick
+-- Anti-kick FX cleanup: the stun SPARKS and SOUND. For ~1.5s after a nearby kick (same
+-- window the stun filter uses) we
+--   * mute the game's own stun sounds (AudioUtil:PlaySound/PlayLocalSound for names that
+--     look like stun/break/kick-hit sounds) via hookfunction,
+--   * destroy any Sound / spark / particle instance that gets created near you or on you,
+--   * switch off every ParticleEmitter on your character, and put them back afterwards.
+-- Best effort: effects the SERVER creates and shows only to others can't be touched.
 do
-    local e = env()
+    local env = (getgenv and getgenv()) or _G
     local SoundService = game:GetService("SoundService")
 
-    -- PRELOAD the animations so they don't arrive late on the first kick
+    -- PRELOAD the animations kicks use. The first time an animation plays on your screen
+    -- its asset has to download, so it can show up LATE - after the hit and the stun - which
+    -- is exactly "only the first kick (and the first dash-kick) gets through". Loaded now,
+    -- they play on time from the first kick on.
     task.spawn(function()
         local list = {}
         for _, id in ipairs({
@@ -1823,21 +1538,25 @@ do
         for _, a in ipairs(list) do a:Destroy() end
     end)
 
+    -- "is a kick happening near me right now?" - ALSO published through env so the
+    -- long-lived audio hook always runs the newest version of this check
     local function inWindow()
-        local lk = e.StunEvade_LastKick
+        local lk = env.ForceHBE_LastKick
         return settings.antiKick and lk ~= nil and os.clock() - lk < 2.2
     end
-    e.StunEvade_InKickWindow = inWindow
+    env.ForceHBE_InKickWindow = inWindow
     local function badSoundName(n)
         n = tostring(n):lower()
-        if n:find("woosh") or n:find("whoosh") then return false end
+        if n:find("woosh") or n:find("whoosh") then return false end -- the swing/kick whoosh isn't a hit sound
         return n:find("break") or n:find("stun") or n:find("kick") or n:find("hit")
             or n:find("impact") or n:find("spark") or n:find("clash")
     end
-    e.StunEvade_BadSound = badSoundName
+    env.ForceHBE_BadSound = badSoundName
 
+    -- 1) the game's own audio helper (found in memory, like the other getgc features).
+    --    The hook calls the env functions above, so it never goes stale.
     local function hookAudio()
-        if e.StunEvade_AudioHook2 or type(hookfunction) ~= "function" then return end
+        if env.ForceHBE_AudioHook2 or type(hookfunction) ~= "function" then return end
         local audio
         local function isAudio(t)
             return type(t) == "table" and type(rawget(t, "PlaySound")) == "function"
@@ -1861,23 +1580,26 @@ do
             local old
             pcall(function()
                 old = hookfunction(fn, function(self, name, ...)
-                    local win, bad = e.StunEvade_InKickWindow, e.StunEvade_BadSound
+                    local win, bad = env.ForceHBE_InKickWindow, env.ForceHBE_BadSound
                     if win and bad and type(name) == "string" and win() and bad(name) then return end
                     return old(self, name, ...)
                 end)
             end)
         end
         wrap("PlaySound"); wrap("PlayLocalSound")
-        e.StunEvade_AudioHook2 = true
+        env.ForceHBE_AudioHook2 = true
     end
-    e.StunEvade_HookAudio = hookAudio
+    env.ForceHBE_HookAudio = hookAudio
 
+    -- 2) kill sound / spark instances created around you during the window
     local function killFx(d)
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
         local near
         if d:IsA("Sound") then
+            -- on you, stun-like name, or ANY new sound created on a part within 16 studs
+            -- (covers the victim's hit sounds when YOU are the one kicking)
             local sp = d:FindFirstAncestorWhichIsA("BasePart")
             near = d:IsDescendantOf(char) or badSoundName(d.Name)
                 or (sp ~= nil and (sp.Position - hrp.Position).Magnitude <= 16 and not tostring(d.Name):lower():find("woosh"))
@@ -1895,6 +1617,12 @@ do
         if inWindow() then killFx(d) end
     end))
 
+    -- 3) things that ALREADY exist (cached sounds the game replays, emitters it :Emit()s):
+    --    while the window is open, every frame
+    --      - any playing sound on you / in SoundService / near you with a stun-like name -> volume 0
+    --      - any particle emitter on you or within 16 studs -> fully transparent + disabled
+    --        (Enabled=false alone doesn't stop :Emit(); transparency does)
+    --    and everything is put back when the window closes.
     local savedVol, savedTrans, savedEnabled = {}, {}, {}
     local function muteSound(d, inChar)
         if d.IsPlaying and (inChar or badSoundName(d.Name)) then
@@ -1918,17 +1646,19 @@ do
     track(RunService.Heartbeat:Connect(function()
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        -- when YOU kick, the same cleanup hides your own hit sparks + sound
+        -- WHEN YOU KICK: your own game also shows hit sparks + a hit sound on your screen.
+        -- While your saber is in its "kicking" state, keep the window open too, so the
+        -- same cleanup hides them for you (each player's script only changes their OWN screen)
         if settings.antiKick and saberStillValid(saberComp) then
             local okK, st = pcall(function() return rawget(saberComp, "CombatStateMachine"):GetCurrentState() end)
-            if okK and st == "kicking" then e.StunEvade_LastKick = os.clock() end
+            if okK and st == "kicking" then env.ForceHBE_LastKick = os.clock() end
         end
         if inWindow() and hrp then
-            frameN = frameN + 1
+            frameN += 1
             for _, d in ipairs(char:GetDescendants()) do
                 if d:IsA("Sound") then muteSound(d, true) else hideFx(d) end
             end
-            if frameN % 2 == 0 then
+            if frameN % 2 == 0 then -- the wider sweep every other frame (it's heavier)
                 for _, d in ipairs(SoundService:GetDescendants()) do
                     if d:IsA("Sound") then muteSound(d, false) end
                 end
@@ -1954,15 +1684,16 @@ do
 end
 
 -- keybind: press the chosen key to toggle (set the key in the panel)
-local capturingKey = false
+local capturingKey = false -- true while you're choosing a new key in the panel
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or capturingKey or input.UserInputType ~= Enum.UserInputType.Keyboard then return end
     if input.KeyCode.Name == settings.antiKickKey then setAntiKick(not settings.antiKick) end
 end))
 
 ------------------------------------------------------------------------
--- Self-heal: every 2s re-check that ON features are really applied to your CURRENT
--- character. Features never depend on the panel being visible.
+-- Self-heal: every 2s re-check that ON features are really applied to your
+-- CURRENT character (covers respawns, the game resetting attributes, etc.).
+-- Features never depend on the panel being visible.
 ------------------------------------------------------------------------
 track(task.spawn(function()
     while true do
@@ -1976,15 +1707,15 @@ track(task.spawn(function()
             if settings.block and blockMode == "delete" and blockHookedChar ~= char then
                 blockDeleteHook(char)
             end
-            if settings.autoEvade then installEvadeHook() end
-            if settings.antiKick then
+            if settings.autoEvade then installEvadeHook() end -- keeps retrying until it can hook
+            if settings.antiKick then -- keeps retrying until it can hook
                 installAntiKick()
                 if antiKickStatusSink then antiKickStatusSink() end
             end
-            if settings.autoEvade ~= sinkApplied then syncSink() end
         end
     end
 end))
+
 ------------------------------------------------------------------------
 -- UI
 ------------------------------------------------------------------------
@@ -2001,20 +1732,15 @@ gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 local okSet = pcall(function() gui.Parent = parentGui end)
 if not okSet then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
 
--- TweenService is used by the intro image (and anything else that animates)
-local TweenService = game:GetService("TweenService")
-local ts = TweenService
-
 local COLORS = {
     bg = Color3.fromRGB(24, 24, 28), panel = Color3.fromRGB(34, 34, 40),
     text = Color3.fromRGB(235, 235, 240), sub = Color3.fromRGB(150, 150, 160),
     on = Color3.fromRGB(60, 170, 90), off = Color3.fromRGB(90, 90, 100),
-    new = Color3.fromRGB(80, 140, 230),
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(216, 384) -- compact; the rows scroll (mouse wheel)
-frame.Position = UDim2.new(0, 20, 0.5, -192)
+frame.Size = UDim2.fromOffset(210, 320) -- compact; the rows scroll (mouse wheel)
+frame.Position = UDim2.new(0, 20, 0.5, -160)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -2029,7 +1755,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 13
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Comp Client"
+title.Text = "comp"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
@@ -2040,11 +1766,13 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v24"
+hint.Text = "Ctrl+H = hide  |  v30"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
 -- password is entered
+-- a scrolling list: mouse wheel (or drag the thin bar) to scroll; rows stack in the order
+-- they're created (the first number given to makeRow/makeSwitch is just the sort order)
 local content = Instance.new("ScrollingFrame")
 content.Size = UDim2.new(1, 0, 1, -30)
 content.Position = UDim2.fromOffset(0, 30)
@@ -2055,10 +1783,7 @@ content.ScrollBarImageColor3 = COLORS.sub
 content.ScrollingDirection = Enum.ScrollingDirection.Y
 content.CanvasSize = UDim2.new(0, 0, 0, 0)
 content.AutomaticCanvasSize = Enum.AutomaticSize.Y
--- the content is NOT hidden while locked: it is pushed out of the panel by `splash`
--- (the intro image) and revealed when the password is accepted
-content.Visible = true
-content.Active = false
+content.Visible = false
 content.Parent = frame
 do
     local layout = Instance.new("UIListLayout")
@@ -2071,22 +1796,13 @@ do
     pad.Parent = content
 end
 
--- Rows are created before the panel decides where the feature list lives: while the intro
--- image is up they go into `splashHolder` (parked off the panel), and `releaseSplash`
--- moves them into `content` once the image is gone, so the scroll list starts at the top.
-local splashHolder = Instance.new("Frame")
-splashHolder.Name = "StunEvade_CodeHolder"
-local function codeHolder()
-    return splashHolder.Parent and splashHolder or content
-end
-
 local function makeRow(y, labelText)
     local row = Instance.new("Frame")
     row.Size = UDim2.new(1, -16, 0, 26)
     row.LayoutOrder = y
     row.BackgroundColor3 = COLORS.panel
     row.BorderSizePixel = 0
-    row.Parent = codeHolder()
+    row.Parent = content
     Instance.new("UICorner", row).CornerRadius = UDim.new(0, 6)
 
     local label = Instance.new("TextLabel")
@@ -2134,7 +1850,7 @@ local function makeSwitch(y, labelText, initial, onChanged)
     end
 end
 
--- section headers (the number is the position in the list)
+-- section headers: Resources / Combat / HBE (the number is the position in the list)
 local function makeHeader(order, text)
     local h = Instance.new("TextLabel")
     h.Size = UDim2.new(1, -16, 0, 18)
@@ -2145,7 +1861,8 @@ local function makeHeader(order, text)
     h.TextColor3 = COLORS.on
     h.TextXAlignment = Enum.TextXAlignment.Left
     h.Text = text
-    h.Parent = codeHolder()
+    h.Parent = content
+    -- thin line under the title
     local line = Instance.new("Frame")
     line.Size = UDim2.new(1, 0, 0, 1)
     line.Position = UDim2.new(0, 0, 1, -1)
@@ -2153,21 +1870,18 @@ local function makeHeader(order, text)
     line.BorderSizePixel = 0
     line.Parent = h
 end
-
 makeHeader(10, "RESOURCES")
 makeHeader(20, "COMBAT")
-makeHeader(35, "CHASE")
-makeHeader(40, "INPUT")
-makeHeader(50, "HITBOX EXPANDER")
+makeHeader(30, "HITBOX EXPANDER")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce)
 makeSwitch(12, "Infinite Block", settings.block, setBlock)
 makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
 makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-
 makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
+        -- self-test so you can see in F9 whether everything Auto Parry needs is there
         task.delay(2.5, function()
             if not settings.autoParry then return end
             log(("Auto Parry ON | lightsaber component: %s | click function: %s | live ping %.0f ms"):format(
@@ -2177,16 +1891,19 @@ makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end)
+makeSwitch(31, "Hitbox Expander", settings.hbe, setHBE)
+makeSwitch(32, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 makeSwitch(27, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+-- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
+-- force-dashing straight at you, so it can also spend a parry on a plain dash
 makeSwitch(28, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
--- when you get stunned: instantly hold W + dash (E) away, faster than human timing
+-- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
 makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
-    syncSink() -- Stun Evade ON = every key/mouse button except right click is swallowed
-    if on then installEvadeHook() end
-    log(on and "Stun evade ON - keys locked (only right click gets through)"
-        or "Stun evade OFF - keys unlocked")
+    if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
 end)
+
+-- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
 antiKickSwitch = makeSwitch(22, "Anti-kick", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end)
@@ -2200,7 +1917,7 @@ do
     warn.TextColor3 = Color3.fromRGB(230, 150, 80)
     warn.TextXAlignment = Enum.TextXAlignment.Left
     warn.Text = "  (Very blatant - use at your own discretion)"
-    warn.Parent = codeHolder()
+    warn.Parent = content
 end
 
 -- keybind row: click the button, then press the key you want (Esc cancels)
@@ -2229,10 +1946,9 @@ do
             if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
             if conn then conn:Disconnect() conn = nil end
             listening = false
-            task.defer(function() capturingKey = false end) -- after the toggle listener saw this press
+            task.defer(function() capturingKey = false end) -- after the toggle listener has seen this same press
             if input.KeyCode ~= Enum.KeyCode.Escape then
                 settings.antiKickKey = input.KeyCode.Name
-                syncSink() -- the new key has to be let through the input sink
             end
             btn.Text = settings.antiKickKey
         end)
@@ -2240,6 +1956,7 @@ do
     end)
 end
 do
+    -- tells you whether the hooks are really in place (so you're not guessing)
     local st = Instance.new("TextLabel")
     st.Size = UDim2.new(1, -16, 0, 14)
     st.LayoutOrder = 25
@@ -2249,72 +1966,10 @@ do
     st.TextColor3 = COLORS.sub
     st.TextXAlignment = Enum.TextXAlignment.Left
     st.TextTruncate = Enum.TextTruncate.AtEnd
-    st.Parent = codeHolder()
+    st.Parent = content
     antiKickStatusSink = function() st.Text = "  anti-kick: " .. antiKickStatus end
     antiKickStatusSink()
 end
-
--- CHASE: the new toggle
-local chaseSwitch = makeSwitch(36, "Chase Multi (parry stun)", settings.chaseMulti, function(on)
-    settings.chaseMulti = on
-    if not on then chaseStop(nil) end
-    log(on and "Chase Multi ON - after a parry stun: dash to them, then W + E + swing until their stun ends"
-        or "Chase Multi OFF")
-end)
-chaseSwitch(settings.chaseMulti, true) -- start it ON when the setting says so, no side effects
-do
-    local note = Instance.new("TextLabel")
-    note.Size = UDim2.new(1, -16, 0, 26)
-    note.LayoutOrder = 37
-    note.BackgroundTransparency = 1
-    note.Font = Enum.Font.Gotham
-    note.TextSize = 9
-    note.TextWrapped = true
-    note.TextColor3 = COLORS.sub
-    note.TextXAlignment = Enum.TextXAlignment.Left
-    note.Text = "  Dashes to whoever your parry stuns, then W > E > left click on repeat until their stun ends."
-    note.Parent = codeHolder()
-end
-
--- INPUT: no toggle any more - it follows Stun Evade. This row only shows the state.
-do
-    local row = makeRow(41, "Keys locked (Stun evade)")
-    local st = Instance.new("TextLabel")
-    st.Size = UDim2.fromOffset(46, 18)
-    st.Position = UDim2.new(1, -52, 0.5, -9)
-    st.BackgroundColor3 = COLORS.off
-    st.BorderSizePixel = 0
-    st.Font = Enum.Font.GothamBold
-    st.TextSize = 10
-    st.TextColor3 = Color3.new(1, 1, 1)
-    st.Text = settings.autoEvade and "ON" or "OFF"
-    st.Parent = row
-    Instance.new("UICorner", st).CornerRadius = UDim.new(1, 0)
-    -- update it from the heartbeat so it always tells the truth
-    track(RunService.Heartbeat:Connect(function()
-        local want = sinkApplied and "ON" or "OFF"
-        if st.Text ~= want then
-            st.Text = want
-            st.BackgroundColor3 = sinkApplied and COLORS.on or COLORS.off
-        end
-    end))
-end
-do
-    local note = Instance.new("TextLabel")
-    note.Size = UDim2.new(1, -16, 0, 26)
-    note.LayoutOrder = 42
-    note.BackgroundTransparency = 1
-    note.Font = Enum.Font.Gotham
-    note.TextSize = 9
-    note.TextWrapped = true
-    note.TextColor3 = COLORS.sub
-    note.TextXAlignment = Enum.TextXAlignment.Left
-    note.Text = "  While Stun evade is ON every key + left/middle mouse is swallowed. Only right click gets through."
-    note.Parent = codeHolder()
-end
-
-makeSwitch(51, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(52, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -2338,13 +1993,19 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(53, "Hitbox size", "hbeSize", 2, 50)
-makeNumberBox(54, "Transparency (0-1)", "hbeTransparency", 0, 1)
--- Auto Parry timing: parry too EARLY -> raise this; parry too LATE -> lower it (negative ok)
+makeNumberBox(33, "Hitbox size", "hbeSize", 2, 50)
+-- 0 = solid (easiest to see), 1 = invisible
+makeNumberBox(34, "Transparency (0-1)", "hbeTransparency", 0, 1)
+-- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
+-- parry too LATE (you get hit first) -> lower it (negative is fine).
+-- With "Parry follows ping" ON this is added on top of your (negated) live ping.
 makeNumberBox(29, "Parry timing (ms)", "parryOffset", -500, 500)
 
 ------------------------------------------------------------------------
--- Password lock (only a hash is stored, not the password)
+-- Password lock. The panel shows only this screen until the right password is
+-- typed. Only a hash is stored here, not the password itself.
+-- NOTE: this keeps casual users out of the menu; it isn't real security (anyone
+-- who reads/edits the script on GitHub can remove it).
 ------------------------------------------------------------------------
 local PASSWORD_HASH = 2300189347
 local function hashPassword(s)
@@ -2404,7 +2065,7 @@ local function tryUnlock()
     if hashPassword(pwBox.Text) == PASSWORD_HASH then
         pwBox.Text = ""
         lock.Visible = false
-        releaseSplash()
+        content.Visible = true
         log("unlocked")
     else
         pwBox.Text = ""
@@ -2412,150 +2073,6 @@ local function tryUnlock()
         lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
     end
 end
-
-------------------------------------------------------------------------
--- INTRO IMAGE  (the artwork pops up when the script runs, glows, then fades away)
---   Full-screen overlay (not inside the small panel, so the art shows at its real size
---   on any screen): the picture fades in, a soft aura of the same picture pulses behind
---   it, then everything fades out and disappears after a few seconds.
---   LEFT CLICK skips it. Nothing extra is downloaded: the glow is the picture itself.
---   ART: an uploaded Roblox image id, e.g. "rbxassetid://1234567890" (upload the PNG on
---   create.roblox.com, copy its Image / Decal asset id). Leave it "loading" until then -
---   the intro is skipped and the panel shows as normal.
-------------------------------------------------------------------------
-local ART = "loading"
--- SHOW: seconds the picture stays before it fades.  HOLD: fraction of that it stays
--- fully visible (the rest is the fade-out).
-local INTRO_SHOW, INTRO_HOLD = 4.5, 0.8
-local splash = Instance.new("Frame")
-splash.Name = "StunEvade_Splash"
-splash.Size = UDim2.new(1, 0, 1, 0)
-splash.Position = UDim2.fromOffset(0, 0)
-splash.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-splash.BackgroundTransparency = 0.35
-splash.BorderSizePixel = 0
-splash.ZIndex = 60
-splash.Parent = gui
-
-local splashBox = Instance.new("Frame")
-splashBox.Size = UDim2.new(1, 0, 0.86, 0)
-splashBox.Position = UDim2.new(0, 0, 0.5, 0)
-splashBox.AnchorPoint = Vector2.new(0.5, 0.5)
-splashBox.BackgroundTransparency = 1
-splashBox.ZIndex = 61
-splashBox.Parent = splash
-
--- the glow: the picture itself, enlarged and see-through, pulsing
-local splashGlow = Instance.new("ImageLabel")
-splashGlow.Name = "Glow"
-splashGlow.Size = UDim2.new(1, 40, 1, 40)
-splashGlow.Position = UDim2.fromOffset(-20, -20)
-splashGlow.BackgroundTransparency = 1
-splashGlow.Image = ART
-splashGlow.ImageTransparency = 1
-splashGlow.ScaleType = Enum.ScaleType.Fit
-splashGlow.ZIndex = 62
-splashGlow.Parent = splashBox
-
-local splashImg = Instance.new("ImageLabel")
-splashImg.Name = "Art"
-splashImg.Size = UDim2.new(1, 0, 1, 0)
-splashImg.BackgroundTransparency = 1
-splashImg.Image = ART
-splashImg.ImageTransparency = 1
-splashImg.ScaleType = Enum.ScaleType.Fit
-splashImg.ZIndex = 63
-splashImg.Parent = splashBox
-
--- a thin glowing edge around the picture
--- a glowing edge that hugs the picture (the image's own alpha decides its shape)
-local splashEdge = Instance.new("ImageLabel")
-splashEdge.Name = "Edge"
-splashEdge.Size = UDim2.new(1, 0, 1, 0)
-splashEdge.BackgroundTransparency = 1
-splashEdge.Image = ART
-splashEdge.ImageColor3 = Color3.fromRGB(90, 160, 255)
-splashEdge.ImageTransparency = 1
-splashEdge.ScaleType = Enum.ScaleType.Fit
-splashEdge.ZIndex = 62
-splashEdge.Parent = splashBox
-
-local splashTweens = {}
-local function tweenIn(obj, info, props)
-    local t = ts:Create(obj, info, props)
-    table.insert(splashTweens, t)
-    t:Play()
-    return t
-end
-
-local splashDone = false
-local function releaseSplash()
-    if splashDone then return end
-    splashDone = true
-    -- stop the breathing glow
-    for _, t in ipairs(splashTweens) do pcall(function() t:Cancel() end) end
-    table.clear(splashTweens)
-    if splashImg:GetAttribute("fading") then return end -- the fade-out is already running
-    splash:Destroy()
-    splashHolder:ClearAllChildren()
-    splashHolder:Destroy()
-    content.Active = true
-    if not lock.Visible then content.Visible = true end
-end
-
-local function splashIntro()
-    if ART == "loading" then
-        -- no picture set yet: do not cover the panel with nothing
-        releaseSplash()
-        return
-    end
-    -- 1) pop in: the picture fades in while it grows a touch (the glow with it)
-    splashImg.ImageTransparency = 1
-    splashGlow.ImageTransparency = 1
-    splashEdge.ImageTransparency = 1
-    splashImg.Size = UDim2.new(0.94, 0, 0.94, 0)
-    splashImg.Position = UDim2.new(0.03, 0, 0.03, 0)
-    splashGlow.Size = UDim2.new(1.0, 40, 1.0, 40)
-    tweenIn(splashImg, TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
-        { ImageTransparency = 0, Size = UDim2.new(1, 0, 1, 0), Position = UDim2.fromOffset(0, 0) })
-    tweenIn(splashEdge, TweenInfo.new(0.5), { ImageTransparency = 0.75 })
-    tweenIn(splashGlow, TweenInfo.new(0.6), { ImageTransparency = 0.55 })
-    -- 2) the glow breathes for as long as the picture is up
-    task.spawn(function()
-        while not splashDone do
-            local t1 = tweenIn(splashGlow, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
-                { ImageTransparency = 0.8, Size = UDim2.new(1.06, 40, 1.06, 40) })
-            t1.Completed:Wait()
-            if splashDone then break end
-            local t2 = tweenIn(splashGlow, TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
-                { ImageTransparency = 0.5, Size = UDim2.new(1.0, 40, 1.0, 40) })
-            t2.Completed:Wait()
-        end
-    end)
-    -- 3) stay up, then fade everything out and get out of the way
-    local fade = INTRO_SHOW * (1 - INTRO_HOLD)
-    task.delay(INTRO_SHOW * INTRO_HOLD, function()
-        if splashDone or not splash.Parent then return end
-        splashImg:SetAttribute("fading", true)
-        local info = TweenInfo.new(fade, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-        tweenIn(splashImg, info, { ImageTransparency = 1 })
-        tweenIn(splashEdge, info, { ImageTransparency = 1 })
-        tweenIn(splashGlow, info, { ImageTransparency = 1 })
-        local done = tweenIn(splash, info, { BackgroundTransparency = 1 })
-        done.Completed:Once(function()
-            releaseSplash()
-        end)
-    end)
-    -- skip: click the picture
-    local skipBtn = Instance.new("TextButton")
-    skipBtn.Text = ""
-    skipBtn.BackgroundTransparency = 1
-    skipBtn.Size = UDim2.new(1, 0, 1, 0)
-    skipBtn.ZIndex = 70
-    skipBtn.Parent = splash
-    skipBtn.MouseButton1Click:Connect(releaseSplash)
-end
-
 unlockBtn.MouseButton1Click:Connect(tryUnlock)
 pwBox.FocusLost:Connect(function(enterPressed)
     if enterPressed then tryUnlock() end
@@ -2589,15 +2106,20 @@ local function onList()
     if settings.autoParry then table.insert(on, "AutoParry") end
     if settings.autoEvade then table.insert(on, "AutoEvade") end
     if settings.dashGuard then table.insert(on, "DashGuard") end
-    if settings.chaseMulti then table.insert(on, "ChaseMulti") end
-    if settings.autoEvade then table.insert(on, "KeysLocked") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
 end
 
 --[[
     Ctrl + H fully hides/shows the menu - nothing is left on screen.
-    Hiding ONLY flips `frame.Visible`; no feature reads the panel or the switches.
+    Glitch-proofing:
+      - Hiding ONLY flips `frame.Visible`. No feature reads the panel, the switches,
+        or `Visible`; they all read the `settings` table, which hiding never touches.
+      - The gui itself stays Enabled and parented, so nothing gets destroyed or
+        garbage-collected while hidden.
+      - The 2s self-heal loop keeps re-applying ON features while hidden.
+      - Instead of an on-screen status line, F9 prints what's still ON each time
+        you hide it, so you can check without anything showing.
 ]]
 track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.KeyCode ~= Enum.KeyCode.H then return end
@@ -2612,49 +2134,15 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
 end))
 
 ------------------------------------------------------------------------
--- RE-EXECUTE HANDLING
---   Executing the script again replaces the old copy completely:
---     1) the previous copy's cleanup runs FIRST (bottom of this file), so its panel, its
---        loops, its connections, its input sink and its ON features all go away
---     2) this copy then builds one fresh panel
---   Anything left over from an older build (a panel under another name, a stale
---   Ctrl+H / drag / input listener, an armed sink) is swept too, so you can never end up
---   with two panels on screen or two copies both pressing keys.
-------------------------------------------------------------------------
-local function sweepOldPanels()
-    local places = {}
-    if gethui then places[#places + 1] = gethui() end
-    pcall(function() places[#places + 1] = game:GetService("CoreGui") end)
-    pcall(function() places[#places + 1] = LocalPlayer:FindFirstChildOfClass("PlayerGui") end)
-    for _, parent in ipairs(places) do
-        pcall(function()
-            for _, obj in ipairs(parent:GetChildren()) do
-                if obj:IsA("ScreenGui") and (obj.Name == GUI_NAME
-                    or string.match(obj.Name, "^StunEvade") or string.match(obj.Name, "^ForceHBE")) then
-                    obj:Destroy()
-                end
-            end
-        end)
-    end
-end
-
--- close the previous copy, then sweep whatever else of ours is still there
-do
-    local e = env()
-    local oldCleanup = e.StunEvade_Cleanup
-    e.StunEvade_Cleanup = nil
-    if type(oldCleanup) == "function" then pcall(oldCleanup) end
-    -- a copy that died half way may have left the sink armed: release every key first
-    pcall(function() ContextActionService:UnbindAction(SINK_NAME) end)
-    sweepOldPanels()
-end
-
-------------------------------------------------------------------------
--- cleanup (runs when the script is executed again - see RE-EXECUTE HANDLING above)
+-- cleanup (used when you re-execute the script)
 ------------------------------------------------------------------------
 local function cleanup()
-    if env().StunEvade_Cleanup == cleanup then env().StunEvade_Cleanup = nil end
-    -- 1) every loop, every listener and every pending task this copy made
+    setForce(false)
+    setBlock(false)
+    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
+    settings.autoEvade = false
+    settings.antiKick = false
+    setHBE(false)
     for _, c in ipairs(connections) do
         if type(c) == "thread" then
             pcall(task.cancel, c)
@@ -2662,27 +2150,8 @@ local function cleanup()
             pcall(function() c:Disconnect() end)
         end
     end
-    table.clear(connections)
-    -- 2) features off - the chase releases W/E, the sink releases every key
-    pcall(chaseStop, nil)
-    pcall(sinkSet, false)
-    pcall(function() setForce(false) end)
-    pcall(function() setBlock(false) end)
-    pcall(function() setHBE(false) end)
-    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
-    settings.autoEvade, settings.antiKick, settings.chaseMulti = false, false, false
-    -- 3) render-step / action bindings and the panel itself
-    pcall(function() RunService:UnbindFromRenderStep("StunEvade_EvadeMove") end)
-    pcall(function() RunService:UnbindFromRenderStep("StunEvade_ChaseMove") end)
-    pcall(function() ContextActionService:UnbindAction("StunEvade_EvadeSink") end)
-    pcall(function() ContextActionService:UnbindAction(SINK_NAME) end)
-    pcall(releaseSplash)
-    pcall(function() if gui then gui:Destroy() end end)
-    pcall(sweepOldPanels)
+    if gui then gui:Destroy() end
 end
-env().StunEvade_Cleanup = cleanup
+if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
--- the intro image (needs this copy alive, so it starts at the very end of the load)
-task.spawn(splashIntro)
-
-log("loaded (build 24) - Ctrl+H toggles the panel; executing it again replaces this one")
+log("loaded (build 17: no log box) - Ctrl+H toggles the panel")
