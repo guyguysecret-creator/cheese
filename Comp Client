@@ -1247,4 +1247,7 @@ end))
 
 log("Stun Evade script loaded with all fixes:")
 log(" - Input blocking: blocks all keys/mouse except Right Click (for blocking/parrying)")
-log... (1 KB left)
+log(" - Auto-dash + multi-hit: enabled via 'autoDashMulti' setting")
+log("   Pattern: W then E immediately after, then Left Click to swing saber")
+log("   Stops when target's stun animation ends")
+log(" - Auto parry: optimized with reduced delay for immediate chase")
