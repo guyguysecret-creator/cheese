@@ -51,6 +51,7 @@ local settings = {
     kick = false,
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
+    dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
     parryOffset = -75,     -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping)
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
@@ -517,7 +518,10 @@ end
 local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
-    DASH_REACH = 8,      -- studs in front of a dashing attacker that their blade can hit
+    DASH_GUARD_SPEED = 25, -- studs/s toward you that counts as "dashing at you"
+    DASH_GUARD_RANGE = 70, -- studs
+    DASH_GUARD_LEAD = 0.1, -- s extra lead (on top of ping) for the dash-guard parry
+    DASH_REACH = 8,     -- studs in front of a dashing attacker that their blade can hit
     BODY_RADIUS = 2.5,   -- studs: blade counts as "landed" this close to your center
     MIN_SWING_SPEED = 9, -- studs/s: blade speed relative to THEIR body that counts as a swing
     HIT_RADIUS = 4.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
@@ -556,6 +560,7 @@ for _, id in ipairs({
 
 -- the kick uses the "ParryBreak" animation (Client.Components.Lightsaber.States.Combat.Kicking)
 local KICK_ID = "13552157283"
+local DASH_ID = "6302511048" -- Dash_Animation (force dash, E)
 
 local pingEma = 0.08
 local baitScore = {}                              -- [player] = n
@@ -595,7 +600,8 @@ local function findAttackTrack(char)
     if not animator then return nil end
     local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
     if not ok or type(tracks) ~= "table" then return nil end
-    local unknown, attack
+    local unknown, attack, dash
+    local attackPos = math.huge
     for _, trk in ipairs(tracks) do
         local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
         if okId and id then
@@ -603,7 +609,13 @@ local function findAttackTrack(char)
             -- earlier can still be fading out and used to hide the kick from us
             if id == KICK_ID then return trk, true, false end
             if ATTACK_IDS[id] then
-                attack = attack or trk
+                -- fast combos: the old swing is still fading while the next one starts.
+                -- Always follow the NEWEST one (smallest TimePosition) so we never flip
+                -- back and forth between the two and lose our blade-speed history.
+                local okP, pos = pcall(function() return trk.TimePosition end)
+                if okP and pos < attackPos then attack, attackPos = trk, pos end
+            elseif id == DASH_ID then
+                dash = dash or trk
             elseif not unknown and not NON_ATTACK_IDS[id] then
                 local okL, looped, len = pcall(function() return trk.Looped, trk.Length end)
                 if okL and not looped and len > 0.2 and len < 4 then unknown = { trk, id } end
@@ -611,6 +623,9 @@ local function findAttackTrack(char)
         end
     end
     if attack then return attack, false, false end
+    -- DASH GUARD (optional): a force-dash toward you is the first half of dash-kicks and
+    -- dash-attacks, so it is also a (early) warning for high-ping players
+    if dash and settings.dashGuard then return dash, false, false, true end
     if unknown then
         -- only count it if their saber is actually out (blade parts exist) - filters emotes
         local hasBlade = false
@@ -676,8 +691,8 @@ local function updateSwings(myHrp, dt)
                 end
                 plrLastPos[plr] = hrp0.Position
             end
-            local trk, isKick, isUnknown
-            if char then trk, isKick, isUnknown = findAttackTrack(char) end
+            local trk, isKick, isUnknown, isDash
+            if char then trk, isKick, isUnknown, isDash = findAttackTrack(char) end
             local old = swingState[plr]
             if old and (not trk or old.trk ~= trk) and AP.DEBUG and not handledSwing[old.trk] and old.why
                 and old.why ~= "too early" and os.clock() - (AP._lastDbg or 0) > 0.7 then
@@ -691,8 +706,12 @@ local function updateSwings(myHrp, dt)
                 local st = swingState[plr]
                 if not st or st.trk ~= trk then
                     st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil,
-                           isKick = isKick, unknown = isUnknown, t0 = os.clock(), maxSwing = 0 }
+                           isKick = isKick, unknown = isUnknown, isDash = isDash, t0 = os.clock(), maxSwing = 0 }
                     swingState[plr] = st
+                    if isDash and AP.DEBUG then
+                        logP(plr.Name, ("Auto Parry SAW %s dash (%.0f studs away)"):format(plr.Name,
+                            (char:FindFirstChild("HumanoidRootPart") and (char.HumanoidRootPart.Position - myPos).Magnitude) or -1))
+                    end
                     if isKick and AP.DEBUG then
                         local hrpK = char:FindFirstChild("HumanoidRootPart")
                         logP(plr.Name, ("Auto Parry SAW a kick from %s (%.0f studs away)"):format(
@@ -804,6 +823,23 @@ local function assessThreat(plr, myHrp)
     local toMe = myHrp.Position - hrp.Position
     local d = math.max(toMe.Magnitude, 0.01)
     local face = hrp.CFrame.LookVector:Dot(toMe / d)
+
+    -- DASH GUARD: an enemy force-dashing straight at you. Their dash-kick / dash-attack
+    -- comes the moment they land, so on high ping this is the early warning we need.
+    -- We parry so that the parry is up as they ARRIVE (it then covers the ~0.7s after).
+    if st.isDash then
+        if not settings.dashGuard then return no("dash guard is off") end
+        local fast = plrVelFast[plr] or Vector3.zero
+        local dirE = toMe / d
+        local toward = fast:Dot(dirE)
+        if toward < AP.DASH_GUARD_SPEED then return no("dash isn't heading at you") end
+        if d > AP.DASH_GUARD_RANGE then return no(("dasher too far (%.0f studs)"):format(d)) end
+        if face < 0.45 then return no("dasher not facing you") end
+        -- what we see is a ping old, so they are already closer than they look
+        local tArrive = math.max(d - AP.DASH_REACH, 0) / toward - pingEma
+        if tArrive > pingEma + AP.DASH_GUARD_LEAD then return no("too early") end
+        return math.max(tArrive, 0), trk
+    end
 
     -- KICK: no blade involved. The kick's hit box is a ~4.5 stud cube in front of the
     -- kicker that switches on 0.4s after the kick starts (Kicking state: KICK_WINDUP),
@@ -1038,7 +1074,7 @@ apStep = function(dt)
         -- kicks are the time-critical case: use the game's own input path (no OS mouse
         -- latency), with a real click as a back-up if it didn't take
         local sent
-        if st2 and st2.isKick then sent = sendParryDirect() else sent = sendParryClick() end
+        if st2 and (st2.isKick or st2.isDash) then sent = sendParryDirect() else sent = sendParryClick() end
         if AP.DEBUG then
             -- "fired" only means we SENT it - this checks whether the game really started a parry
             local tgt, wasKick = bestPlr.Name, st2 and st2.isKick
@@ -1129,8 +1165,8 @@ local COLORS = {
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 480)
-frame.Position = UDim2.new(0, 20, 0.5, -240)
+frame.Size = UDim2.fromOffset(250, 520)
+frame.Position = UDim2.new(0, 20, 0.5, -260)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -1235,6 +1271,9 @@ end)
 makeSwitch(238, "Hitbox Expander", settings.hbe, setHBE)
 makeSwitch(278, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
 makeSwitch(318, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+-- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
+-- force-dashing straight at you, so it can also spend a parry on a plain dash
+makeSwitch(358, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 
 -- number boxes (type a value, press Enter or click away)
 local function makeNumberBox(y, labelText, key, minV, maxV)
@@ -1258,13 +1297,13 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     end)
 end
 
-makeNumberBox(358, "Hitbox size", "hbeSize", 2, 50)
+makeNumberBox(398, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(398, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(438, "Transparency (0-1)", "hbeTransparency", 0, 1)
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(438, "Parry timing (ms)", "parryOffset", -500, 500)
+makeNumberBox(478, "Parry timing (ms)", "parryOffset", -500, 500)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
@@ -1537,6 +1576,7 @@ local function onList()
     if settings.parry then table.insert(on, "Parry") end
     if settings.kick then table.insert(on, "Kicks") end
     if settings.autoParry then table.insert(on, "AutoParry") end
+    if settings.dashGuard then table.insert(on, "DashGuard") end
     if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
 end
@@ -1570,7 +1610,7 @@ end))
 local function cleanup()
     setForce(false)
     setBlock(false)
-    settings.parry, settings.kick, settings.autoParry = false, false, false
+    settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
     setHBE(false)
     for _, c in ipairs(connections) do
         if type(c) == "thread" then
@@ -1583,4 +1623,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 14: dash-kick fix) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 15: dash guard + stable combos) - Ctrl+H toggles the panel")
