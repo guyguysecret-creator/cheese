@@ -1284,7 +1284,7 @@ local function doEvade()
         pcall(function()
             CAS:BindActionAtPriority("ForceHBE_EvadeSink", function() return Enum.ContextActionResult.Sink end,
                 false, 9000, Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D,
-                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1)
+                Enum.KeyCode.Space, Enum.UserInputType.MouseButton1, Enum.UserInputType.E, Enum.UserInputType.LeftControl, Enum.UserInputType.C)
         end)
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
