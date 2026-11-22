@@ -2533,3 +2533,53 @@ local function tryUnlock()
         lockLabel.TextColor3 = Color3.fromRGB(220, 80, 80)
     end
 end
+unlockBtn.MouseButton1Click:Connect(tryUnlock)
+pwBox.FocusLost:Connect(function(enterPressed)
+    if enterPressed then tryUnlock() end
+end)
+
+-- dragging
+do
+    local dragging, dragStart, startPos
+    frame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, dragStart, startPos = true, input.Position, frame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - dragStart
+            frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        end
+    end))
+end
+
+local function onList()
+    local on = {}
+    if settings.force then table.insert(on, "Force") end
+    if settings.block then table.insert(on, "Block") end
+    if settings.parry then table.insert(on, "Parry") end
+    if settings.kick then table.insert(on, "Kicks") end
+    if settings.autoParry then table.insert(on, "AutoParry") end
+    if settings.autoEvade then table.insert(on, "AutoEvade") end
+    if settings.dashGuard then table.insert(on, "DashGuard") end
+    if settings.chaseMulti then table.insert(on, "ChaseMulti") end
+    if settings.hbe then table.insert(on, "HBE") end
+    return #on > 0 and table.concat(on, ", ") or "nothing"
+end
+
+-- Ctrl + H fully hides/shows the menu - nothing is left on screen.
+track(UserInputService.InputBegan:Connect(function(input, processed)
+    if processed or input.KeyCode ~= Enum.KeyCode.H then return end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
+        frame.Visible = not frame.Visible
+        if frame.Visible then
+            log("menu shown")
+        else
+            log("menu hidden (Ctrl+H to bring it back) - still ON: " .. onList())
+        end
+    end
+end))
