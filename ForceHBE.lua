@@ -1241,7 +1241,11 @@ end
 
 local function installAntiKick()
     local env = (getgenv and getgenv()) or _G
-    if env.ForceHBE_KickHook2 then antiKickStatus = "active" return true end
+    if env.ForceHBE_KickHook2 then
+        antiKickStatus = "active"
+        pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end)
+        return true
+    end
     local function fail(why) antiKickStatus = "NOT active: " .. why return false, why end
     if type(hookfunction) ~= "function" then return fail("no hookfunction in this executor") end
     if not saberStillValid(saberComp) then return fail("saber not found (equip + ignite it)") end
@@ -1284,6 +1288,7 @@ local function installAntiKick()
     if not okH then return fail("hook failed: " .. tostring(err)) end
     env.ForceHBE_KickHook2 = true
     antiKickStatus = classes.fsm and "active" or "active (partial)"
+    pcall(function() if env.ForceHBE_HookAudio then env.ForceHBE_HookAudio() end end) -- mute stun sounds too
     return true
 end
 
@@ -1301,6 +1306,108 @@ local function setAntiKick(on)
         log("Anti-kick OFF")
     end
     if antiKickStatusSink then antiKickStatusSink() end
+end
+
+-- Anti-kick FX cleanup: the stun SPARKS and SOUND. For ~1.5s after a nearby kick (same
+-- window the stun filter uses) we
+--   * mute the game's own stun sounds (AudioUtil:PlaySound/PlayLocalSound for names that
+--     look like stun/break/kick-hit sounds) via hookfunction,
+--   * destroy any Sound / spark / particle instance that gets created near you or on you,
+--   * switch off every ParticleEmitter on your character, and put them back afterwards.
+-- Best effort: effects the SERVER creates and shows only to others can't be touched.
+do
+    local env = (getgenv and getgenv()) or _G
+    local function inWindow()
+        local lk = env.ForceHBE_LastKick
+        return settings.antiKick and lk ~= nil and os.clock() - lk < 1.5
+    end
+
+    -- 1) the game's own audio helper (found in memory, like the other getgc features)
+    local function hookAudio()
+        if env.ForceHBE_AudioHook or type(hookfunction) ~= "function" then return end
+        local audio
+        local function isAudio(t)
+            return type(t) == "table" and type(rawget(t, "PlaySound")) == "function"
+        end
+        if type(filtergc) == "function" then
+            local ok, res = pcall(filtergc, "table", { Keys = { "PlaySound", "PlayLocalSound" } })
+            if ok and type(res) == "table" then for _, t in pairs(res) do if isAudio(t) then audio = t break end end end
+        end
+        if not audio and type(getgc) == "function" then
+            local ok, list = pcall(getgc, true)
+            if ok and type(list) == "table" then
+                for _, t in ipairs(list) do
+                    if isAudio(t) and type(rawget(t, "PlayLocalSound")) == "function" then audio = t break end
+                end
+            end
+        end
+        if not audio then return end
+        local function wrap(fnName)
+            local fn = rawget(audio, fnName)
+            if type(fn) ~= "function" then return end
+            local old
+            local ok = pcall(function()
+                old = hookfunction(fn, function(self, name, ...)
+                    local s = env.ForceHBE_Settings
+                    local lk = env.ForceHBE_LastKick
+                    if s and s.antiKick and lk and os.clock() - lk < 1.5 and type(name) == "string"
+                        and (name:lower():find("break") or name:lower():find("stun") or name:lower():find("kicked")
+                            or name:lower():find("hit") or name:lower():find("impact")) then
+                        return
+                    end
+                    return old(self, name, ...)
+                end)
+            end)
+            return ok
+        end
+        wrap("PlaySound"); wrap("PlayLocalSound")
+        env.ForceHBE_AudioHook = true
+    end
+    env.ForceHBE_HookAudio = hookAudio
+
+    -- 2) kill sound / spark instances created around you during the window
+    local function killFx(d)
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local near
+        if d:IsA("Sound") then
+            local n = d.Name:lower()
+            near = d:IsDescendantOf(char) or n:find("break") or n:find("stun") or n:find("kick") or n:find("hit")
+                or n:find("impact") or n:find("spark")
+        elseif d:IsA("ParticleEmitter") or d:IsA("Sparkles") or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Trail") or d:IsA("Beam") then
+            local part = d:FindFirstAncestorWhichIsA("BasePart")
+            near = part and (d:IsDescendantOf(char) or (part.Position - hrp.Position).Magnitude <= 14)
+        end
+        if near then pcall(function()
+            if d:IsA("Sound") then d.Volume = 0; d:Stop() end
+            if d:IsA("ParticleEmitter") then d.Enabled = false end
+            d:Destroy()
+        end) end
+    end
+    track(game.DescendantAdded:Connect(function(d)
+        if inWindow() then killFx(d) end
+    end))
+
+    -- 3) switch off every ParticleEmitter already on your character while the window is open
+    local silenced = {}
+    track(RunService.Heartbeat:Connect(function()
+        local char = LocalPlayer.Character
+        if inWindow() and char then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("ParticleEmitter") and d.Enabled then
+                    silenced[d] = true
+                    d.Enabled = false
+                    d:Clear()
+                end
+            end
+        elseif next(silenced) then
+            for d in pairs(silenced) do
+                if d.Parent then pcall(function() d.Enabled = true end) end
+            end
+            table.clear(silenced)
+        end
+    end))
 end
 
 -- keybind: press the chosen key to toggle (set the key in the panel)
@@ -1385,7 +1492,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v21"
+hint.Text = "Ctrl+H = hide  |  v22"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
