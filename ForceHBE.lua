@@ -115,7 +115,19 @@ track(LocalPlayer.CharacterAdded:Connect(function(char)
     end
 end))
 
-local function log(...) print("[ForceHBE]", ...) end
+-- Some executors send print() to their OWN console instead of Roblox's F9 console, so
+-- everything is also kept in a buffer that the menu shows in a small box under the panel.
+local logLines = {}
+local logSink -- set once the UI exists
+local function log(...)
+    local parts = {}
+    for i = 1, select("#", ...) do parts[i] = tostring((select(i, ...))) end
+    local msg = table.concat(parts, " ")
+    pcall(print, "[ForceHBE]", msg)
+    table.insert(logLines, msg)
+    if #logLines > 40 then table.remove(logLines, 1) end
+    if logSink then pcall(logSink) end
+end
 
 ------------------------------------------------------------------------
 -- Infinite Block
@@ -1212,6 +1224,38 @@ pwBox.FocusLost:Connect(function(enterPressed)
     if enterPressed then tryUnlock() end
 end)
 
+-- on-screen log box (under the panel, moves/hides with it): the same lines the script
+-- prints to F9, in case your executor doesn't show print() there
+do
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, 0, 0, 170)
+    box.Position = UDim2.new(0, 0, 1, 6)
+    box.BackgroundColor3 = COLORS.bg
+    box.BackgroundTransparency = 0.15
+    box.BorderSizePixel = 0
+    box.Parent = content
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, -12, 1, -8)
+    lbl.Position = UDim2.fromOffset(6, 4)
+    lbl.BackgroundTransparency = 1
+    lbl.Font = Enum.Font.Code
+    lbl.TextSize = 11
+    lbl.TextColor3 = COLORS.sub
+    lbl.TextWrapped = true
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.TextYAlignment = Enum.TextYAlignment.Bottom
+    lbl.Text = ""
+    lbl.Parent = box
+
+    logSink = function()
+        local from = math.max(1, #logLines - 11)
+        lbl.Text = table.concat(logLines, "\n", from, #logLines)
+    end
+    logSink()
+end
+
 -- dragging
 do
     local dragging, dragStart, startPos
@@ -1284,4 +1328,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-print("[ForceHBE] loaded (auto-parry build 7: kick debug) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 8: on-screen log) - Ctrl+H toggles the panel")
