@@ -695,6 +695,7 @@ local function updateSwings(myHrp, dt)
                 local ePos = hrpE and hrpE.Position
                 local eVel = (ePos and st.prevE and dt > 0) and (ePos - st.prevE) / dt or Vector3.zero
                 st.prevE = ePos
+                st.eVel = eVel
 
                 -- how fast is their whole BODY rushing at you? (dash attacks come from far away)
                 local bodyClosing = 0
@@ -794,23 +795,29 @@ local function assessThreat(plr, myHrp)
         -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
         local sinceStart = os.clock() - st.t0 + pingEma
         if sinceStart > AP.KICK_WINDUP + 0.75 + pingEma then return no("kick was already over") end
-        local closingK = math.min(math.max(st.bodyClosing or 0, 0), 70)
-        -- slack: with high ping BOTH positions are stale (the kicker's by a ping, yours by
-        -- the time the kick lands), so the faster anyone is moving the less exact "d" is
-        local slack = math.min(pingEma, 0.5)
-            * (math.min(myHrp.AssemblyLinearVelocity.Magnitude, 60) + math.min(hrp.AssemblyLinearVelocity.Magnitude, 60)) * 0.5
+        -- WHERE WILL YOU BOTH BE when the hit box switches on? The kicker's position we see
+        -- is one ping old and the box turns on KICK_WINDUP after the kick began. A kicker
+        -- 26 studs away who is not closing in can never hit, so it is NOT answered
+        -- (answering it only burns the 1.5s parry cooldown, then the real kick lands).
+        local tAct = math.max(AP.KICK_WINDUP - sinceStart, 0)
+        local eVel = st.eVel or Vector3.zero
+        local kPred = hrp.Position + eVel * (tAct + pingEma)
+        local mePred = myHrp.Position + myHrp.AssemblyLinearVelocity * tAct
+        local dAct = (mePred - kPred).Magnitude
+        local slack = math.min(math.min(pingEma, 0.5) * 12, 4) -- a little extra forgiveness, capped
         -- Test 1 (geometry): is your body inside the kick's real hit box (4.5-stud cube
         -- in front of the kicker) once we add tolerance for turning / ping drift?
         local rel = hrp.CFrame:PointToObjectSpace(myHrp.Position)
         local tol = AP.KICK_TOL + slack
-        local inBox = (-rel.Z) >= -1.5 and (-rel.Z) <= 4.5 + tol
+        local inBox = d <= 14 and (-rel.Z) >= -1.5 and (-rel.Z) <= 4.5 + tol
             and math.abs(rel.X) <= 2.25 + tol and math.abs(rel.Y) <= 2.25 + tol
         -- Test 2 (old rule, now ping-aware): close enough + roughly facing you
-        local reach = d - closingK * (AP.KICK_WINDUP + pingEma)
         local coneK = AP.KICK_CONE - math.min(pingEma, 0.4) * 0.8 -- laggier = more forgiving aim
-        local nearOK = reach <= AP.KICK_RANGE + slack and (face >= coneK or d <= AP.NEAR_RANGE)
+        local nearOK = dAct <= AP.KICK_RANGE + slack and (face >= coneK or d <= AP.NEAR_RANGE)
         if not inBox and not nearOK then
-            if reach > AP.KICK_RANGE + slack then return no(("kicker too far (%.0f studs)"):format(d)) end
+            if dAct > AP.KICK_RANGE + slack then
+                return no(("kicker too far (%.0f studs now, ~%.0f when the kick lands)"):format(d, dAct))
+            end
             return no("kicker not facing you")
         end
         -- a kick can't be cancelled and its windup is fixed, so there is nothing to wait
@@ -999,6 +1006,21 @@ track(RunService.Heartbeat:Connect(function(dt)
         -- latency), with a real click as a back-up if it didn't take
         local sent
         if st2 and st2.isKick then sent = sendParryDirect() else sent = sendParryClick() end
+        if AP.DEBUG then
+            -- "fired" only means we SENT it - this checks whether the game really started a parry
+            local tgt, wasKick = bestPlr.Name, st2 and st2.isKick
+            task.delay(0.15, function()
+                local sc = saberComp
+                if not sc then return end
+                local okC, onCd = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("parry") end)
+                local okS, state = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+                if okC and onCd then
+                    logP(tgt, ("Parry CONFIRMED vs %s%s"):format(tgt, wasKick and " (kick)" or ""))
+                else
+                    logP(tgt, ("Parry did NOT start vs %s (your state: %s)"):format(tgt, tostring(okS and state or "?")))
+                end
+            end)
+        end
         if sent and not apLoggedFirst then
             apLoggedFirst = true
             logP(bestPlr.Name, ("Auto Parry fired (first one this session) vs %s | live ping %.0f ms"):format(bestPlr.Name, pingEma * 1000))
@@ -1505,4 +1527,4 @@ local function cleanup()
 end
 if getgenv then getgenv().ForceHBE_Cleanup = cleanup end
 
-log("loaded (auto-parry build 11: player filter box) - Ctrl+H toggles the panel")
+log("loaded (auto-parry build 12: kick prediction) - Ctrl+H toggles the panel")
