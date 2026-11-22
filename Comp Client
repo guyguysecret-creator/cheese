@@ -57,6 +57,8 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
+    chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
+    zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
     whitelist = { esp = {}, hbe = {}, parry = {} }, -- [UserId] = true: that player is skipped by that feature
@@ -1529,11 +1531,12 @@ local function doEvade()
         -- So the angles shrink as the dash goes: a hard FAKE at ZIG_ANGLE, a medium real leg, then
         -- a nearly straight finish. Sideways swings still cancel out, but you end ~21 studs away
         -- instead of the ~13 you got with a constant 65-degree zig-zag.
+        local ZA = settings.zigAngle or AP.ZIG_ANGLE
         local legs = {
-            { side = startSide,  dur = AP.ZIG_FAKE + math.random() * 0.03,  ang = AP.ZIG_ANGLE },        -- the fake
-            { side = -startSide, dur = 0.23 + math.random() * 0.04,         ang = AP.ZIG_ANGLE * 0.7 }, -- the real direction
-            { side = startSide,  dur = 0.15 + math.random() * 0.03,         ang = AP.ZIG_ANGLE * 0.4 }, -- near-straight finish
-            { side = -startSide, dur = 5,                                   ang = AP.ZIG_ANGLE * 0.25 },
+            { side = startSide,  dur = AP.ZIG_FAKE + math.random() * 0.03,  ang = ZA },        -- the fake
+            { side = -startSide, dur = 0.23 + math.random() * 0.04,         ang = ZA * 0.7 }, -- the real direction
+            { side = startSide,  dur = 0.15 + math.random() * 0.03,         ang = ZA * 0.4 }, -- near-straight finish
+            { side = -startSide, dur = 5,                                   ang = ZA * 0.25 },
         }
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
@@ -1632,6 +1635,22 @@ local function startChase(plr)
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         local hum = char and char:FindFirstChildOfClass("Humanoid")
         if not hrp then chaseBusy = false return end
+
+        -- OPTION "Chase: unblock to start": with it ON the chase only begins once you have let go of block
+        -- (wait a moment for you to release it; if you keep holding, no chase). OFF = start right away.
+        if settings.chaseUnblock then
+            local waitFrom = os.clock()
+            while settings.parryChase and os.clock() - waitFrom < 1.0 do
+                local cs0 = combatStateNow()
+                local holding = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+                if not holding and cs0 ~= "blocking" and cs0 ~= "parrying" then break end
+                RunService.Heartbeat:Wait()
+            end
+            if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) or combatStateNow() == "blocking" then
+                chaseBusy = false
+                return
+            end
+        end
 
         -- Steering: ONE move vector, applied after the game's own controls every frame. We never
         -- set the character's CFrame or touch the camera (the humanoid turns toward where it's
@@ -1875,7 +1894,16 @@ do
                     local okT, pos = pcall(function() return trk and trk.TimePosition end)
                     local la = lastAtk[plr]
                     local wasAttacker = (la and os.clock() - la < 1.5) or not next(lastAtk) -- not just a bystander who got stunned
-                    if trk and okT and pos < 0.6 and wasAttacker then            -- a FRESH stun right after my parry
+                    -- ARE YOU FIGHTING THEM? Two other people duelling next to you must not drag you in when one
+                    -- of them gets parried: the stunned player has to be close to you AND have been FACING you
+                    -- (i.e. swinging at YOU), not at someone else.
+                    local toMe = Vector3.new(hrp.Position.X - th.Position.X, 0, hrp.Position.Z - th.Position.Z)
+                    local fightingMe = false
+                    if toMe.Magnitude > 0.01 then
+                        local lf = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
+                        fightingMe = toMe.Magnitude <= 14 and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.5
+                    end
+                    if trk and okT and pos < 0.6 and wasAttacker and fightingMe then            -- a FRESH stun right after my parry
                         parryAt = -math.huge                     -- count it once
                         cutParry()
                         if settings.parryChase then startChase(plr) end
@@ -3178,7 +3206,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v53"
+hint.Text = "Ctrl+H = hide  |  v54"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3415,7 +3443,7 @@ local function makeWhitelist(order, labelText, listName)
     count()
 end
 makeHeader(10, "RESOURCES")
-makeHeader(20, "COMBAT")
+makeHeader(19, "COMBAT")
 makeHeader(40, "HITBOX EXPANDER")
 makeHeader(50, "VISUALS")
 
@@ -3445,7 +3473,7 @@ makeSwitch(30, "Parry follows ping", settings.pingAdjust, function(on) settings.
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
 makeSwitch(31, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
-makeSwitch(21, "Stun evade", settings.autoEvade, function(on)
+makeSwitch(20, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
     if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
 end)
@@ -3601,6 +3629,8 @@ makeWhitelist(55, "ESP whitelist", "esp")
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
 makeNumberBox(32, "Parry timing (ms)", "parryOffset", -500, 500)
+-- how wide the Stun evade zig-zag swings (degrees): lower = ends up FARTHER away, higher = harder to chase
+makeNumberBox(21, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
 makeNumberBox(29, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
@@ -3608,6 +3638,8 @@ makeSwitch(33, "Parry chase (multi)", settings.parryChase, function(on) settings
 makeNumberBox(34, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
 makeSwitch(35, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
+-- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
+makeSwitch(36, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
