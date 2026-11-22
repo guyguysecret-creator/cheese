@@ -52,7 +52,8 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
-    multiDelay = 150,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows)
+    multiDelay = 230,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows)
+    jumpChase = false,     -- Parry chase: for VERY far evades, dash-snipe with a jump (click, W+E, Space)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
@@ -542,6 +543,9 @@ local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
     ZIGZAG_STEP = 0.16,    -- stun evade: seconds between left/right direction flips
+    SNIPE_MIN_DIST = 33,   -- jump chase: only when they are further than one dash reaches (studs)
+    SNIPE_MIN_STUN = 0.9,  -- jump chase: only with at least this much stun left (s)
+    SNIPE_JUMP_AFTER = 0.3, -- jump chase: seconds into the dash before the jump
     EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
     DASH_GUARD_SPEED = 25, -- studs/s toward you that counts as "dashing at you"
     DASH_GUARD_RANGE = 70, -- studs
@@ -1525,53 +1529,114 @@ local function startChase(plr)
             pcall(keypress, KEY_A)
         end
 
-        -- target velocity measured here, so it works even when Auto Parry is off
-        local lastTPos, tVel = nil, Vector3.zero
+        local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
-
-        -- TWO PHASES
-        --   APPROACH (they're further than MELEE): a FULL-LENGTH dash toward where they are going.
-        --     The dash is never cut short and never interrupted - it runs its whole distance, and
-        --     the move vector is re-aimed every frame, so if they change direction you swing your
-        --     dash over to follow them mid-way. When it ends and they're still far, the next full
-        --     dash starts as soon as the dash cooldown allows.
-        --   MULTI (they're within MELEE, or the dash reached them): W + A + E, then swing -
-        --     dash, and on the next frame cancel it into a swing, repeated on the first frame the
-        --     game accepts each step (all numbers are the game's own: dash cooldown 0.18s, swing
-        --     debounce 0.15s, dash 32 force + 8 to cancel; a dash can only become a swing while the
-        --     combat state is "ignited").
         local DASH_COST, MELEE, ARRIVED = 32 + 8, 7, 5
-        local mode, dashFrames, cancelled = "approach", 0, false
-        local nextMultiAt = 0 -- pacing: the multi never starts a new cycle before this time
-        local t0 = os.clock()
-        while os.clock() - t0 < 6 and settings.parryChase do
+        local mode = "approach"
+
+        -- re-aim: where they ARE and where they're HEADING. Called ONCE per frame. Returns the flat
+        -- distance to them (nil if they're gone).
+        local function updateAim()
             local tc = plr.Character
             local th = tc and tc:FindFirstChild("HumanoidRootPart")
-            local thum = tc and tc:FindFirstChildOfClass("Humanoid")
-            if not th or not thum or thum.Health <= 0 then break end
-            if not findStunTrack(tc) then break end            -- their stun ended: STOP at once
-            local cs = combatStateNow()
-            if cs == "stunned" then break end                  -- you got hit: stop
-            hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-            if not hrp then break end
-
-            -- where they ARE and where they're HEADING (they may be dashing/evading away)
+            local me = LocalPlayer.Character
+            local mh = me and me:FindFirstChild("HumanoidRootPart")
+            if not th or not mh then return nil end
+            hrp = mh
             local now = os.clock()
             local dt = math.max(now - lastTime, 1 / 240)
             lastTime = now
             if lastTPos then tVel = tVel * 0.4 + ((th.Position - lastTPos) / dt) * 0.6 end
             lastTPos = th.Position
-            local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(hrp.Position.X, 0, hrp.Position.Z)).Magnitude
+            local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
             -- lead: our dash covers ~60 studs/s, so aim where they'll be by the time we get there
             local lead = math.min(dist / 60, 0.5)
             local aim = th.Position + tVel * lead
-            local to = Vector3.new(aim.X - hrp.Position.X, 0, aim.Z - hrp.Position.Z)
+            local to = Vector3.new(aim.X - mh.Position.X, 0, aim.Z - mh.Position.Z)
             if to.Magnitude > 0.5 then
                 local dir = to.Unit
                 -- in the multi, slip ~35 degrees to the left (W + A) while swinging
                 if mode == "multi" and dist <= 9 then dir = CFrame.Angles(0, math.rad(35), 0):VectorToWorldSpace(dir) end
                 moveDir = dir
             end
+            return dist
+        end
+
+        local function cancelListener()
+            pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
+        end
+        local function sendAttack()
+            pcall(function()
+                saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
+            end)
+        end
+
+        -- JUMP CHASE (optional, "Jump chase" switch) - the dash snipe, for when they evaded VERY far:
+        --     left-click (swing)  ->  W + E (dash)  ->  Space (jump)
+        --   Why it goes further: the game slows you to jumping speed when you jump from a standstill or
+        --   a run, but NOT when you jump out of a dash - so you keep dash speed (60 studs/s) for the
+        --   whole jump. Jumping late in the dash (SNIPE_JUMP_AFTER) adds the full air time on top of
+        --   the dash itself: about 50 studs instead of 30. While airborne you can still steer, and a
+        --   swing taken in the air after a dash is the game's quick dash-swing.
+        local sniped = false
+        local function doSnipe()
+            sniped = true
+            sendAttack()                                   -- 1) left-click: swing
+            RunService.RenderStepped:Wait()
+            updateAim()
+            sendDashInput()                                -- 2) W (held) + E: dash
+            RunService.RenderStepped:Wait()
+            updateAim()
+            if movementState() ~= "dashing" then return end -- the dash didn't start: carry on normally
+            local ts = os.clock()
+            while os.clock() - ts < AP.SNIPE_JUMP_AFTER and movementState() == "dashing" do
+                cancelListener()
+                updateAim()                                -- keep steering toward them the whole time
+                RunService.RenderStepped:Wait()
+            end
+            pcall(function()                               -- 3) Space: jump out of the dash
+                saberComp:ProcessInput(true, { name = "JUMP", inputState = Enum.UserInputState.Begin })
+            end)
+        end
+
+        -- TWO PHASES (plus the optional jump snipe above)
+        --   APPROACH (they're further than MELEE): a FULL-LENGTH dash toward where they are going.
+        --     It is never cut short or interrupted - it runs its whole distance while the move vector
+        --     is re-aimed every frame, so if they change direction your dash swings over to follow
+        --     them. When it ends and they're still far, the next full dash starts as soon as the dash
+        --     cooldown allows.
+        --   MULTI (they're within MELEE, or the dash reached them): W + A + E, then swing -
+        --     dash, and on the next frame cancel it into a swing, paced by "Multi delay". (Game
+        --     numbers: dash cooldown 0.18s, swing debounce 0.15s, dash 32 force + 8 to cancel; a dash
+        --     can only become a swing while the combat state is "ignited".)
+        local dashFrames, cancelled = 0, false
+        local nextMultiAt = 0 -- pacing: the multi never starts a new cycle before this time
+        local t0 = os.clock()
+        while os.clock() - t0 < 6 and settings.parryChase do
+            local tc = plr.Character
+            local thum = tc and tc:FindFirstChildOfClass("Humanoid")
+            if not tc or not thum or thum.Health <= 0 then break end
+            local stunTrk = findStunTrack(tc)
+            if not stunTrk then break end                      -- their stun ended: STOP at once
+            -- TIME LEFT IN THEIR STUN - the same number the ESP shows: their stun animation is played
+            -- so that its length equals the stun length, so what's left of the animation is what's
+            -- left of the stun. We see it one ping late (they're already further along), so ping is
+            -- subtracted. A dash/swing already started would still land after the stun is over -
+            -- that was the over-multi.
+            local remEff = 9
+            local okR, rem = pcall(function()
+                return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
+            end)
+            if okR and type(rem) == "number" then remEff = rem - pingEma end
+            if remEff <= 0.05 then break end                   -- their stun is over (or about to be): STOP
+            -- a new dash needs ~0.3s to land, a cancel-into-swing ~0.12s: don't START what can't land
+            local canDash = remEff >= 0.3
+            local canSwing = remEff >= 0.12
+            local cs = combatStateNow()
+            if cs == "stunned" then break end                  -- you got hit: stop
+
+            local dist = updateAim()
+            if not dist then break end
 
             local ms = movementState()
             local sc = saberComp
@@ -1584,22 +1649,19 @@ local function startChase(plr)
 
             if ms == "dashing" then
                 dashFrames += 1
-                -- take out the listener that would cancel the dash on any key press
-                pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
+                cancelListener() -- take out the listener that would cancel the dash on any key press
                 local function cancelIntoSwing()
                     cancelled = true
                     local h = rawget(sc, "_dashCancelHandler")
                     if type(h) == "function" then
                         pcall(h, true)                          -- left-click during a dash = dash-cancel into a swing
                     else
-                        pcall(function()
-                            sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
-                        end)
+                        sendAttack()
                     end
                 end
                 if mode == "multi" then
-                    if not cancelled and dashFrames >= 2 and ready then cancelIntoSwing() end
-                elseif dist <= ARRIVED and not cancelled and dashFrames >= 2 and ready then
+                    if not cancelled and dashFrames >= 2 and ready and canSwing then cancelIntoSwing() end
+                elseif dist <= ARRIVED and not cancelled and dashFrames >= 2 and ready and canSwing then
                     -- this full dash has REACHED them: its last moment becomes the first swing
                     mode = "multi"
                     cancelIntoSwing()
@@ -1612,26 +1674,33 @@ local function startChase(plr)
                     local okC, v = pcall(function() return rawget(sc, "Cooldowns"):OnCooldown("dash") end)
                     onCd = okC and v or false
                 end
-                if dist > MELEE then
+                if ms == "jumping" or ms == "free_falling" then
+                    -- airborne after the jump snipe: steer (already done) and swing the moment you're on them
+                    if dist <= MELEE + 2 and cs == "ignited" and canSwing and os.clock() >= nextMultiAt then
+                        mode = "multi"
+                        sendAttack()
+                        nextMultiAt = os.clock() + 0.15 + ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
+                    end
+                elseif dist > MELEE then
                     mode = "approach"
-                    if ready and not onCd and groundedMS(ms) and force >= 32 then
+                    if settings.jumpChase and not sniped and dist > AP.SNIPE_MIN_DIST and remEff >= AP.SNIPE_MIN_STUN
+                        and cs == "ignited" and not onCd and groundedMS(ms) and force >= DASH_COST then
+                        doSnipe()                               -- very far: dash-snipe with a jump
+                    elseif ready and not onCd and groundedMS(ms) and force >= 32 and canDash then
                         sendDashInput()                         -- a full dash toward them
                     end
                 else
                     mode = "multi"
                     -- PACING: the game would allow a new cycle every ~0.18s, which looks like a machine.
-                    -- "Multi delay" adds extra time between cycles (and +-20% randomness so the rhythm
-                    -- isn't a metronome). Set it to 0 for the fastest the game allows.
-                    if os.clock() >= nextMultiAt then
+                    -- "Multi delay" adds extra time between cycles (+-20% so it isn't a metronome).
+                    if os.clock() >= nextMultiAt and canSwing then
                         local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
-                        if ready and not onCd and groundedMS(ms) and force >= DASH_COST then
+                        if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
                             sendDashInput()                     -- E (W and A are held)
                             nextMultiAt = os.clock() + 0.18 + gap
                         elseif cs == "ignited" then
                             -- dash still cooling down (or no force): keep hitting with plain swings
-                            pcall(function()
-                                sc:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
-                            end)
+                            sendAttack()
                             nextMultiAt = os.clock() + 0.15 + gap
                         end
                     end
@@ -3049,7 +3118,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v45"
+hint.Text = "Ctrl+H = hide  |  v47"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3475,6 +3544,8 @@ makeNumberBox(31, "Parry timing (ms)", "parryOffset", -500, 500)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
 makeSwitch(32, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
 makeNumberBox(33, "Multi delay (ms)", "multiDelay", 0, 800)
+-- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
+makeSwitch(34, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
@@ -3618,6 +3689,7 @@ local function cleanup()
     settings.parry, settings.kick, settings.autoParry, settings.dashGuard = false, false, false, false
     settings.autoEvade = false
     settings.parryChase = false
+    settings.jumpChase = false
     settings.antiKick = false
     settings.esp = false
     if espClear then espClear() end
