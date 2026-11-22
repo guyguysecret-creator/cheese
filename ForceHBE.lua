@@ -501,9 +501,16 @@ local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 30,      -- studs: ignore attackers further than this
     BODY_RADIUS = 2.5,   -- studs: blade counts as "landed" this close to your center
-    MIN_SWING_SPEED = 14, -- studs/s: blade speed relative to THEIR body that counts as a swing
-    HIT_RADIUS = 3.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
-    MIN_CLOSING = 8,     -- studs/s: blade must be heading toward you at least this fast
+    MIN_SWING_SPEED = 9, -- studs/s: blade speed relative to THEIR body that counts as a swing
+    HIT_RADIUS = 4.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
+    MIN_CLOSING = 5,     -- studs/s: blade must be heading toward you at least this fast
+    KICK_RESPONSE = "parry", -- what to do about an incoming kick: "parry" or "dash" (taps E)
+    KICK_RANGE = 8,      -- studs: kick hit box reaches ~4.5 studs, plus slack
+    KICK_CONE = 0.6,     -- cos(~53 deg): kicker must face you
+    KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
+    CLOSE_RANGE = 12,   -- studs: inside this, a swing animation facing you = parry right away
+    CLOSE_CONE = 0.55,   -- cos(~57 deg): how directly they must face you for the close rule
+    CLOSE_MISS = 6.5,    -- studs: close rule is skipped if the blade clearly passes this far from you
     MIN_COMMIT = 0.03,   -- s the swing must have run (feint filter)
     MAX_PHASE = 0.85,    -- ignore swings nearly finished
     AIM = 0.18,          -- s: we want the hit to land this long AFTER our parry is active
@@ -524,6 +531,9 @@ for _, id in ipairs({
     98442653394978, 6368651662,                                     -- dash attacks
 }) do ATTACK_IDS[tostring(id)] = true end
 
+-- the kick uses the "ParryBreak" animation (Client.Components.Lightsaber.States.Combat.Kicking)
+local KICK_ID = "13552157283"
+
 local pingEma = 0.08
 local baitScore = {}                              -- [player] = n
 local handledSwing = setmetatable({}, { __mode = "k" }) -- swing track -> true
@@ -539,7 +549,10 @@ local function findAttackTrack(char)
     if not ok or type(tracks) ~= "table" then return nil end
     for _, trk in ipairs(tracks) do
         local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
-        if okId and id and ATTACK_IDS[id] then return trk end
+        if okId and id then
+            if ATTACK_IDS[id] then return trk, false end
+            if id == KICK_ID then return trk, true end
+        end
     end
     return nil
 end
@@ -573,13 +586,15 @@ local function updateSwings(myHrp, dt)
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             local char = plr.Character
-            local trk = char and findAttackTrack(char)
+            local trk, isKick
+            if char then trk, isKick = findAttackTrack(char) end
             if not trk then
                 swingState[plr] = nil
             else
                 local st = swingState[plr]
                 if not st or st.trk ~= trk then
-                    st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil }
+                    st = { trk = trk, prev = nil, relV = {}, swingV = {}, ttc = nil,
+                           isKick = isKick, t0 = os.clock() }
                     swingState[plr] = st
                 end
                 local pts = {}
@@ -598,7 +613,7 @@ local function updateSwings(myHrp, dt)
                 local eVel = (ePos and st.prevE and dt > 0) and (ePos - st.prevE) / dt or Vector3.zero
                 st.prevE = ePos
 
-                local best
+                local best, missMin
                 if st.prev and #pts == #st.prev and dt > 0 then
                     for i, pt in ipairs(pts) do
                         local worldVel = (pt - st.prev[i]) / dt
@@ -609,17 +624,18 @@ local function updateSwings(myHrp, dt)
                         st.swingV[i] = (st.swingV[i] or swing) * 0.5 + swing * 0.5
                         local relV = st.relV[i]
                         local relSpeed = relV.Magnitude
-                        -- 1) it must be a real swing: blade moving fast relative to THEIR body
-                        --    (walking past you / idle sway is far below this)
-                        if st.swingV[i].Magnitude >= AP.MIN_SWING_SPEED and relSpeed > 0.01 then
+                        if relSpeed > 3 then
                             local toMe = myPos - pt
-                            -- 2) it must be heading AT you: follow the blade's path forward and
-                            --    check how close it passes to your center (closest approach)
+                            -- follow the blade's path forward: where does it pass closest to you?
                             local tStar = toMe:Dot(relV) / (relSpeed * relSpeed)
                             if tStar >= 0 and tStar < 1 then
                                 local miss = (toMe - relV * tStar).Magnitude
-                                if miss <= AP.HIT_RADIUS and relV:Dot(toMe) / math.max(toMe.Magnitude, 0.01) >= AP.MIN_CLOSING then
-                                    -- time until the blade is within body radius of you
+                                if not missMin or miss < missMin then missMin = miss end
+                                -- path threat: a real swing (fast relative to THEIR body, so walking
+                                -- past you doesn't count) that passes through you
+                                if st.swingV[i].Magnitude >= AP.MIN_SWING_SPEED
+                                    and miss <= AP.HIT_RADIUS
+                                    and relV:Dot(toMe) / math.max(toMe.Magnitude, 0.01) >= AP.MIN_CLOSING then
                                     local t = math.max(tStar - AP.BODY_RADIUS / relSpeed, 0)
                                     if not best or t < best then best = t end
                                 end
@@ -629,6 +645,7 @@ local function updateSwings(myHrp, dt)
                 end
                 st.prev = (#pts > 0) and pts or nil
                 st.ttc = best
+                st.missMin = missMin
                 st.hasBlade = #pts > 0
             end
         end
@@ -662,6 +679,23 @@ local function assessThreat(plr, myHrp)
         return trk.TimePosition, trk.Speed, trk.Length, trk.IsPlaying
     end)
     if not okT or not playing then return nil end
+
+    -- KICK: no blade involved. The kick's hit box is a ~4.5 stud cube in front of the
+    -- kicker that switches on 0.4s after the kick starts (Kicking state: KICK_WINDUP),
+    -- so: kicker is close, facing you, and the active moment is about to arrive.
+    if st.isKick then
+        local sinceStart = os.clock() - st.t0
+        if sinceStart < AP.MIN_COMMIT then return nil end
+        if sinceStart > AP.KICK_WINDUP + 0.75 then return nil end -- kick already over
+        local toMeK = myHrp.Position - hrp.Position
+        local dK = math.max(toMeK.Magnitude, 0.01)
+        local closingK = math.max((hrp.AssemblyLinearVelocity - myHrp.AssemblyLinearVelocity):Dot(toMeK / dK), 0)
+        if dK - closingK * 0.3 > AP.KICK_RANGE then return nil end
+        if hrp.CFrame.LookVector:Dot(toMeK / dK) < AP.KICK_CONE then return nil end
+        local untilActive = math.max(AP.KICK_WINDUP - sinceStart, 0)
+        if untilActive > triggerTime(trk) then return nil end
+        return untilActive, trk
+    end
     local elapsed = timePos / math.max(speed, 0.1)
     local minCommit = AP.MIN_COMMIT + math.min(0.12, (baitScore[plr] or 0) * 0.03)
     if elapsed < minCommit then return nil end                 -- feint filter
@@ -674,6 +708,15 @@ local function assessThreat(plr, myHrp)
     if hrp.CFrame.LookVector:Dot(toMe / d) < AP.CONE_COS then return nil end
 
     local ttc = st.ttc
+    -- CLOSE-RANGE RULE: slow regular swings and fast multi-hit combos right next to you
+    -- don't move fast enough for the path check, so up close the swing animation itself
+    -- is the signal: attacker is near, facing you, and the blade isn't clearly going
+    -- somewhere else -> parry right away.
+    if not ttc and d <= AP.CLOSE_RANGE
+        and hrp.CFrame.LookVector:Dot(toMe / d) >= AP.CLOSE_CONE
+        and (st.missMin == nil or st.missMin <= AP.CLOSE_MISS) then
+        ttc = 0
+    end
     if not st.hasBlade then
         -- no blade parts found on this player: fall back to swing-animation timing
         ttc = math.max(AP.FALLBACK_HIT - elapsed, 0)
@@ -710,6 +753,24 @@ local function sendParryClick()
     end)
 end
 
+-- optional kick answer: tap E (Force Dash) to get out of the kick's hit box
+local lastDash = 0
+local function sendDash()
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        if pcall(keypress, 0x45) then -- 0x45 = E
+            task.wait(0.03)
+            pcall(keyrelease, 0x45)
+            return true
+        end
+    end
+    return false
+end
+local function usesDash(st) return st ~= nil and st.isKick and AP.KICK_RESPONSE == "dash" end
+local function responseAvailable(st, canParry)
+    if usesDash(st) then return os.clock() - lastDash > 1 end
+    return canParry
+end
+
 track(RunService.Heartbeat:Connect(function(dt)
     if not settings.autoParry then return end
 
@@ -720,14 +781,18 @@ track(RunService.Heartbeat:Connect(function(dt)
     local myHrp = char and char:FindFirstChild("HumanoidRootPart")
     if not myHrp then return end
     updateSwings(myHrp, dt) -- keep blade speeds fresh every frame, even before you block
-    if apBusy or not canParryNow() then return end
+    if apBusy then return end
+    local canParry = canParryNow()
 
-    -- score every attacker, react to the most urgent swing
+    -- score every attacker, react to the most urgent swing/kick we can actually answer
     local bestEta, bestTrk, bestPlr
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then
             local eta, trk = assessThreat(plr, myHrp)
-            if eta and (not bestEta or eta < bestEta) then bestEta, bestTrk, bestPlr = eta, trk, plr end
+            if eta and responseAvailable(swingState[plr], canParry)
+                and (not bestEta or eta < bestEta) then
+                bestEta, bestTrk, bestPlr = eta, trk, plr
+            end
         end
     end
     if not bestTrk then return end
@@ -747,17 +812,26 @@ track(RunService.Heartbeat:Connect(function(dt)
             if not bestTrk.IsPlaying then baitScore[bestPlr] = (baitScore[bestPlr] or 0) + 1 end
             return
         end
-        if not canParryNow() then return end
+        local st2 = swingState[bestPlr]
+        if not responseAvailable(st2, canParryNow()) then return end
+        baitScore[bestPlr] = math.max(0, (baitScore[bestPlr] or 0) - 0.5)
 
-        -- one parry covers everyone swinging right now
+        if usesDash(st2) then
+            -- kick answered with a dash instead of a parry
+            handledSwing[bestTrk] = true
+            lastDash = os.clock()
+            task.spawn(sendDash)
+            return
+        end
+
+        -- one parry covers everyone swinging (or kicking) right now
         handledSwing[bestTrk] = true
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer then
+            if plr ~= LocalPlayer and not usesDash(swingState[plr]) then
                 local _, t2 = assessThreat(plr, hrp2)
                 if t2 then handledSwing[t2] = true end
             end
         end
-        baitScore[bestPlr] = math.max(0, (baitScore[bestPlr] or 0) - 0.5)
 
         if sendParryClick() and not apLoggedFirst then
             apLoggedFirst = true
