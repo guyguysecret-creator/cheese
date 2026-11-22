@@ -542,7 +542,8 @@ end
 local AP = {
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
-    ZIGZAG_STEP = 0.16,    -- stun evade: seconds between left/right direction flips
+    ZIG_ANGLE = 65,        -- stun evade: how far (degrees) each zig-zag leg swings off 'straight away'
+    ZIG_FAKE = 0.13,       -- stun evade: length (s) of the short fake leg at the start
     SNIPE_MIN_DIST = 33,   -- jump chase: only when they are further than one dash reaches (studs)
     SNIPE_MIN_STUN = 0.9,  -- jump chase: only with at least this much stun left (s)
     SNIPE_JUMP_AFTER = 0.3, -- jump chase: seconds into the dash before the jump
@@ -1402,17 +1403,30 @@ local function doEvade()
             end)
         end
 
-        -- 2) ZIG-ZAG: steer 45 deg to one side (W+D / W+A feel), flip to the other side every
-        --    ZIGZAG_STEP seconds, and keep alternating for the whole dash
+        -- 2) CAMERA-BREAKING ZIG-ZAG. Whoever chases you has their camera following you, so big
+        --    sideways swings make that camera whip left-right and lose you. The path (relative to
+        --    "away from the attacker"): a SHORT fake one way, then a LONGER leg hard the other way,
+        --    then back again - wide angles (ZIG_ANGLE) and leg lengths that are randomised every
+        --    time, so there is no pattern to learn or lead.
         local startSide = (math.random(2) == 1) and 1 or -1
         local zigStart = os.clock()
+        local legs = {
+            { side = startSide,  dur = AP.ZIG_FAKE + math.random() * 0.05 },   -- the fake
+            { side = -startSide, dur = 0.20 + math.random() * 0.07 },          -- the real direction
+            { side = startSide,  dur = 0.22 + math.random() * 0.08 },
+            { side = -startSide, dur = 5 },
+        }
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_EvadeMove", Enum.RenderPriority.Last.Value, function()
                 if not hum then return end
                 hum.Jump = false
-                local seg = math.floor((os.clock() - zigStart) / AP.ZIGZAG_STEP)
-                local side = (seg % 2 == 0) and startSide or -startSide
-                hum:Move(CFrame.Angles(0, math.rad(45 * side), 0):VectorToWorldSpace(faceDir), false)
+                local el = os.clock() - zigStart
+                local side, acc = legs[#legs].side, 0
+                for _, leg in ipairs(legs) do
+                    acc = acc + leg.dur
+                    if el < acc then side = leg.side break end
+                end
+                hum:Move(CFrame.Angles(0, math.rad(AP.ZIG_ANGLE * side), 0):VectorToWorldSpace(faceDir), false)
             end)
         end)
 
@@ -1531,7 +1545,8 @@ local function startChase(plr)
 
         local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
-        local DASH_COST, MELEE, ARRIVED = 32 + 8, 7, 5
+        local DASH_COST = 32 + 8
+        local MELEE, ARRIVED = 7, 5     -- re-set every frame: tighter when the Hitbox Expander is OFF
         local mode = "approach"
 
         -- re-aim: where they ARE and where they're HEADING. Called ONCE per frame. Returns the flat
@@ -1556,12 +1571,23 @@ local function startChase(plr)
             if to.Magnitude > 0.5 then
                 local dir = to.Unit
                 -- in the multi, slip ~35 degrees to the left (W + A) while swinging
-                if mode == "multi" and dist <= 9 then dir = CFrame.Angles(0, math.rad(35), 0):VectorToWorldSpace(dir) end
+                -- (only with the Hitbox Expander on: without it a swing taken 35 deg off-target misses)
+                if mode == "multi" and dist <= 9 and settings.hbe then dir = CFrame.Angles(0, math.rad(35), 0):VectorToWorldSpace(dir) end
                 moveDir = dir
             end
             return dist
         end
 
+        -- WITHOUT the Hitbox Expander your swing only connects if you are CLOSE and FACING them (the
+        -- expander makes their hit area ~12 studs wide, which forgives both). So with it off, the chase
+        -- closes in tighter and snaps your character to face them for each swing / multi dash.
+        local function faceTarget()
+            if settings.hbe or not lastTPos or not hrp then return end
+            pcall(function()
+                local pos = hrp.Position
+                hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
+            end)
+        end
         local function cancelListener()
             pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
         end
@@ -1634,6 +1660,7 @@ local function startChase(plr)
             local canSwing = remEff >= 0.12
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
+            MELEE, ARRIVED = (settings.hbe and 7 or 5), (settings.hbe and 5 or 3.5)
 
             local dist = updateAim()
             if not dist then break end
@@ -1652,6 +1679,7 @@ local function startChase(plr)
                 cancelListener() -- take out the listener that would cancel the dash on any key press
                 local function cancelIntoSwing()
                     cancelled = true
+                    faceTarget()
                     local h = rawget(sc, "_dashCancelHandler")
                     if type(h) == "function" then
                         pcall(h, true)                          -- left-click during a dash = dash-cancel into a swing
@@ -1678,6 +1706,7 @@ local function startChase(plr)
                     -- airborne after the jump snipe: steer (already done) and swing the moment you're on them
                     if dist <= MELEE + 2 and cs == "ignited" and canSwing and os.clock() >= nextMultiAt then
                         mode = "multi"
+                        faceTarget()
                         sendAttack()
                         nextMultiAt = os.clock() + 0.15 + ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
                     end
@@ -1696,10 +1725,12 @@ local function startChase(plr)
                     if os.clock() >= nextMultiAt and canSwing then
                         local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
                         if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
+                            faceTarget()
                             sendDashInput()                     -- E (W and A are held)
                             nextMultiAt = os.clock() + 0.18 + gap
                         elseif cs == "ignited" then
                             -- dash still cooling down (or no force): keep hitting with plain swings
+                            faceTarget()
                             sendAttack()
                             nextMultiAt = os.clock() + 0.15 + gap
                         end
@@ -3118,7 +3149,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v47"
+hint.Text = "Ctrl+H = hide  |  v48"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
