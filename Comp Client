@@ -520,6 +520,9 @@ end
 --   left and the parry cooldown is over - otherwise a click would swing instead.
 ------------------------------------------------------------------------
 local AP = {
+local autoEvadeQueued = {
+    isQueued = false,
+    queuedState = nil,
     CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
     MAX_RANGE = 55,      -- studs: ignore attackers further than this (dash attacks start far away)
     EVADE_FACING = 0.5,    -- stun evade: attacker counts as "looking straight at you" above this (1 = dead on)
