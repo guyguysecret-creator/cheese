@@ -50,6 +50,7 @@ local settings = {
     parry = false,
     kick = false,
     autoParry = false,
+    parryOffset = 0,       -- ms: Auto Parry timing, + = later, - = earlier
     hbe = false,
     hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
     hbeTransparency = 0.7, -- so you can see the box
@@ -476,8 +477,9 @@ end
 --   A swing counts as a THREAT only if ALL of these hold:
 --     - aimed at you: attacker's facing is within ~65 deg of the line to you
 --       (stray swings at other people / at nothing are ignored)
---     - in range: distance <= blade reach + (closing speed x (ping + reaction lead)),
---       so fast dash attacks trigger from further away and high ping triggers earlier
+--     - about to land: we track their blade and predict the time until it reaches you
+--       (distance / closing speed), and click when that is <= ping + 0.18s - so fast
+--       dash attacks and high ping automatically trigger from further away
 --     - committed: swing has been running >= 50ms (a feint that's cancelled instantly
 --       never gets a parry), and it isn't past ~70% of the animation (hit already done)
 --   Parry in the game stays active ~0.7s, so firing a little early is safe.
@@ -488,21 +490,23 @@ end
 --   Baits: right before clicking the threat is re-checked; if the swing was cancelled
 --   in the meantime, that attacker gets a "bait score" that makes us wait slightly
 --   longer on their next swings.
---   Timing: a small random delay (30-110ms, centered ~70ms) and a per-swing random
---   +-6% on trigger distance, so it isn't frame-perfect every time.
+--   Timing: a small random delay (0-40ms) and a per-swing random +-12% on the trigger
+--   time, so it isn't frame-perfect every time. "Parry timing (ms)" in the panel
+--   shifts everything: + = later, - = earlier.
 --
 --   Safety: never clicks unless your saber is in the BLOCKING state, you have parries
 --   left and the parry cooldown is over - otherwise a click would swing instead.
 ------------------------------------------------------------------------
 local AP = {
-    REACH = 14,          -- studs: blade + arm reach of a swing
-    CONE_COS = 0.42,     -- cos(65 deg): how directly the attacker must face you
-    MIN_COMMIT = 0.05,   -- s the swing must have run (feint filter)
-    MAX_PHASE = 0.7,     -- ignore swings already past 70% of their animation
-    LEAD = 0.06,         -- extra reaction lead added to ping (s)
-    JITTER_MIN = 0.03,   -- human delay range: JITTER_MIN .. JITTER_MIN + JITTER_SPAN
-    JITTER_SPAN = 0.08,
-    DIST_VARIANCE = 0.06,
+    CONE_COS = 0.3,      -- cos(~72 deg): how directly the attacker must face you
+    MAX_RANGE = 30,      -- studs: ignore attackers further than this
+    BODY_RADIUS = 2.5,   -- studs: blade counts as "landed" this close to your center
+    MIN_COMMIT = 0.04,   -- s the swing must have run (feint filter)
+    MAX_PHASE = 0.85,    -- ignore swings nearly finished
+    AIM = 0.18,          -- s: we want the hit to land this long AFTER our parry is active
+    TIME_VARIANCE = 0.12, -- per-swing random +-12% on the trigger time
+    JITTER_MAX = 0.04,   -- extra human delay 0..40ms (triangular, ~20ms average)
+    FALLBACK_HIT = 0.25, -- s into a swing the hit lands, only if no blade parts are found
 }
 
 -- every swing animation id used by the game's forms (Shared.Modules.SaberModule.Animations)
@@ -537,42 +541,122 @@ local function findAttackTrack(char)
     return nil
 end
 
--- is this player's current swing a real threat to us? returns eta, swingTrack
+-- Timing model (v2): instead of "are they within X studs" we predict WHEN the blade
+-- will reach you. Every frame we track points along each attacker's blade (the "Core"
+-- parts inside their "Blade" models - the same parts the game raycasts from), measure
+-- how fast they're moving toward you (minus your own movement), and compute
+--     timeToHit = (distance - bodyRadius) / closingSpeed
+-- We click when timeToHit <= ping + AIM (+ your offset), i.e. so the parry is already
+-- active when the hit lands but hasn't run out yet (it lasts ~0.7s).
+local bladeCache = setmetatable({}, { __mode = "k" }) -- character -> { cores, t }
+local swingState = {}                                  -- [player] = { trk, prev, speed, ttc }
+
+local function getCores(char)
+    local c = bladeCache[char]
+    if c and os.clock() - c.t < 1.5 then return c.cores end
+    local cores = {}
+    for _, d in ipairs(char:GetDescendants()) do
+        if d.Name == "Core" and d:IsA("BasePart") and d.Parent and string.match(d.Parent.Name, "Blade") then
+            cores[#cores + 1] = d
+        end
+    end
+    bladeCache[char] = { cores = cores, t = os.clock() }
+    return cores
+end
+
+-- called once per frame: refresh every attacker's blade speed + time-to-hit
+local function updateSwings(myHrp, dt)
+    local myPos, myVel = myHrp.Position, myHrp.AssemblyLinearVelocity
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local char = plr.Character
+            local trk = char and findAttackTrack(char)
+            if not trk then
+                swingState[plr] = nil
+            else
+                local st = swingState[plr]
+                if not st or st.trk ~= trk then
+                    st = { trk = trk, prev = nil, speed = {}, ttc = nil }
+                    swingState[plr] = st
+                end
+                local pts = {}
+                for _, core in ipairs(getCores(char)) do
+                    if core.Parent then
+                        local cf, half = core.CFrame, core.Size.Y / 2
+                        pts[#pts + 1] = cf.Position + cf.UpVector * half
+                        pts[#pts + 1] = cf.Position
+                        pts[#pts + 1] = cf.Position - cf.UpVector * half
+                    end
+                end
+                local best
+                if st.prev and #pts == #st.prev and dt > 0 then
+                    for i, pt in ipairs(pts) do
+                        local rel = (pt - st.prev[i]) / dt - myVel
+                        local toMe = myPos - pt
+                        local dist = math.max(toMe.Magnitude, 0.01)
+                        local s = rel:Dot(toMe / dist)
+                        -- smooth so a single jittery frame can't trigger it
+                        st.speed[i] = (st.speed[i] or s) * 0.5 + s * 0.5
+                        if st.speed[i] > 2 then
+                            local t = math.max(dist - AP.BODY_RADIUS, 0) / st.speed[i]
+                            if not best or t < best then best = t end
+                        end
+                    end
+                end
+                st.prev = (#pts > 0) and pts or nil
+                st.ttc = best
+                st.hasBlade = #pts > 0
+            end
+        end
+    end
+end
+
+-- when to click: parry must be active by the time the hit lands
+local function triggerTime(trk)
+    local v = swingVariance[trk]
+    if not v then
+        v = 1 + (math.random() * 2 - 1) * AP.TIME_VARIANCE
+        swingVariance[trk] = v
+    end
+    local offset = (settings.parryOffset or 0) / 1000 -- + = later, - = earlier
+    return math.max((pingEma + AP.AIM) * v - offset, 0.02)
+end
+
+-- is this player's current swing a real threat to us? returns urgency (lower = sooner), swingTrack
 local function assessThreat(plr, myHrp)
     local char = plr.Character
     if not char then return nil end
     local hrp = char:FindFirstChild("HumanoidRootPart")
     local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum or hum.Health <= 0 then return nil end
+    local st = swingState[plr]
+    if not hrp or not hum or hum.Health <= 0 or not st then return nil end
 
-    local trk = findAttackTrack(char)
-    if not trk or handledSwing[trk] then return nil end
+    local trk = st.trk
+    if handledSwing[trk] then return nil end
 
-    local okT, timePos, speed, length = pcall(function() return trk.TimePosition, trk.Speed, trk.Length end)
-    if not okT then return nil end
+    local okT, timePos, speed, length, playing = pcall(function()
+        return trk.TimePosition, trk.Speed, trk.Length, trk.IsPlaying
+    end)
+    if not okT or not playing then return nil end
     local elapsed = timePos / math.max(speed, 0.1)
     local minCommit = AP.MIN_COMMIT + math.min(0.12, (baitScore[plr] or 0) * 0.03)
     if elapsed < minCommit then return nil end                 -- feint filter
-    if length > 0 and timePos / length > AP.MAX_PHASE then return nil end -- hit already happened
+    if length > 0 and timePos / length > AP.MAX_PHASE then return nil end -- swing nearly over
 
+    -- aimed at you?
     local toMe = myHrp.Position - hrp.Position
     local d = math.max(toMe.Magnitude, 0.01)
-    local dir = toMe / d
-    if hrp.CFrame.LookVector:Dot(dir) < AP.CONE_COS then return nil end -- not aimed at us
+    if d > AP.MAX_RANGE then return nil end
+    if hrp.CFrame.LookVector:Dot(toMe / d) < AP.CONE_COS then return nil end
 
-    -- latency + speed compensation: look further out the faster they close in / the higher the ping
-    local closing = math.max((hrp.AssemblyLinearVelocity - myHrp.AssemblyLinearVelocity):Dot(dir), 0)
-    local variance = swingVariance[trk]
-    if not variance then
-        variance = 1 + (math.random() * 2 - 1) * AP.DIST_VARIANCE
-        swingVariance[trk] = variance
+    local ttc = st.ttc
+    if not st.hasBlade then
+        -- no blade parts found on this player: fall back to swing-animation timing
+        ttc = math.max(AP.FALLBACK_HIT - elapsed, 0)
     end
-    local trigger = (AP.REACH + closing * (pingEma + AP.LEAD)) * variance
-    if d > trigger then return nil end
-
-    local eta = math.max(0.25 - elapsed, 0)
-    if closing > 1 then eta = math.min(eta, math.max(d - AP.REACH, 0) / closing) end
-    return eta, trk
+    if not ttc then return nil end                 -- blade not heading toward you
+    if ttc > triggerTime(trk) then return nil end  -- hit still too far away
+    return ttc, trk
 end
 
 -- only true when a left-click would really PARRY (not swing)
@@ -608,10 +692,11 @@ track(RunService.Heartbeat:Connect(function(dt)
     local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if okP and type(p) == "number" then pingEma = pingEma + (p - pingEma) * math.min(1, dt * 2) end
 
-    if apBusy then return end
     local char = LocalPlayer.Character
     local myHrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not myHrp or not canParryNow() then return end
+    if not myHrp then return end
+    updateSwings(myHrp, dt) -- keep blade speeds fresh every frame, even before you block
+    if apBusy or not canParryNow() then return end
 
     -- score every attacker, react to the most urgent swing
     local bestEta, bestTrk, bestPlr
@@ -624,7 +709,7 @@ track(RunService.Heartbeat:Connect(function(dt)
     if not bestTrk then return end
 
     apBusy = true
-    local delay = AP.JITTER_MIN + ((math.random() + math.random()) / 2) * AP.JITTER_SPAN * 2
+    local delay = ((math.random() + math.random()) / 2) * AP.JITTER_MAX -- 0-40ms, ~20ms avg
     task.delay(delay, function()
         apBusy = false
         if not settings.autoParry then return end
@@ -701,8 +786,8 @@ local COLORS = {
 }
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(250, 400)
-frame.Position = UDim2.new(0, 20, 0.5, -200)
+frame.Size = UDim2.fromOffset(250, 440)
+frame.Position = UDim2.new(0, 20, 0.5, -220)
 frame.BackgroundColor3 = COLORS.bg
 frame.BorderSizePixel = 0
 frame.Active = true
@@ -820,6 +905,9 @@ end
 makeNumberBox(318, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
 makeNumberBox(358, "Transparency (0-1)", "hbeTransparency", 0, 1)
+-- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
+-- parry too LATE (you get hit first) -> lower it (negative is fine)
+makeNumberBox(398, "Parry timing (ms)", "parryOffset", -300, 300)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
