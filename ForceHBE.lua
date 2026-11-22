@@ -507,8 +507,8 @@ local AP = {
     HIT_RADIUS = 4.5,    -- studs: blade's closest approach to your center that counts as "aimed at you"
     MIN_CLOSING = 5,     -- studs/s: blade must be heading toward you at least this fast
     KICK_RESPONSE = "parry", -- what to do about an incoming kick: "parry" or "dash" (taps E)
-    KICK_RANGE = 8,      -- studs: kick hit box reaches ~4.5 studs, plus slack
-    KICK_CONE = 0.6,     -- cos(~53 deg): kicker must face you
+    KICK_RANGE = 9,      -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
+    KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
     KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
@@ -578,18 +578,22 @@ local function findAttackTrack(char)
     if not animator then return nil end
     local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
     if not ok or type(tracks) ~= "table" then return nil end
-    local unknown
+    local unknown, attack
     for _, trk in ipairs(tracks) do
         local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
         if okId and id then
-            if ATTACK_IDS[id] then return trk, false, false end
+            -- a KICK wins over everything: the swing animation that was playing a moment
+            -- earlier can still be fading out and used to hide the kick from us
             if id == KICK_ID then return trk, true, false end
-            if not unknown and not NON_ATTACK_IDS[id] then
+            if ATTACK_IDS[id] then
+                attack = attack or trk
+            elseif not unknown and not NON_ATTACK_IDS[id] then
                 local okL, looped, len = pcall(function() return trk.Looped, trk.Length end)
                 if okL and not looped and len > 0.2 and len < 4 then unknown = { trk, id } end
             end
         end
     end
+    if attack then return attack, false, false end
     if unknown then
         -- only count it if their saber is actually out (blade parts exist) - filters emotes
         local hasBlade = false
@@ -763,15 +767,18 @@ local function assessThreat(plr, myHrp)
     -- kicker that switches on 0.4s after the kick starts (Kicking state: KICK_WINDUP),
     -- so: kicker is close (or rushing in), facing you, and the active moment is near.
     if st.isKick then
-        local sinceStart = os.clock() - st.t0
-        if sinceStart < AP.MIN_COMMIT then return no("too early") end
-        if sinceStart > AP.KICK_WINDUP + 0.75 then return no("kick was already over") end
-        local closingK = math.max(st.bodyClosing or 0, 0)
-        if d - closingK * 0.3 > AP.KICK_RANGE then return no(("kicker too far (%.0f studs)"):format(d)) end
-        if face < AP.KICK_CONE then return no("kicker not facing you") end
-        local untilActive = math.max(AP.KICK_WINDUP - sinceStart, 0)
-        if untilActive > triggerTime(trk) then return no("too early") end
-        return untilActive, trk
+        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
+        -- kicker's position we see is that old too. So: (1) the kick is further along than
+        -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
+        local sinceStart = os.clock() - st.t0 + pingEma
+        if sinceStart > AP.KICK_WINDUP + 0.75 + pingEma then return no("kick was already over") end
+        local closingK = math.min(math.max(st.bodyClosing or 0, 0), 70)
+        local reach = d - closingK * (AP.KICK_WINDUP + pingEma)
+        if reach > AP.KICK_RANGE then return no(("kicker too far (%.0f studs)"):format(d)) end
+        if face < AP.KICK_CONE and d > AP.NEAR_RANGE then return no("kicker not facing you") end
+        -- a kick can't be cancelled and its windup is fixed, so there is nothing to wait
+        -- for: answer the moment we recognise it (any waiting only costs ping-time we lack)
+        return math.max(AP.KICK_WINDUP - sinceStart, 0), trk
     end
 
     local elapsed = timePos / math.max(speed, 0.1)
@@ -898,7 +905,8 @@ track(RunService.Heartbeat:Connect(function(dt)
 
     apBusy = true
     -- humanized delay, but when the hit is basically here (close fights) react instantly
-    local delay = (bestEta < 0.1) and 0 or ((math.random() + math.random()) / 2) * AP.JITTER_MAX
+    local bestIsKick = swingState[bestPlr] and swingState[bestPlr].isKick
+    local delay = (bestIsKick or bestEta < 0.1) and 0 or ((math.random() + math.random()) / 2) * AP.JITTER_MAX
     local function respond()
         apBusy = false
         if not settings.autoParry then return end
@@ -1001,7 +1009,7 @@ title.Font = Enum.Font.GothamBold
 title.TextSize = 14
 title.TextXAlignment = Enum.TextXAlignment.Left
 title.TextColor3 = COLORS.text
-title.Text = "Force + HBE"
+title.Text = "comp"
 title.Parent = frame
 
 local hint = Instance.new("TextLabel")
