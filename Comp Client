@@ -57,6 +57,8 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = true,   -- ESP: ON = enemies only, OFF = show your team too
+    kickPreUnblock = false, -- Anti-kick: also let go of block the moment someone dashes at you from afar (for high ping: dash-snipes)
+    chaseCam = true,       -- Parry chase: swing the camera onto the target and keep it there (looks like a real lock-on)
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
@@ -564,7 +566,7 @@ local AP = {
     KICK_RANGE = 9,     -- studs: kick hit box reaches ~4.5 studs, plus slack (after ping/dash compensation)
     KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
     KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
-    COUNTER_RANGE = 22,  -- Anti-kick counter: react to a kicker this close (studs), wider than Auto Parry's kick test
+    COUNTER_RANGE = 26,  -- Anti-kick counter: react to a kicker this close (studs), wider than Auto Parry's kick test
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
@@ -1670,6 +1672,48 @@ local function startChase(plr)
 
         local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
+
+        -- CAMERA LOCK-ON (switch "Chase: lock camera"): while chasing, the camera swings round onto the
+        -- person you stunned and stays on them - behind you, looking at them - eased in (not snapped) so it
+        -- reads as a player tracking their opponent. It eases back afterwards instead of cutting.
+        local lockPos
+        local cam = workspace.CurrentCamera
+        local prevCamType, camStartLook
+        local function restoreCam()
+            if not prevCamType then return end
+            local want = prevCamType
+            prevCamType = nil
+            pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseCam") end)
+            pcall(function()
+                -- ease back toward where the camera was looking before the chase, then hand it back
+                local t1 = os.clock()
+                while os.clock() - t1 < 0.25 and camStartLook do
+                    local pos = cam.CFrame.Position
+                    cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(pos, pos + camStartLook), 0.3)
+                    RunService.RenderStepped:Wait()
+                end
+                cam.CameraType = want
+            end)
+        end
+        if settings.chaseCam and cam then
+            pcall(function()
+                prevCamType = cam.CameraType
+                camStartLook = cam.CFrame.LookVector
+                cam.CameraType = Enum.CameraType.Scriptable
+                RunService:BindToRenderStep("ForceHBE_ChaseCam", Enum.RenderPriority.Camera.Value + 1, function()
+                    local me = LocalPlayer.Character
+                    local mh = me and me:FindFirstChild("HumanoidRootPart")
+                    if not mh or not lockPos then return end
+                    local flat = Vector3.new(lockPos.X - mh.Position.X, 0, lockPos.Z - mh.Position.Z)
+                    if flat.Magnitude < 0.5 then return end
+                    local eye = mh.Position + Vector3.new(0, 3.2, 0) - flat.Unit * 11
+                    local want = CFrame.lookAt(eye, lockPos + Vector3.new(0, 2, 0))
+                    cam.CFrame = cam.CFrame:Lerp(want, 0.35)
+                end)
+            end)
+            -- safety net: whatever happens, the camera is handed back (a chase lasts 6s at most)
+            task.delay(8, restoreCam)
+        end
         local DASH_COST = 32 + 8
         local MELEE, ARRIVED = 7, 5     -- re-set every frame: tighter when the Hitbox Expander is OFF
         local mode = "approach"
@@ -1688,6 +1732,7 @@ local function startChase(plr)
             lastTime = now
             if lastTPos then tVel = tVel * 0.4 + ((th.Position - lastTPos) / dt) * 0.6 end
             lastTPos = th.Position
+            lockPos = th.Position
             local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
             -- lead: our dash covers ~60 studs/s, so aim where they'll be by the time we get there
             local lead = math.min(dist / 60, 0.5)
@@ -1870,6 +1915,7 @@ local function startChase(plr)
             pcall(keyrelease, KEY_W)
             pcall(keyrelease, KEY_A)
         end
+        restoreCam()
         chaseBusy = false
     end)
 end
@@ -2040,7 +2086,8 @@ local function startKickCounter(plr, kickTrk)
                 lastTPos = th.Position
                 local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
                 local lead = math.min(dist / 60, 0.4)
-                local center = th.Position + tVel * lead
+                -- (what you see of them is one ping old: a dash-sniper has already gone further than drawn)
+                local center = th.Position + tVel * (lead + pingEma * 0.8)
                 -- aim at their FLANK (the side I'm already on), not the cube in front of them
                 local look = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
                 look = look.Magnitude > 0.05 and look.Unit or Vector3.new(0, 0, -1)
@@ -2141,6 +2188,55 @@ track(RunService.Heartbeat:Connect(function()
     if not settings.antiKick or counterBusy then return end
     for _, plr in ipairs(Players:GetPlayers()) do
         if plr ~= LocalPlayer then tryCounterKick(plr) end
+    end
+end))
+-- HIGH PING vs the DASH-SNIPE (dash from far, then kick the moment they land): by the time the kick
+-- animation reaches a high-ping screen there is hardly any time left. The DASH comes first and gives
+-- ~0.3-0.5s of warning, so with "Anti-kick: pre-unblock" ON, the moment someone dashes AT you from afar
+-- you let go of block - before the kick even starts. (Trade-off: a dash-ATTACK would have been blocked,
+-- so this is optional and off by default.)
+local preUnblocked = setmetatable({}, { __mode = "k" })
+local function findDashTrack(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    local animator = hum and hum:FindFirstChildOfClass("Animator")
+    if not animator then return nil end
+    local ok, tracks = pcall(animator.GetPlayingAnimationTracks, animator)
+    if not ok or type(tracks) ~= "table" then return nil end
+    for _, trk in ipairs(tracks) do
+        local okId, id = pcall(function() return string.match(trk.Animation.AnimationId, "%d+") end)
+        if okId and id == DASH_ID then return trk end
+    end
+    return nil
+end
+track(RunService.Heartbeat:Connect(function()
+    if not (settings.antiKick and settings.kickPreUnblock) then return end
+    if combatStateNow() ~= "blocking" then return end
+    local me = LocalPlayer.Character
+    local mh = me and me:FindFirstChild("HumanoidRootPart")
+    if not mh then return end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer then
+            local ch = plr.Character
+            local h = ch and ch:FindFirstChild("HumanoidRootPart")
+            if h then
+                local toMe = Vector3.new(mh.Position.X - h.Position.X, 0, mh.Position.Z - h.Position.Z)
+                local d = toMe.Magnitude
+                if d > 6 and d <= 70 then
+                    local v = plrVelFast[plr] or Vector3.zero
+                    local lf = Vector3.new(h.CFrame.LookVector.X, 0, h.CFrame.LookVector.Z)
+                    if v:Dot(toMe.Unit) >= AP.DASH_GUARD_SPEED and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.5 then
+                        local dt = findDashTrack(ch)
+                        if dt and not preUnblocked[dt] then
+                            preUnblocked[dt] = true
+                            pcall(function()
+                                saberComp:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.End })
+                            end)
+                            break
+                        end
+                    end
+                end
+            end
+        end
     end
 end))
 -- Auto Evade, EARLY trigger: hook the exact spot where the server's stun message arrives
@@ -3206,7 +3302,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v54"
+hint.Text = "Ctrl+H = hide  |  v56"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3451,7 +3547,7 @@ makeSwitch(11, "Infinite Force", settings.force, setForce)
 makeSwitch(12, "Infinite Block", settings.block, setBlock)
 makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
 makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
-makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
+makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
         -- self-test so you can see in F9 whether everything Auto Parry needs is there
@@ -3466,12 +3562,12 @@ makeSwitch(26, "Auto Parry", settings.autoParry, function(on)
 end)
 makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
 makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
-makeSwitch(27, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end)
-makeWhitelist(28, "Parry whitelist", "parry")
-makeSwitch(30, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end)
+makeWhitelist(29, "Parry whitelist", "parry")
+makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(31, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+makeSwitch(32, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
 makeSwitch(20, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
@@ -3479,6 +3575,8 @@ makeSwitch(20, "Stun evade", settings.autoEvade, function(on)
 end)
 
 -- Anti-kick: toggle here or with its key (rebindable in the row below the warning)
+-- (placed right after the Anti-kick rows - order 26)
+makeSwitch(26, "Anti-kick: pre-unblock (far dash)", settings.kickPreUnblock, function(on) settings.kickPreUnblock = on end)
 antiKickSwitch = makeSwitch(22, "Anti-kick (counter)", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end)
@@ -3628,18 +3726,19 @@ makeWhitelist(55, "ESP whitelist", "esp")
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(32, "Parry timing (ms)", "parryOffset", -500, 500)
+makeNumberBox(33, "Parry timing (ms)", "parryOffset", -500, 500)
 -- how wide the Stun evade zig-zag swings (degrees): lower = ends up FARTHER away, higher = harder to chase
 makeNumberBox(21, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
-makeNumberBox(29, "Parry strictness (0-100)", "parryStrict", 0, 100)
+makeNumberBox(30, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-makeSwitch(33, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
-makeNumberBox(34, "Multi delay (ms)", "multiDelay", 0, 800)
+makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
+makeNumberBox(35, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
-makeSwitch(35, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
+makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
-makeSwitch(36, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end)
+makeSwitch(38, "Chase: lock camera", settings.chaseCam, function(on) settings.chaseCam = on end)
+makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end)
 
 ------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
