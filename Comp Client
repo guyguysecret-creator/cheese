@@ -77,6 +77,7 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
+    parryChaseKey = "None", -- key that toggles Parry chase (set it in the panel)
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = false,  -- ESP: ON = enemies only, OFF = show your team too
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
@@ -4067,7 +4068,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v79"
+hint.Text = "Ctrl+H = hide  |  v80"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4312,8 +4313,8 @@ local function makeWhitelist(order, labelText, listName, btnWord)
 end
 makeHeader(10, "RESOURCES")
 makeHeader(19, "COMBAT")
-makeHeader(40, "HITBOX EXPANDER")
-makeHeader(50, "VISUALS")
+makeHeader(140, "HITBOX EXPANDER")
+makeHeader(150, "VISUALS")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce, "force")
 makeSwitch(12, "Infinite Block", settings.block, setBlock, "block")
@@ -4332,8 +4333,8 @@ makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end, "autoParry")
-makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE, "hbe")
-makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
+makeSwitch(141, "Hitbox Expander", settings.hbe, setHBE, "hbe")
+makeSwitch(142, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
 makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
 makeWhitelist(29, "Parry whitelist", "parry")
 makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
@@ -4473,17 +4474,17 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     CFG_UI.num[key] = { min = minV, max = maxV, refresh = function() box.Text = tostring(settings[key]) end }
 end
 
-makeWhitelist(43, "HBE whitelist", "hbe")
-makeNumberBox(44, "Hitbox size", "hbeSize", 2, 50)
+makeWhitelist(143, "HBE whitelist", "hbe")
+makeNumberBox(144, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(45, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(145, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
 -- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
-makeSwitch(51, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
-makeSwitch(52, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end, "espOutline")
-makeSwitch(53, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
-makeSwitch(54, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
-makeWhitelist(55, "ESP whitelist", "esp")
+makeSwitch(151, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
+makeSwitch(152, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end, "espOutline")
+makeSwitch(153, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
+makeSwitch(154, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
+makeWhitelist(155, "ESP whitelist", "esp")
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
@@ -4493,19 +4494,26 @@ makeNumberBox(21, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
 makeNumberBox(30, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
+local parryChaseSwitch = makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
+-- keybind that toggles Parry chase on/off (click the box, press a key / combo / mouse button)
+KB.makeRow(35, "Parry chase key", "parryChaseKey")
+KB.add(function() return settings.parryChaseKey end, function()
+    settings.parryChase = not settings.parryChase
+    if parryChaseSwitch then parryChaseSwitch(settings.parryChase, true) end
+    log("Parry chase " .. (settings.parryChase and "ON" or "OFF") .. " (key)")
+end)
 -- 0-800 ms. At 50 or below = ULTRA multi (no pacing: as fast as the game allows)
-makeNumberBox(35, "Multi delay (ms)", "multiDelay", 0, 800)
+makeNumberBox(41, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
-makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
+makeSwitch(42, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
-makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
+makeSwitch(43, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
-makeWhitelist(38, "Chase only (none = all)", "chase", "Pick")
+makeWhitelist(44, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
 makeSwitch(26, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
 -- ON = Parry chase never goes after your own team (e.g. other Jedi when you're a Jedi)
-makeSwitch(39, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
+makeSwitch(45, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
 
 ------------------------------------------------------------------------
 -- GUIDE: a button at the very top of the feature list opens a separate window that explains
@@ -4607,6 +4615,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
+                "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
                 "**Chase only (none = all):** click Pick, search and tick names. With anyone ticked, the chase ONLY ever goes after those players. With nobody ticked it chases anyone who qualifies. Saved in configs too.",
             } },
