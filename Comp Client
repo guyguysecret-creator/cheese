@@ -614,6 +614,29 @@ local function multiGap(base)
     return base + d * (0.8 + math.random() * 0.4)
 end
 
+-- Is somebody ELSE a clearly better target for this player's kick/dash than me? (closer to them and
+-- right in front of them). Anti-kick uses it so a kick or dash aimed at a third person - two people
+-- fighting near you - never makes you let go of block. Inside 5 studs it always says "no": that close,
+-- the kick's box reaches you anyway.
+local function betterTargetThanMe(kHrp, myHrp)
+    local toMe = Vector3.new(myHrp.Position.X - kHrp.Position.X, 0, myHrp.Position.Z - kHrp.Position.Z)
+    local dMe = toMe.Magnitude
+    if dMe <= 5 then return false end
+    local lf = Vector3.new(kHrp.CFrame.LookVector.X, 0, kHrp.CFrame.LookVector.Z)
+    if lf.Magnitude < 0.01 then return false end
+    lf = lf.Unit
+    for _, p in ipairs(Players:GetPlayers()) do
+        local c = p ~= LocalPlayer and p.Character
+        local h = c and c:FindFirstChild("HumanoidRootPart")
+        if h and c ~= kHrp.Parent then
+            local v = Vector3.new(h.Position.X - kHrp.Position.X, 0, h.Position.Z - kHrp.Position.Z)
+            local d = v.Magnitude
+            if d > 0.01 and d < dMe - 2 and lf:Dot(v / d) >= 0.8 then return true end
+        end
+    end
+    return false
+end
+
 -- every swing animation id used by the game's forms (Shared.Modules.SaberModule.Animations)
 local ATTACK_IDS = {}
 for _, id in ipairs({
@@ -986,13 +1009,14 @@ local function assessThreat(plr, myHrp, forCounter)
             -- net instead of Auto Parry's precise "will it hit me" test: any kicker within COUNTER_RANGE
             -- (plus the distance a dash + lag hides) who isn't facing away from you.
             local hiddenC = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
+            if betterTargetThanMe(hrp, myHrp) then return no("kick is aimed at somebody else") end
             if d <= AP.COUNTER_RANGE + hiddenC and (face >= -0.2 or d <= AP.NEAR_RANGE) then
                 return 0, trk
             end
             -- FAR: a dash-kick starts its kick animation up to about one dash + one kick away (~40 studs),
             -- before the kicker has even picked up speed. Anyone that far who is looking straight at you
             -- counts. (This is what used to be missed: only medium-range dash-kicks were answered.)
-            if d <= AP.COUNTER_FAR + hiddenC and face >= 0.5 then
+            if d <= AP.COUNTER_FAR + hiddenC and face >= 0.75 then
                 return 0, trk
             end
             return no("kicker too far / facing away for the counter")
@@ -2141,6 +2165,12 @@ local function startKickCounter(plr, kickTrk)
         if not hrp then counterBusy = false return end
         antiKickStatus = "countering " .. plr.Name
         if antiKickStatusSink then antiKickStatusSink() end
+        -- (so an unexpected unblock can always be traced: F9 says who triggered it)
+        pcall(function()
+            local kh = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            log(("Anti-kick: countering a kick from %s (%.0f studs away) - this lets go of block"):format(
+                plr.Name, kh and (kh.Position - hrp.Position).Magnitude or -1))
+        end)
 
         local function unblock()
             pcall(function()
@@ -2351,10 +2381,12 @@ track(RunService.Heartbeat:Connect(function()
                 if d > 6 and d <= 70 then
                     local v = plrVelFast[plr] or Vector3.zero
                     local lf = Vector3.new(h.CFrame.LookVector.X, 0, h.CFrame.LookVector.Z)
-                    if v:Dot(toMe.Unit) >= AP.DASH_GUARD_SPEED and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.5 then
+                    if v:Dot(toMe.Unit) >= AP.DASH_GUARD_SPEED and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.75
+                        and not betterTargetThanMe(h, mh) then
                         local dt = findDashTrack(ch)
                         if dt and not preUnblocked[dt] then
                             preUnblocked[dt] = true
+                            log(("Anti-kick pre-unblock: %s is dashing at you from %.0f studs - letting go of block"):format(plr.Name, d))
                             pcall(function()
                                 saberComp:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.End })
                             end)
@@ -3430,7 +3462,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v65"
+hint.Text = "Ctrl+H = hide  |  v66"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3978,6 +4010,7 @@ do
                 "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
                 "Far dash-kicks: reacts to a kicker up to about 50 studs away who is looking at you, and dashes in to meet them.",
                 "Kick right next to you: swings immediately, no dash first, so the hit lands inside the kick's 0.4 second wind-up.",
+                "It ignores kicks aimed at someone else (another player closer to the kicker and in front of them). Every time it lets go of block, F9 prints who triggered it and from how far.",
                 "The small status line under it shows whether it is ready.",
                 "Toggle it with its switch or with its key. The default key is {{Right Ctrl}}.",
             } },
