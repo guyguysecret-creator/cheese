@@ -86,7 +86,9 @@ local settings = {
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
-    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {} }, -- [UserId] = true: that player is skipped by that feature (chase: the ONLY ones chased)
+    -- [UserId] = true: that player is skipped by that feature (chase / parryOnly: the ONLY ones chased / parried)
+    -- ("parry" is the old skip list - no longer used, kept so old configs still load)
+    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {} },
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
@@ -504,6 +506,12 @@ local boxes = {} -- [character] = box part
 local function inWhitelist(listName, plr)
     local wl = settings.whitelist and settings.whitelist[listName]
     return wl ~= nil and wl[plr.UserId] == true
+end
+-- (v84) "Parry only": when anyone is ticked, Auto Parry / Anti-kick / Perfect trade answer ONLY those
+-- players; with nobody ticked they answer everyone
+local function parryPicked(plr)
+    local wl = settings.whitelist and settings.whitelist.parryOnly
+    return wl == nil or next(wl) == nil or wl[plr.UserId] == true
 end
 local function sameTeam(plr)
     local mine = LocalPlayer.Team
@@ -1229,8 +1237,8 @@ end
 
 -- is this player's current swing a real threat to us? returns urgency (lower = sooner), swingTrack
 local function assessThreat(plr, myHrp, forCounter)
-    -- Auto Parry never reacts to whitelisted players (or teammates, when its team check is on)
-    if inWhitelist("parry", plr) or (settings.parryTeamCheck and sameTeam(plr)) then return nil end
+    -- Auto Parry only reacts to players on the "Parry only" list (everyone if it's empty), never teammates with team check on
+    if not parryPicked(plr) or (settings.parryTeamCheck and sameTeam(plr)) then return nil end
     local char = plr.Character
     if not char then return nil end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -2921,7 +2929,7 @@ do
     local function pickAttacker(mh)
         local best, bestScore
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr ~= LocalPlayer and not inWhitelist("parry", plr) and not (settings.parryTeamCheck and sameTeam(plr)) then
+            if plr ~= LocalPlayer and parryPicked(plr) and not (settings.parryTeamCheck and sameTeam(plr)) then
                 local ch = plr.Character
                 local h = ch and ch:FindFirstChild("HumanoidRootPart")
                 local hum = ch and ch:FindFirstChildOfClass("Humanoid")
@@ -4229,7 +4237,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v83"
+hint.Text = "Ctrl+H = hide  |  v84"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4497,7 +4505,7 @@ end, "autoParry")
 makeSwitch(141, "Hitbox Expander", settings.hbe, setHBE, "hbe")
 makeSwitch(142, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
 makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
-makeWhitelist(29, "Parry whitelist", "parry")
+makeWhitelist(29, "Parry only (none = all)", "parryOnly", "Pick")
 makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
@@ -4757,9 +4765,10 @@ do
                 "Lower = parries more, but you may waste parries on near misses. Higher = only clear hits get parried.",
                 "Wasting parries? Try 70 to 80. Getting hit through it? Try 40 to 50.",
             } },
-            { "Parry team check / Parry whitelist", {
+            { "Parry team check / Parry only", {
                 "Team check ON: Auto Parry never reacts to your teammates.",
-                "Whitelist: click it, search a name and tick it. Ticked players are ignored by Auto Parry (friends, a sparring partner).",
+                "Parry only: click Pick, search a name and tick it. When anyone is ticked, Auto Parry, Anti-kick and Perfect trade ONLY react to those players and ignore everyone else.",
+                "Nobody ticked = they react to everyone (the normal way). Untick everyone to go back to that.",
             } },
             { "Dash guard (high ping)", {
                 "When an enemy force-dashes straight at you (and the dash can really reach you), Auto Parry gets ready for them: the swing they throw out of that dash is answered instantly, with no feint wait. Kicks are always answered instantly anyway.",
@@ -4804,7 +4813,7 @@ do
             } },
             { "Perfect trade (block, then multi)", {
                 "While you block, the moment an opponent's swing LANDS on your block you let go and hit back with ONE multi (dash cancelled into a swing) straight at them. Then your block goes back up if you're still holding it. That's a trade.",
-                "It answers the attacker who is close, swinging (or just swung) and facing you. Kicks are left to Anti-kick. Players on the Parry whitelist (and teammates with Parry team check on) are never traded with.",
+                "It answers the attacker who is close, swinging (or just swung) and facing you. Kicks are left to Anti-kick. If anyone is ticked in Parry only, it only trades with those players (and never with teammates when Parry team check is on).",
                 "Needs about 40 Force for the multi (Infinite Force covers it). Without it you get a plain swing.",
             } },
             { "Anti-kick key", {
@@ -4853,7 +4862,8 @@ do
                 "Kick timing gets marginal around 250 ms and above.",
             } },
             { "Whitelists and teams", {
-                "Each feature has its own whitelist (Parry, HBE, ESP), so ticking someone in one does not affect the others.",
+                "Each feature has its own list (Parry only, Chase only, HBE, ESP), so ticking someone in one does not affect the others.",
+                "Parry only and Chase only are pick lists: ticked players are the ONLY ones it acts on. The HBE and ESP whitelists skip whoever is ticked.",
             } },
         } },
     }
