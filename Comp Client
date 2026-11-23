@@ -2886,8 +2886,10 @@ do
                 faceThem()
                 local h = dashed and saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
                 if type(h) == "function" then pcall(h, true) else swing() end
-                local tE = os.clock()
-                while os.clock() - tE < 0.12 do aim() RunService.RenderStepped:Wait() end
+                -- keep steering just long enough for the swing to go out, then hand back (and re-block)
+                RunService.RenderStepped:Wait()
+                aim()
+                RunService.RenderStepped:Wait()
             end)
             if not okT then warn("[ForceHBE] perfect trade error: " .. tostring(errT)) end
             pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeMove") end)
@@ -2899,8 +2901,10 @@ do
 
     local function tryTrade()
         if not settings.perfectTrade or tradeBusy or counterBusy or chaseBusy then return end
-        if os.clock() - lastTrade < 0.45 then return end
-        if not wasBlocking or os.clock() - blockSince < 0.1 then return end -- (the block pose at block start isn't a hit)
+        -- (v77) built for multi spam on your block: a new trade can follow 0.15s after the last one, and a hit
+        -- 0.04s after your block went back up already counts (only the block pose itself at block start doesn't)
+        if os.clock() - lastTrade < 0.15 then return end
+        if not wasBlocking or os.clock() - blockSince < 0.04 then return end
         local char = LocalPlayer.Character
         local mh = char and char:FindFirstChild("HumanoidRootPart")
         if not mh then return end
@@ -4010,7 +4014,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v76"
+hint.Text = "Ctrl+H = hide  |  v77"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
