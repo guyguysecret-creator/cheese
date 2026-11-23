@@ -2704,10 +2704,33 @@ local function startKickCounter(plr, kickTrk)
         -- 1) UNBLOCK - the very first thing, before anything else can go wrong
         if combatStateNow() == "blocking" then unblock() end
 
+        -- (v85) FACE THE KICKER FIRST. The dash goes the way you move, but its animation and speed follow
+        -- the way you FACE - so with your back to them the counter came out as a backwards dash. Now you
+        -- are turned to face them on the very first frame (before any dash), and kept facing them every
+        -- frame until the counter ends (after the game's own camera / shift lock, so it can't turn you back).
+        local faceAt
         local moveDir = hrp.CFrame.LookVector
+        pcall(function()
+            local kh = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if not kh then return end
+            faceAt = kh.Position
+            local pos = hrp.Position
+            local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
+            if flat.Magnitude > 0.5 then
+                moveDir = flat.Unit
+                hrp.CFrame = CFrame.lookAt(pos, pos + flat)
+            end
+        end)
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_CounterMove", Enum.RenderPriority.Last.Value, function()
                 if hum then hum:Move(moveDir, false) end
+                -- the game checks S BEFORE W: S held (backing away) = backwards dash, so let go of it
+                if haveKeys and UserInputService:IsKeyDown(Enum.KeyCode.S) then pcall(keyrelease, 0x53) end
+                if faceAt and hrp and hrp.Parent then
+                    local pos = hrp.Position
+                    local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
+                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat) end
+                end
             end)
         end)
         if haveKeys then
@@ -2730,10 +2753,12 @@ local function startKickCounter(plr, kickTrk)
                 end)
             end
             local function faceTarget()
-                if settings.hbe or not lastTPos or not hrp then return end
+                -- (v85) always (HBE on too): every dash / swing goes out facing them
+                if not lastTPos or not hrp then return end
                 pcall(function()
                     local pos = hrp.Position
-                    hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
+                    local flat = Vector3.new(lastTPos.X - pos.X, 0, lastTPos.Z - pos.Z)
+                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat) end
                 end)
             end
 
@@ -2745,6 +2770,7 @@ local function startKickCounter(plr, kickTrk)
                 local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if not th or not thum or thum.Health <= 0 or not mh then break end
                 hrp = mh
+                faceAt = th.Position -- keep facing them as they move
 
                 -- STOP when their kick animation is over (we see it one ping late, so ping is subtracted)
                 local okK, playing, rem = pcall(function()
@@ -4237,7 +4263,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v84"
+hint.Text = "Ctrl+H = hide  |  v85"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4808,6 +4834,7 @@ do
                 "Every kind of kick: forward dash-kicks, REVERSE kicks (facing away and back-dashing into you with S), and plain kicks. A kicker moving toward you counts whichever way they face.",
                 "Kick right next to you: swings immediately, no dash first, so the hit lands inside the kick's 0.4 second wind-up.",
                 "It ignores kicks aimed at someone else (another player closer to the kicker and in front of them). Every time it lets go of block, F9 prints who triggered it and from how far.",
+                "Your back to the kicker (or shift lock pointing away)? It turns you to face them first and keeps you facing them, so the counter is always a forward dash, never a backwards one.",
                 "The small status line under it shows whether it is ready.",
                 "Toggle it with its switch or with its key. The default key is {{Right Ctrl}}.",
             } },
