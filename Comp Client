@@ -76,6 +76,7 @@ local settings = {
     jumpChase = false,     -- Parry chase: for VERY far evades, dash-snipe with a jump (click, W+E, Space)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
+    chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = false,  -- ESP: ON = enemies only, OFF = show your team too
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
@@ -464,7 +465,17 @@ local function inWhitelist(listName, plr)
 end
 local function sameTeam(plr)
     local mine = LocalPlayer.Team
-    return mine ~= nil and plr.Team == mine
+    if mine ~= nil and plr.Team == mine then return true end
+    -- (v79) the game also tags every character with its side ("Alignment" - e.g. Jedi / Sith); the same
+    -- side counts as your team too. Neutral-looking values are never treated as a team.
+    local ok, same = pcall(function()
+        local a = LocalPlayer.Character and LocalPlayer.Character:GetAttribute("Alignment")
+        local b = plr.Character and plr.Character:GetAttribute("Alignment")
+        if a == nil or b == nil or a ~= b then return false end
+        local s = string.lower(tostring(a))
+        return not (s == "" or s:find("neutral") or s:find("grey") or s:find("gray") or s:find("none"))
+    end)
+    return ok and same == true
 end
 
 local function isEnemy(plr)
@@ -2498,6 +2509,8 @@ do
             -- "Chase only" list: when anyone is ticked, ONLY those players are ever chased
             local allow = settings.whitelist.chase
             local allowed = (next(allow) == nil) or allow[plr.UserId] == true
+            -- "Chase team check": never your own team
+            if settings.chaseTeamCheck and sameTeam(plr) then allowed = false end
             -- enough stun left to be worth it
             local okR, rem = pcall(function() return (trk.Length - trk.TimePosition) / math.max(trk.Speed, 0.05) end)
             local worth = not okR or type(rem) ~= "number" or rem - pingEma > 0.2
@@ -4054,7 +4067,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v78"
+hint.Text = "Ctrl+H = hide  |  v79"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4490,7 +4503,9 @@ makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) se
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(38, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
-makeSwitch(39, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
+makeSwitch(26, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
+-- ON = Parry chase never goes after your own team (e.g. other Jedi when you're a Jedi)
+makeSwitch(39, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
 
 ------------------------------------------------------------------------
 -- GUIDE: a button at the very top of the feature list opens a separate window that explains
@@ -4592,6 +4607,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
+                "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
                 "**Chase only (none = all):** click Pick, search and tick names. With anyone ticked, the chase ONLY ever goes after those players. With nobody ticked it chases anyone who qualifies. Saved in configs too.",
             } },
             { "Multi delay (ms)", {
