@@ -2299,26 +2299,43 @@ local function startChase(plr) -- returns true if a chase started
                     updateAim()
                     RunService.RenderStepped:Wait()
                 end
-                local cs = combatStateNow()
-                local onCd = false
-                pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
-                local force = 0
-                pcall(function() force = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
-                faceTarget()
-                if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) and force >= 40 then
-                    sendDashInput()
-                    -- let the dash start, then cancel it into the swing
-                    for _ = 1, 8 do
-                        RunService.RenderStepped:Wait()
+                -- ALWAYS A MULTI: keep asking for the dash (up to ~0.4s, e.g. while the dash cooldown runs
+                -- out) until it really starts, then cancel THAT dash into the swing. A plain swing is
+                -- only the last resort if a dash is impossible (no Force).
+                local function force()
+                    local f = 0
+                    pcall(function() f = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
+                    return f
+                end
+                local dashed = false
+                if force() >= 40 then
+                    local tD = os.clock()
+                    while os.clock() - tD < 0.4 do
                         updateAim()
-                        cancelListener()
-                        if movementState() == "dashing" then break end
+                        local cs = combatStateNow()
+                        local onCd = false
+                        pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
+                        if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) then
+                            faceTarget()
+                            sendDashInput()
+                        end
+                        RunService.RenderStepped:Wait()
+                        if movementState() == "dashing" then dashed = true break end
                     end
-                    RunService.RenderStepped:Wait()
+                end
+                if dashed then
+                    cancelListener()
+                    RunService.RenderStepped:Wait()             -- dash running 2 frames: now cancel it
+                    updateAim()
+                    cancelListener()
+                    -- the cancel turns into a swing only from "ignited": wait for it briefly
+                    local tC = os.clock()
+                    while os.clock() - tC < 0.2 and combatStateNow() ~= "ignited" do RunService.RenderStepped:Wait() end
                     faceTarget()
                     local h = saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
                     if type(h) == "function" then pcall(h, true) else sendAttack() end
-                elseif cs == "ignited" then
+                elseif combatStateNow() == "ignited" then
+                    faceTarget()
                     sendAttack()
                 end
                 -- give the swing a moment to go out before the keys are released
@@ -2600,7 +2617,7 @@ local function startKickCounter(plr, kickTrk)
                     dashFrames += 1
                     pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
                     -- the dash runs its full length toward the flank; once on them, it becomes a swing
-                    if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE and canSwing then
+                    if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE + 3 and canSwing then
                         cancelled = true
                         faceTarget()
                         local h = rawget(sc, "_dashCancelHandler")
@@ -2618,12 +2635,16 @@ local function startKickCounter(plr, kickTrk)
                             sendDashInput()                     -- close the gap with a full dash
                         end
                     elseif os.clock() >= nextMultiAt and canSwing then
-                        -- RIGHT ON THEM (this covers a plain kick next to you): swing at once. A kick's hit
-                        -- box switches on 0.4s after it starts, so the first swing has to go out now - a
-                        -- dash first (the old behaviour) cost ~0.2s and the kick landed. Swings repeat at
-                        -- the game's own speed, paced like the Parry chase but never slower than 0.2s
-                        -- (the kick window is short).
-                        if swingReady then
+                        -- RIGHT ON THEM (a plain kick next to you): MULTI until their kick animation is over -
+                        -- W + A + E dash, cancelled into a swing on the next frames (the "dashing" branch above),
+                        -- over and over, paced like the Parry chase but never slower than 0.2s (the kick
+                        -- window is short). A plain swing is only used when a dash isn't possible right now
+                        -- (dash cooldown / no Force).
+                        if dashReady and not onCd and groundedMS(ms) and force >= DASH_COST and remEff >= 0.12 then
+                            faceTarget()
+                            sendDashInput()
+                            nextMultiAt = os.clock() + math.min(multiGap(0.18), 0.2)
+                        elseif swingReady then
                             faceTarget()
                             sendAttack()
                             nextMultiAt = os.clock() + math.min(multiGap(0.15), 0.2)
@@ -3744,7 +3765,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v70"
+hint.Text = "Ctrl+H = hide  |  v71"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
