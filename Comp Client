@@ -613,6 +613,7 @@ local AP = {
     guard = {}, feint = {}, feintT = {}, dashT = {},  -- per-player state (filled in by updateSwings)
     learnedParry = {},   -- custom-form PARRY animation ids learned in play (never treated as swings again)
     armed = {},          -- [player] = time: Dash guard saw them dash in - answer their follow-up swing instantly
+    rushT = {},          -- [player] = last time they were moving toward me fast (forwards OR backwards)
 }
 
 -- Pacing between multi cycles (Parry chase + Anti-kick counter). Normal: the game's own minimum for
@@ -634,6 +635,12 @@ local function betterTargetThanMe(kHrp, myHrp)
     local dMe = toMe.Magnitude
     if dMe <= 5 then return false end
     local lf = Vector3.new(kHrp.CFrame.LookVector.X, 0, kHrp.CFrame.LookVector.Z)
+    -- (v73) a kicker dashing BACKWARDS (reverse kick) heads where they move, not where they look
+    local okV, vel = pcall(function() return kHrp.AssemblyLinearVelocity end)
+    if okV and vel then
+        local fv = Vector3.new(vel.X, 0, vel.Z)
+        if fv.Magnitude >= 15 then lf = fv end
+    end
     if lf.Magnitude < 0.01 then return false end
     lf = lf.Unit
     for _, p in ipairs(Players:GetPlayers()) do
@@ -914,6 +921,15 @@ local function updateSwings(myHrp, dt)
                 g.blockAnim, g.parryAnim = AP.scanGuard(char)
                 if g.blockVal or g.blockAnim or g.parryAnim then g.last = os.clock() end
             end
+            -- RUSH TRACKER: last time they were moving toward me fast (any facing - back-dashes count)
+            if hrp0 then
+                local vr = plrVelFast[plr]
+                local toMeR = Vector3.new(myPos.X - hrp0.Position.X, 0, myPos.Z - hrp0.Position.Z)
+                if vr and toMeR.Magnitude > 0.5 and toMeR.Magnitude <= 60
+                    and Vector3.new(vr.X, 0, vr.Z):Dot(toMeR.Unit) >= 15 then
+                    AP.rushT[plr] = os.clock()
+                end
+            end
             -- DASH TIMER: when did their current force dash start? (it lasts AP.DASH_TIME)
             if dt > 0 then
                 local vf = plrVelFast[plr]
@@ -1173,16 +1189,28 @@ local function assessThreat(plr, myHrp, forCounter)
             -- (plus the distance a dash + lag hides) who isn't facing away from you.
             local hiddenC = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
             if betterTargetThanMe(hrp, myHrp) then return no("kick is aimed at somebody else") end
-            if d <= AP.COUNTER_RANGE + hiddenC and (face >= -0.2 or d <= AP.NEAR_RANGE) then
+            -- (v73) EVERY KIND OF KICK: a kicker can face you and dash forward, FACE AWAY and dash
+            -- BACKWARDS into you (S - the "reverse kick"), or just stand and kick. So "coming at you"
+            -- counts as much as "facing you": how fast they're moving toward you right now, and how fast
+            -- they were going toward you a moment ago (their dash may already be over on our screen).
+            local vNow = plrVelFast[plr] or Vector3.zero
+            local dirToMe = toMe / d
+            local closing = Vector3.new(vNow.X, 0, vNow.Z):Dot(Vector3.new(dirToMe.X, 0, dirToMe.Z))
+            local rushing = closing >= 15
+            -- a rush at me in the last 0.6s (tracked for everyone in updateSwings - the kick often comes
+            -- right as their dash ends, forwards or backwards)
+            local rushedRecently = AP.rushT[plr] ~= nil and os.clock() - AP.rushT[plr] < 0.6
+            local comingAtMe = face >= -0.2 or rushing or rushedRecently
+            if d <= AP.COUNTER_RANGE + hiddenC and (comingAtMe or d <= AP.NEAR_RANGE) then
                 return 0, trk
             end
             -- FAR: a dash-kick starts its kick animation up to about one dash + one kick away (~40 studs),
-            -- before the kicker has even picked up speed. Anyone that far who is looking straight at you
-            -- counts. (This is what used to be missed: only medium-range dash-kicks were answered.)
-            if d <= AP.COUNTER_FAR + hiddenC and face >= 0.75 then
+            -- before the kicker has even picked up speed. Anyone that far who is looking straight at you,
+            -- or already dashing (forwards OR backwards) at you, counts.
+            if d <= AP.COUNTER_FAR + hiddenC and (face >= 0.75 or rushing or rushedRecently) then
                 return 0, trk
             end
-            return no("kicker too far / facing away for the counter")
+            return no("kicker too far / not coming at you for the counter")
         end        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
         -- kicker's position we see is that old too. So: (1) the kick is further along than
         -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
@@ -3785,7 +3813,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v72"
+hint.Text = "Ctrl+H = hide  |  v73"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4338,6 +4366,7 @@ do
             { "Anti-kick (counter)", {
                 "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
                 "Far dash-kicks: reacts to a kicker up to about 50 studs away who is looking at you, and dashes in to meet them.",
+                "Every kind of kick: forward dash-kicks, REVERSE kicks (facing away and back-dashing into you with S), and plain kicks. A kicker moving toward you counts whichever way they face.",
                 "Kick right next to you: swings immediately, no dash first, so the hit lands inside the kick's 0.4 second wind-up.",
                 "It ignores kicks aimed at someone else (another player closer to the kicker and in front of them). Every time it lets go of block, F9 prints who triggered it and from how far.",
                 "The small status line under it shows whether it is ready.",
