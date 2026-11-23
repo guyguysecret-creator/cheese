@@ -587,6 +587,7 @@ local AP = {
     KICK_CONE = 0.45,    -- cos(~63 deg): kicker must face you (beyond NEAR_RANGE)
     KICK_WINDUP = 0.4,   -- s from kick start until the hit box turns on (game constant)
     COUNTER_RANGE = 26,  -- Anti-kick counter: react to a kicker this close (studs), wider than Auto Parry's kick test
+    COUNTER_FAR = 50,    -- Anti-kick counter: a kicker this far who is FACING you also counts (a dash-kick starts its kick from up to ~one dash + one kick away)
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
@@ -600,7 +601,18 @@ local AP = {
     DASH_CLOSING = 22,   -- studs/s: attacker body rushing at you this fast = dash attack
     DEBUG = false,       -- (only matters when VERBOSE is on) explains why a swing/kick was ignored
     FALLBACK_HIT = 0.25, -- s into a swing the hit lands, only if no blade parts are found
+    MULTI_ULTRA = 50,    -- ms: "Multi delay" at or below this = ULTRA multi (no pacing at all)
 }
+
+-- Pacing between multi cycles (Parry chase + Anti-kick counter). Normal: the game's own minimum for
+-- that input (`base`: ~0.15s swing / ~0.18s dash) PLUS "Multi delay", +-20% so it isn't a metronome.
+-- If "Multi delay" is lowered a TON (MULTI_ULTRA ms or less) the pacing is dropped completely: inputs
+-- go out every frame and only the game's own cooldowns limit them. Very fast - and it looks it.
+local function multiGap(base)
+    local d = (settings.multiDelay or 0) / 1000
+    if d * 1000 <= AP.MULTI_ULTRA then return 0 end
+    return base + d * (0.8 + math.random() * 0.4)
+end
 
 -- every swing animation id used by the game's forms (Shared.Modules.SaberModule.Animations)
 local ATTACK_IDS = {}
@@ -977,6 +989,12 @@ local function assessThreat(plr, myHrp, forCounter)
             if d <= AP.COUNTER_RANGE + hiddenC and (face >= -0.2 or d <= AP.NEAR_RANGE) then
                 return 0, trk
             end
+            -- FAR: a dash-kick starts its kick animation up to about one dash + one kick away (~40 studs),
+            -- before the kicker has even picked up speed. Anyone that far who is looking straight at you
+            -- counts. (This is what used to be missed: only medium-range dash-kicks were answered.)
+            if d <= AP.COUNTER_FAR + hiddenC and face >= 0.5 then
+                return 0, trk
+            end
             return no("kicker too far / facing away for the counter")
         end        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
         -- kicker's position we see is that old too. So: (1) the kick is further along than
@@ -1142,6 +1160,15 @@ end
 
 local apStep
 track(RunService.Heartbeat:Connect(function(dt)
+    if not (settings.autoParry or settings.antiKick or settings.parryChase) then return end
+    -- live ping (Anti-kick and Parry chase need it too: their aim and timing allow for lag)
+    local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if okP and type(p) == "number" then
+        -- follow a spike quickly (so we compensate right away) but come back down gently
+        -- (so one lucky low reading doesn't make us late)
+        local rate = (p > pingEma) and 8 or 1.5
+        pingEma = pingEma + (p - pingEma) * math.min(1, dt * rate)
+    end
     if not settings.autoParry then
         -- Anti-kick alone still needs to SEE kicks (to know which stuns are kick stuns)
         if settings.antiKick then
@@ -1150,14 +1177,6 @@ track(RunService.Heartbeat:Connect(function(dt)
             if h then updateSwings(h, dt) end
         end
         return
-    end
-
-    local okP, p = pcall(function() return LocalPlayer:GetNetworkPing() end)
-    if okP and type(p) == "number" then
-        -- follow a spike quickly (so we compensate right away) but come back down gently
-        -- (so one lucky low reading doesn't make us late)
-        local rate = (p > pingEma) and 8 or 1.5
-        pingEma = pingEma + (p - pingEma) * math.min(1, dt * rate)
     end
     apStep(dt)
 end))
@@ -1475,6 +1494,46 @@ local function combatStateNow()
     if not saberStillValid(sc) then return nil end
     local ok, st = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
     return ok and st or nil
+end
+
+-- While the Anti-kick counter / Parry chase runs, the game is told "block released" (and swings fire),
+-- but your real block button is usually still held. The game only re-blocks by itself from some
+-- states, so afterwards you could be left with the saber out and no block. This puts the block
+-- back the moment it is possible - but ONLY if you are really still holding your block button.
+local function userHoldsBlock()
+    local held = false
+    pcall(function()
+        local sc = saberComp
+        local b = sc and rawget(sc, "_pcBlockBinding")
+        if b == nil then
+            held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        elseif typeof(b) == "EnumItem" and b.EnumType == Enum.UserInputType then
+            held = UserInputService:IsMouseButtonPressed(b)
+        elseif typeof(b) == "EnumItem" then
+            held = UserInputService:IsKeyDown(b)
+        end
+        local gp = sc and rawget(sc, "_gpBlockKey")
+        if not held and gp ~= nil then
+            held = UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, gp)
+        end
+    end)
+    return held
+end
+local function reblockIfHeld()
+    task.spawn(function()
+        local t0 = os.clock()
+        while os.clock() - t0 < 1.2 do
+            if not userHoldsBlock() then return end          -- you let go: nothing to restore
+            local cs = combatStateNow()
+            if cs == "blocking" or cs == "parrying" or cs == "stunned" then return end
+            if cs == "ignited" then
+                pcall(function()
+                    saberComp:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.Begin })
+                end)
+            end
+            RunService.Heartbeat:Wait()                      -- (swinging etc.: wait for the swing to end)
+        end
+    end)
 end
 
 local function doEvade()
@@ -1898,7 +1957,7 @@ local function startChase(plr)
                         mode = "multi"
                         faceTarget()
                         sendAttack()
-                        nextMultiAt = os.clock() + 0.15 + ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
+                        nextMultiAt = os.clock() + multiGap(0.15)
                     end
                 elseif dist > MELEE then
                     mode = "approach"
@@ -1912,17 +1971,17 @@ local function startChase(plr)
                     mode = "multi"
                     -- PACING: the game would allow a new cycle every ~0.18s, which looks like a machine.
                     -- "Multi delay" adds extra time between cycles (+-20% so it isn't a metronome).
+                    -- (Multi delay at or below AP.MULTI_ULTRA ms = no pacing: ULTRA multi, every frame.)
                     if os.clock() >= nextMultiAt and canSwing then
-                        local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
                         if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
                             faceTarget()
                             sendDashInput()                     -- E (W and A are held)
-                            nextMultiAt = os.clock() + 0.18 + gap
+                            nextMultiAt = os.clock() + multiGap(0.18)
                         elseif cs == "ignited" then
                             -- dash still cooling down (or no force): keep hitting with plain swings
                             faceTarget()
                             sendAttack()
-                            nextMultiAt = os.clock() + 0.15 + gap
+                            nextMultiAt = os.clock() + multiGap(0.15)
                         end
                     end
                 end
@@ -1937,17 +1996,23 @@ local function startChase(plr)
         end
         restoreCam()
         chaseBusy = false
+        reblockIfHeld()
     end)
 end
 -- watch for "I just parried and the attacker got stunned"
 do
-    local wasParrying, parryAt = false, -math.huge
+    -- the chase starts after a PARRY that stunned someone OR after YOUR KICK stunned someone
+    local wasParrying, parryAt, kickAt = false, -math.huge, -math.huge
     track(RunService.Heartbeat:Connect(function()
         if not (settings.autoParry or settings.parryChase) then wasParrying = false return end
-        local parrying = combatStateNow() == "parrying"
+        local csNow = combatStateNow()
+        local parrying = csNow == "parrying"
         if parrying and not wasParrying then parryAt = os.clock() end
         wasParrying = parrying
-        if os.clock() - parryAt > 1.0 then return end          -- only look right after a parry
+        if csNow == "kicking" then kickAt = os.clock() end      -- last moment my kick was running
+        local afterParry = os.clock() - parryAt <= 1.0
+        local afterKick = os.clock() - kickAt <= 0.9
+        if not (afterParry or afterKick) then return end        -- only look right after a parry / my kick
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then return end
@@ -1969,9 +2034,19 @@ do
                         local lf = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
                         fightingMe = toMe.Magnitude <= 14 and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.5
                     end
-                    if trk and okT and pos < 0.6 and wasAttacker and fightingMe then            -- a FRESH stun right after my parry
-                        parryAt = -math.huge                     -- count it once
-                        cutParry()
+                    -- AFTER MY KICK: the kicked player was not necessarily swinging at me (a kick breaks a
+                    -- block), so the "was attacking me" test is skipped - but they must be close and
+                    -- roughly in front of me, so a stunned bystander is never chased
+                    local kickOK = false
+                    local toThem = Vector3.new(th.Position.X - hrp.Position.X, 0, th.Position.Z - hrp.Position.Z)
+                    if afterKick and toThem.Magnitude > 0.01 and toThem.Magnitude <= 12 then
+                        local mf = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
+                        kickOK = mf.Magnitude > 0.01 and mf.Unit:Dot(toThem.Unit) >= 0.3
+                    end
+                    local viaParry = afterParry and wasAttacker and fightingMe
+                    if trk and okT and pos < 0.6 and (viaParry or kickOK) then   -- a FRESH stun right after my parry / kick
+                        parryAt, kickAt = -math.huge, -math.huge  -- count it once
+                        if viaParry then cutParry() end
                         if settings.parryChase then startChase(plr) end
                         break
                     end
@@ -2059,7 +2134,8 @@ local function startKickCounter(plr, kickTrk)
         -- error in the middle left "counterBusy" stuck on, which silently disabled Anti-kick for the
         -- rest of the session - a likely cause of "works sometimes".)
         local okRun, errRun = pcall(function()
-            local lastTPos, tVel, lastTime = nil, Vector3.zero, os.clock()
+            -- start from the kicker's already-tracked speed: a far dash-kicker is mid-run on frame one
+            local lastTPos, tVel, lastTime = nil, (plrVelFast[plr] or Vector3.zero), os.clock()
             local DASH_COST, MELEE = 32 + 8, (settings.hbe and 7 or 5)
             local dashFrames, cancelled, nextMultiAt = 0, false, 0
             local function sendAttack()
@@ -2151,16 +2227,15 @@ local function startKickCounter(plr, kickTrk)
                             sendDashInput()                     -- close the gap with a full dash
                         end
                     elseif os.clock() >= nextMultiAt and canSwing then
-                        -- MULTI, paced like the Parry chase ("Multi delay")
-                        local gap = ((settings.multiDelay or 0) / 1000) * (0.8 + math.random() * 0.4)
-                        if dashReady and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
-                            faceTarget()
-                            sendDashInput()
-                            nextMultiAt = os.clock() + 0.18 + gap
-                        elseif swingReady then
+                        -- RIGHT ON THEM (this covers a plain kick next to you): swing at once. A kick's hit
+                        -- box switches on 0.4s after it starts, so the first swing has to go out now - a
+                        -- dash first (the old behaviour) cost ~0.2s and the kick landed. Swings repeat at
+                        -- the game's own speed, paced like the Parry chase but never slower than 0.2s
+                        -- (the kick window is short).
+                        if swingReady then
                             faceTarget()
                             sendAttack()
-                            nextMultiAt = os.clock() + 0.15 + gap
+                            nextMultiAt = os.clock() + math.min(multiGap(0.15), 0.2)
                         end
                     end
                 end
@@ -2176,6 +2251,7 @@ local function startKickCounter(plr, kickTrk)
             pcall(keyrelease, KEY_A)
         end
         counterBusy = false
+        reblockIfHeld() -- still holding block? put it back so you are not left with the saber out
         antiKickStatus = settings.antiKick and "ready" or "off"
         if antiKickStatusSink then antiKickStatusSink() end
     end)
@@ -3323,7 +3399,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v61"
+hint.Text = "Ctrl+H = hide  |  v64"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3376,7 +3452,11 @@ local function makeRow(y, labelText)
     return row
 end
 
-local function makeSwitch(y, labelText, initial, onChanged)
+-- everything the config system needs to push saved values back into the menu: key -> setter / refresher
+local CFG_UI = { sw = {}, num = {}, kb = {}, wl = {} }
+
+-- `key` (optional) = the settings entry this switch controls, so saved configs can flip it
+local function makeSwitch(y, labelText, initial, onChanged, key)
     local row = makeRow(y, labelText)
     local state = initial
     local btn = Instance.new("TextButton")
@@ -3400,11 +3480,13 @@ local function makeSwitch(y, labelText, initial, onChanged)
     end)
     render()
     -- lets other code (e.g. a keybind) flip this switch: setter(on, skipCallback)
-    return function(on, skipCallback)
+    local function setter(on, skipCallback)
         state = on
         render()
         if not skipCallback then onChanged(on) end
     end
+    if key then CFG_UI.sw[key] = setter end
+    return setter
 end
 
 -- section headers: Resources / Combat / HBE (the number is the position in the list)
@@ -3557,6 +3639,7 @@ local function makeWhitelist(order, labelText, listName)
     search:GetPropertyChangedSignal("Text"):Connect(function() if panel.Visible then rebuild() end end)
     track(Players.PlayerAdded:Connect(function() if panel.Visible then rebuild() end end))
     track(Players.PlayerRemoving:Connect(function() task.defer(function() if panel.Visible then rebuild() end end) end))
+    CFG_UI.wl[listName] = function() count(); if panel.Visible then rebuild() end end
     count()
 end
 makeHeader(10, "RESOURCES")
@@ -3564,10 +3647,10 @@ makeHeader(19, "COMBAT")
 makeHeader(40, "HITBOX EXPANDER")
 makeHeader(50, "VISUALS")
 
-makeSwitch(11, "Infinite Force", settings.force, setForce)
-makeSwitch(12, "Infinite Block", settings.block, setBlock)
-makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end)
-makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end)
+makeSwitch(11, "Infinite Force", settings.force, setForce, "force")
+makeSwitch(12, "Infinite Block", settings.block, setBlock, "block")
+makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end, "parry")
+makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end, "kick")
 makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
@@ -3580,27 +3663,27 @@ makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
                 pingEma * 1000))
         end)
     end
-end)
-makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE)
-makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end)
-makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end)
+end, "autoParry")
+makeSwitch(41, "Hitbox Expander", settings.hbe, setHBE, "hbe")
+makeSwitch(42, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
+makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
 makeWhitelist(29, "Parry whitelist", "parry")
-makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end)
+makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(32, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end)
+makeSwitch(32, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end, "dashGuard")
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
 makeSwitch(20, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
     if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
-end)
+end, "autoEvade")
 
 -- Anti-kick: toggle here or with its key (rebindable in the row below)
 -- (placed right after the Anti-kick rows - order 26)
-makeSwitch(26, "Anti-kick: pre-unblock (far dash)", settings.kickPreUnblock, function(on) settings.kickPreUnblock = on end)
+makeSwitch(26, "Anti-kick: pre-unblock (far dash)", settings.kickPreUnblock, function(on) settings.kickPreUnblock = on end, "kickPreUnblock")
 antiKickSwitch = makeSwitch(22, "Anti-kick (counter)", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
-end)
+end, "antiKick")
 
 -- keybind row: click the box, then press the key / combo (Ctrl+U ...) / middle click / mouse
 -- side button you want. Esc cancels, Backspace/Delete clears it ("None").
@@ -3619,6 +3702,7 @@ function KB.makeRow(order, labelText, settingKey)
     btn.AutoButtonColor = true
     btn.Parent = row
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    CFG_UI.kb[settingKey] = function() btn.Text = tostring(settings[settingKey]) end
 
     local MOD_NAMES = {
         [Enum.KeyCode.LeftControl] = true, [Enum.KeyCode.RightControl] = true,
@@ -3719,6 +3803,7 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
         if n then settings[key] = math.clamp(n, minV, maxV) end
         box.Text = tostring(settings[key])
     end)
+    CFG_UI.num[key] = { min = minV, max = maxV, refresh = function() box.Text = tostring(settings[key]) end }
 end
 
 makeWhitelist(43, "HBE whitelist", "hbe")
@@ -3727,10 +3812,10 @@ makeNumberBox(44, "Hitbox size", "hbeSize", 2, 50)
 makeNumberBox(45, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
 -- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
-makeSwitch(51, "ESP (through walls)", settings.esp, function(on) settings.esp = on end)
-makeSwitch(52, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end)
-makeSwitch(53, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end)
-makeSwitch(54, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end)
+makeSwitch(51, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
+makeSwitch(52, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end, "espOutline")
+makeSwitch(53, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
+makeSwitch(54, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
 makeWhitelist(55, "ESP whitelist", "esp")
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
@@ -3741,12 +3826,13 @@ makeNumberBox(21, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
 makeNumberBox(30, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end)
+makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
+-- 0-800 ms. At 50 or below = ULTRA multi (no pacing: as fast as the game allows)
 makeNumberBox(35, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
-makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end)
+makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
-makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end)
+makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
 
 ------------------------------------------------------------------------
 -- GUIDE: a button at the very top of the feature list opens a separate window that explains
@@ -3775,6 +3861,18 @@ do
             { "What it can and can not do", {
                 "Everything here works on YOUR screen and with YOUR inputs. The server still decides damage, stuns, and whether a parry or kick lands, so nothing is a guarantee.",
                 "High ping makes timing harder. See the high ping tips at the bottom.",
+            } },
+        } },
+        { "CONFIGS", {
+            { "Save a config", {
+                "Type a name in the box under CONFIGS and press SAVE (or Enter). It stores every switch, number, your Anti-kick key and your whitelists.",
+                "Saving under an existing name overwrites it. Only letters, numbers, spaces, - and _ are kept in names.",
+                "Files are written to {{CompClient/configs}} in your executor's workspace folder. If your executor can not write files they are kept in memory until you close the game, and the status line says so.",
+            } },
+            { "Load a config", {
+                "Click LOAD CONFIG to open the list, then click a name. Every switch, number, key and whitelist is set to what you saved, and the features turn on or off to match.",
+                "The X next to a name deletes it: click once (it turns red with a ?), then click again within 2.5 seconds.",
+                "Tip: keep one config per playstyle, for example a low-ping one and a high-ping one.",
             } },
         } },
         { "RESOURCES", {
@@ -3830,12 +3928,13 @@ do
                 "Lower = straighter, so you end up FARTHER away. Higher = harder to chase but you travel less distance.",
             } },
             { "Parry chase (multi)", {
-                "After you parry and stun an enemy who was fighting you, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
-                "It only starts for someone who attacked you recently and is close to you, so it will not drag you toward bystanders.",
+                "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
+                "After a parry it only starts for someone who attacked you recently and is close to you. After a kick it starts for whoever you stunned if they are close and in front of you. Either way it will not drag you toward bystanders.",
             } },
             { "Multi delay (ms)", {
                 "Range {{0}} to {{800}}, default {{230}}. Extra wait between multi cycles.",
-                "0 = as fast as the game allows. Raise it if swings get eaten or feel out of sync, especially on high ping.",
+                "Raise it if swings get eaten or feel out of sync, especially on high ping. The Anti-kick counter uses it too (capped so it never waits long).",
+                "{{50 or below = ULTRA multi}}: all pacing is dropped and inputs go out every frame, limited only by the game's own cooldowns. It is very fast and looks suspicious. Keep it above 50 for the normal, human-looking pace.",
             } },
             { "Jump chase (far evades)", {
                 "For enemies that evaded very far: click, W+E, then Space (a dash snipe with a jump) and multi when you land.",
@@ -3845,7 +3944,10 @@ do
                 "ON: it only starts once you let go of block.",
             } },
             { "Anti-kick (counter)", {
-                "Ignores the kick stun on your screen and counters the kicker: it lets go of block, moves to their side and multis. The small status line under it shows whether it is ready.",
+                "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
+                "Far dash-kicks: reacts to a kicker up to about 50 studs away who is looking at you, and dashes in to meet them.",
+                "Kick right next to you: swings immediately, no dash first, so the hit lands inside the kick's 0.4 second wind-up.",
+                "The small status line under it shows whether it is ready.",
                 "Toggle it with its switch or with its key. The default key is {{Right Ctrl}}.",
             } },
             { "Anti-kick key", {
@@ -4140,6 +4242,358 @@ do
     end)
     gb.MouseButton1Click:Connect(function() setOpen(not guide.Visible) end)
     closeBtn.MouseButton1Click:Connect(function() setOpen(false) end)
+end
+
+------------------------------------------------------------------------
+-- CONFIGS: save everything you have set (switches, numbers, the Anti-kick key, whitelists) under a
+-- name, and load any saved config from a drop-down. Files live in your executor's workspace folder:
+--     CompClient/configs/<name>.json
+-- (an executor with no file functions keeps them in memory until the game closes instead)
+------------------------------------------------------------------------
+do
+    local HttpService = game:GetService("HttpService")
+    local FOLDER, SUB = "CompClient", "CompClient/configs"
+    local hasFS = type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    local env = (getgenv and getgenv()) or _G
+    env.ForceHBE_MemConfigs = env.ForceHBE_MemConfigs or {}
+    local mem = env.ForceHBE_MemConfigs
+
+    local function snapshot()
+        local d = { sw = {}, num = {}, kb = {}, wl = {} }
+        for k in pairs(CFG_UI.sw) do d.sw[k] = settings[k] == true end
+        for k in pairs(CFG_UI.num) do d.num[k] = settings[k] end
+        for k in pairs(CFG_UI.kb) do d.kb[k] = settings[k] end
+        for listName in pairs(CFG_UI.wl) do
+            local arr = {}
+            for uid in pairs(settings.whitelist[listName]) do arr[#arr + 1] = uid end
+            d.wl[listName] = arr
+        end
+        return d
+    end
+
+    local function applyConfig(d)
+        for k, v in pairs(d.sw or {}) do
+            local setter = CFG_UI.sw[k]
+            if setter and type(v) == "boolean" then
+                if settings[k] ~= v then pcall(setter, v) else pcall(setter, v, true) end
+            end
+        end
+        for k, v in pairs(d.num or {}) do
+            local nb, n = CFG_UI.num[k], tonumber(v)
+            if nb and n then
+                settings[k] = math.clamp(n, nb.min, nb.max)
+                nb.refresh()
+            end
+        end
+        for k, v in pairs(d.kb or {}) do
+            if CFG_UI.kb[k] and type(v) == "string" then
+                settings[k] = v
+                CFG_UI.kb[k]()
+            end
+        end
+        for listName, arr in pairs(d.wl or {}) do
+            local t = settings.whitelist[listName]
+            if t and type(arr) == "table" then
+                for kk in pairs(t) do t[kk] = nil end
+                for _, uid in ipairs(arr) do
+                    local n = tonumber(uid)
+                    if n then t[n] = true end
+                end
+                if CFG_UI.wl[listName] then CFG_UI.wl[listName]() end
+            end
+        end
+    end
+
+    local function cfgPath(name) return SUB .. "/" .. name .. ".json" end
+
+    local function listNames()
+        local names, seen = {}, {}
+        if hasFS and type(listfiles) == "function" and type(isfolder) == "function" then
+            pcall(function()
+                if isfolder(SUB) then
+                    for _, p in ipairs(listfiles(SUB)) do
+                        local n = tostring(p):match("([^/\\]+)%.json$")
+                        if n and not seen[n] then seen[n] = true; names[#names + 1] = n end
+                    end
+                end
+            end)
+        end
+        for n in pairs(mem) do
+            if not seen[n] then seen[n] = true; names[#names + 1] = n end
+        end
+        table.sort(names, function(a, b) return a:lower() < b:lower() end)
+        return names
+    end
+
+    local function saveConfig(name)
+        local json = HttpService:JSONEncode(snapshot())
+        if hasFS then
+            local ok = pcall(function()
+                if type(isfolder) == "function" and type(makefolder) == "function" then
+                    if not isfolder(FOLDER) then makefolder(FOLDER) end
+                    if not isfolder(SUB) then makefolder(SUB) end
+                end
+                writefile(cfgPath(name), json)
+            end)
+            if ok then mem[name] = nil return "file" end
+        end
+        mem[name] = json
+        return "memory"
+    end
+
+    local function readConfig(name)
+        local json = mem[name]
+        if not json and hasFS then
+            pcall(function()
+                if isfile(cfgPath(name)) then json = readfile(cfgPath(name)) end
+            end)
+        end
+        if not json then return nil end
+        local ok, d = pcall(function() return HttpService:JSONDecode(json) end)
+        if ok and type(d) == "table" then return d end
+        return nil
+    end
+
+    local function deleteConfig(name)
+        mem[name] = nil
+        if hasFS and type(delfile) == "function" then
+            pcall(function() if isfile(cfgPath(name)) then delfile(cfgPath(name)) end end)
+        end
+    end
+
+    local function cleanName(s)
+        s = tostring(s or "")
+        s = s:gsub("[^%w _%-]", "")
+        s = s:gsub("^%s+", "")
+        s = s:gsub("%s+$", "")
+        return s:sub(1, 32)
+    end
+
+    ---------------------------------------------------------------- UI
+    makeHeader(2, "CONFIGS")
+    local box = Instance.new("Frame")
+    box.Size = UDim2.new(1, -16, 0, 0)
+    box.AutomaticSize = Enum.AutomaticSize.Y
+    box.LayoutOrder = 3
+    box.BackgroundTransparency = 1
+    box.BorderSizePixel = 0
+    box.Parent = content
+    do
+        local lay = Instance.new("UIListLayout")
+        lay.SortOrder = Enum.SortOrder.LayoutOrder
+        lay.Padding = UDim.new(0, 4)
+        lay.Parent = box
+    end
+
+    -- row 1: name box + SAVE
+    local row1 = Instance.new("Frame")
+    row1.Size = UDim2.new(1, 0, 0, 26)
+    row1.LayoutOrder = 1
+    row1.BackgroundColor3 = COLORS.panel
+    row1.BorderSizePixel = 0
+    row1.Parent = box
+    Instance.new("UICorner", row1).CornerRadius = UDim.new(0, 6)
+    local nameBox = Instance.new("TextBox")
+    nameBox.Size = UDim2.new(1, -72, 0, 18)
+    nameBox.Position = UDim2.fromOffset(6, 4)
+    nameBox.BackgroundColor3 = COLORS.bg
+    nameBox.BorderSizePixel = 0
+    nameBox.Font = Enum.Font.Gotham
+    nameBox.TextSize = 11
+    nameBox.TextColor3 = COLORS.text
+    nameBox.PlaceholderText = "config name..."
+    nameBox.PlaceholderColor3 = COLORS.sub
+    nameBox.Text = ""
+    nameBox.ClearTextOnFocus = false
+    nameBox.TextXAlignment = Enum.TextXAlignment.Left
+    nameBox.Parent = row1
+    Instance.new("UICorner", nameBox).CornerRadius = UDim.new(0, 5)
+    do
+        local p = Instance.new("UIPadding")
+        p.PaddingLeft = UDim.new(0, 6)
+        p.Parent = nameBox
+    end
+    local saveBtn = Instance.new("TextButton")
+    saveBtn.Size = UDim2.fromOffset(54, 18)
+    saveBtn.Position = UDim2.new(1, -60, 0.5, -9)
+    saveBtn.BackgroundColor3 = COLORS.on
+    saveBtn.BorderSizePixel = 0
+    saveBtn.Font = Enum.Font.GothamBold
+    saveBtn.TextSize = 10
+    saveBtn.TextColor3 = Color3.new(1, 1, 1)
+    saveBtn.Text = "SAVE"
+    saveBtn.AutoButtonColor = true
+    saveBtn.Parent = row1
+    Instance.new("UICorner", saveBtn).CornerRadius = UDim.new(0, 6)
+
+    -- row 2: the LOAD drop-down toggle
+    local row2 = Instance.new("Frame")
+    row2.Size = UDim2.new(1, 0, 0, 26)
+    row2.LayoutOrder = 2
+    row2.BackgroundColor3 = COLORS.panel
+    row2.BorderSizePixel = 0
+    row2.Parent = box
+    Instance.new("UICorner", row2).CornerRadius = UDim.new(0, 6)
+    local loadBtn = Instance.new("TextButton")
+    loadBtn.Size = UDim2.new(1, -12, 0, 18)
+    loadBtn.Position = UDim2.fromOffset(6, 4)
+    loadBtn.BackgroundColor3 = COLORS.bg
+    loadBtn.BorderSizePixel = 0
+    loadBtn.Font = Enum.Font.GothamBold
+    loadBtn.TextSize = 10
+    loadBtn.TextColor3 = COLORS.text
+    loadBtn.AutoButtonColor = true
+    loadBtn.Parent = row2
+    Instance.new("UICorner", loadBtn).CornerRadius = UDim.new(0, 5)
+
+    -- the drop-down list of saved configs
+    local dd = Instance.new("Frame")
+    dd.Size = UDim2.new(1, 0, 0, 112)
+    dd.LayoutOrder = 3
+    dd.BackgroundColor3 = COLORS.panel
+    dd.BorderSizePixel = 0
+    dd.Visible = false
+    dd.Parent = box
+    Instance.new("UICorner", dd).CornerRadius = UDim.new(0, 6)
+    local ddList = Instance.new("ScrollingFrame")
+    ddList.Size = UDim2.new(1, -10, 1, -10)
+    ddList.Position = UDim2.fromOffset(5, 5)
+    ddList.BackgroundTransparency = 1
+    ddList.BorderSizePixel = 0
+    ddList.ScrollBarThickness = 3
+    ddList.CanvasSize = UDim2.new(0, 0, 0, 0)
+    ddList.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    ddList.Parent = dd
+    do
+        local ll = Instance.new("UIListLayout")
+        ll.SortOrder = Enum.SortOrder.LayoutOrder
+        ll.Padding = UDim.new(0, 2)
+        ll.Parent = ddList
+    end
+
+    local status = Instance.new("TextLabel")
+    status.Size = UDim2.new(1, 0, 0, 0)
+    status.AutomaticSize = Enum.AutomaticSize.Y
+    status.LayoutOrder = 4
+    status.BackgroundTransparency = 1
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 10
+    status.TextWrapped = true
+    status.TextXAlignment = Enum.TextXAlignment.Left
+    status.TextColor3 = COLORS.sub
+    status.Text = hasFS and "  type a name, then SAVE. Load from the list." or "  (no file access: configs last until you close the game)"
+    status.Parent = box
+    local function setStatus(text, bad)
+        status.Text = "  " .. text
+        status.TextColor3 = bad and Color3.fromRGB(220, 80, 80) or COLORS.sub
+    end
+
+    local function refreshLoadLabel()
+        loadBtn.Text = "LOAD CONFIG  " .. (dd.Visible and "^" or "v")
+    end
+
+    local rebuildList
+    local function doLoad(name)
+        local d = readConfig(name)
+        if not d then setStatus("could not read '" .. name .. "'", true) return end
+        applyConfig(d)
+        nameBox.Text = name
+        setStatus("loaded '" .. name .. "'")
+        log("config loaded: " .. name)
+        dd.Visible = false
+        refreshLoadLabel()
+    end
+    rebuildList = function()
+        for _, c in ipairs(ddList:GetChildren()) do
+            if c:IsA("Frame") or c:IsA("TextLabel") then c:Destroy() end
+        end
+        local names = listNames()
+        if #names == 0 then
+            local e = Instance.new("TextLabel")
+            e.Size = UDim2.new(1, -4, 0, 20)
+            e.BackgroundTransparency = 1
+            e.Font = Enum.Font.Gotham
+            e.TextSize = 11
+            e.TextColor3 = COLORS.sub
+            e.TextXAlignment = Enum.TextXAlignment.Left
+            e.Text = "  (no saved configs yet)"
+            e.Parent = ddList
+            return
+        end
+        for i, name in ipairs(names) do
+            local r = Instance.new("Frame")
+            r.Size = UDim2.new(1, -4, 0, 22)
+            r.LayoutOrder = i
+            r.BackgroundTransparency = 1
+            r.BorderSizePixel = 0
+            r.Parent = ddList
+            local b = Instance.new("TextButton")
+            b.Size = UDim2.new(1, -26, 1, 0)
+            b.BackgroundColor3 = COLORS.bg
+            b.BorderSizePixel = 0
+            b.Font = Enum.Font.Gotham
+            b.TextSize = 11
+            b.TextColor3 = COLORS.text
+            b.TextXAlignment = Enum.TextXAlignment.Left
+            b.TextTruncate = Enum.TextTruncate.AtEnd
+            b.AutoButtonColor = true
+            b.Text = "  " .. name
+            b.Parent = r
+            Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+            b.MouseButton1Click:Connect(function() doLoad(name) end)
+            -- delete: click X, then click again (it turns red and asks) within 2.5 seconds
+            local x = Instance.new("TextButton")
+            x.Size = UDim2.new(0, 22, 1, 0)
+            x.Position = UDim2.new(1, -22, 0, 0)
+            x.BackgroundColor3 = COLORS.off
+            x.BorderSizePixel = 0
+            x.Font = Enum.Font.GothamBold
+            x.TextSize = 10
+            x.TextColor3 = Color3.new(1, 1, 1)
+            x.Text = "X"
+            x.AutoButtonColor = true
+            x.Parent = r
+            Instance.new("UICorner", x).CornerRadius = UDim.new(0, 5)
+            local armed = false
+            x.MouseButton1Click:Connect(function()
+                if not armed then
+                    armed = true
+                    x.Text, x.BackgroundColor3 = "?", Color3.fromRGB(190, 60, 60)
+                    task.delay(2.5, function()
+                        if armed and x.Parent then
+                            armed = false
+                            x.Text, x.BackgroundColor3 = "X", COLORS.off
+                        end
+                    end)
+                else
+                    deleteConfig(name)
+                    setStatus("deleted '" .. name .. "'")
+                    rebuildList()
+                end
+            end)
+        end
+    end
+
+    loadBtn.MouseButton1Click:Connect(function()
+        dd.Visible = not dd.Visible
+        if dd.Visible then rebuildList() end
+        refreshLoadLabel()
+    end)
+    local function doSave()
+        local name = cleanName(nameBox.Text)
+        if name == "" then setStatus("type a name first (letters, numbers, spaces)", true) return end
+        local existed = false
+        for _, n in ipairs(listNames()) do if n == name then existed = true break end end
+        local okS, where = pcall(saveConfig, name)
+        if not okS then setStatus("save failed: " .. tostring(where), true) return end
+        nameBox.Text = name
+        setStatus((existed and "overwrote '" or "saved '") .. name .. "'" .. (where == "file" and "" or " (in memory only)"))
+        log("config saved: " .. name)
+        if dd.Visible then rebuildList() end
+    end
+    saveBtn.MouseButton1Click:Connect(doSave)
+    nameBox.FocusLost:Connect(function(enterPressed) if enterPressed then doSave() end end)
+    refreshLoadLabel()
 end
 
 ------------------------------------------------------------------------
