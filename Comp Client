@@ -625,6 +625,12 @@ local function multiGap(base)
     if d * 1000 <= AP.MULTI_ULTRA then return 0 end
     return base + d * (0.8 + math.random() * 0.4)
 end
+-- (v74) Anti-kick counter pacing: a human-looking 0.26-0.34s between multis (+-random), a bit slower than
+-- before (it was capped at 0.2s, which looked too fast). ULTRA Multi delay (50 or below) still goes all out.
+function AP.counterGap(base)
+    if (settings.multiDelay or 0) <= AP.MULTI_ULTRA then return 0 end
+    return math.max(base, 0.26 + math.random() * 0.08)
+end
 
 -- Is somebody ELSE a clearly better target for this player's kick/dash than me? (closer to them and
 -- right in front of them). Anti-kick uses it so a kick or dash aimed at a third person - two people
@@ -2647,7 +2653,7 @@ local function startKickCounter(plr, kickTrk)
                     if dashAsked and dashFrames == 1 then
                         -- a multi dash really started: NOW the pacing gap begins
                         dashAsked, dashAskAt = false, nil
-                        nextMultiAt = os.clock() + math.min(multiGap(0.18), 0.2)
+                        nextMultiAt = os.clock() + AP.counterGap(0.18)
                     end
                     pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
                     -- the dash runs its full length toward the flank; once on them, it becomes a swing
@@ -2695,7 +2701,7 @@ local function startKickCounter(plr, kickTrk)
                             dashAsked, dashAskAt = false, nil
                             faceTarget()
                             sendAttack()
-                            nextMultiAt = os.clock() + math.min(multiGap(0.15), 0.2)
+                            nextMultiAt = os.clock() + AP.counterGap(0.15)
                         end
                     end
                 end
@@ -3813,7 +3819,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v73"
+hint.Text = "Ctrl+H = hide  |  v74"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
