@@ -2849,6 +2849,9 @@ do
                 if haveKeys then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
                 -- 1) let go of block
                 unblock()
+                -- (v76) the dash needs W to really be down; the OS key press usually lands by the next
+                -- frame, so wait exactly that one frame instead of burning a refused dash first
+                if haveKeys and not UserInputService:IsKeyDown(Enum.KeyCode.W) then RunService.RenderStepped:Wait() end
                 -- 2) the dash: asked for again every frame until the game takes it (W has to register first)
                 local force = 0
                 pcall(function() force = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
@@ -2864,16 +2867,15 @@ do
                         if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) then
                             faceThem()
                             sendDashInput()
+                            -- (v76) the game switches state instantly: check RIGHT AWAY instead of a frame later
+                            if movementState() == "dashing" then dashed = true break end
                         end
                         RunService.RenderStepped:Wait()
                         if movementState() == "dashing" then dashed = true break end
                     end
                 end
-                -- 3) ...cancelled into the swing (or a plain swing if a dash wasn't possible)
+                -- 3) ...cancelled into the swing at once (or a plain swing if a dash wasn't possible)
                 if dashed then
-                    pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
-                    RunService.RenderStepped:Wait()
-                    aim()
                     pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
                 end
                 local tC = os.clock()
@@ -4008,7 +4010,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v75"
+hint.Text = "Ctrl+H = hide  |  v76"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
