@@ -1228,6 +1228,7 @@ apStep = function(dt)
         local st2 = swingState[bestPlr]
         if not responseAvailable(st2, canParryNow()) then return end
         baitScore[bestPlr] = math.max(0, (baitScore[bestPlr] or 0) - 0.5)
+        AP.parryTarget, AP.parryTargetT = bestPlr, os.clock() -- who this parry is FOR (Parry chase only chases them)
 
         if usesDash(st2) then
             -- kick answered with a dash instead of a parry
@@ -2003,11 +2004,41 @@ end
 do
     -- the chase starts after a PARRY that stunned someone OR after YOUR KICK stunned someone
     local wasParrying, parryAt, kickAt = false, -math.huge, -math.huge
+    -- WHO is my parry against? Decided the moment the parry starts, so two other people fighting near me
+    -- can never pull me in: only someone who was really swinging/kicking AT ME counts.
+    --   * Auto Parry knows exactly who it parried (AP.parryTarget) - that is the only one used
+    --   * a manual parry: whoever is mid-swing/kick, close, and looking straight at me
+    local parryCulprits = {}
+    local function pickCulprits(myHrp)
+        parryCulprits = {}
+        local tp = AP.parryTarget
+        if tp and os.clock() - (AP.parryTargetT or -math.huge) <= 1.0 then
+            parryCulprits[tp] = true
+            return
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local st = swingState[plr]
+            local tc = plr ~= LocalPlayer and plr.Character
+            local th = tc and tc:FindFirstChild("HumanoidRootPart")
+            if st and not st.isDash and th then
+                local toMe = Vector3.new(myHrp.Position.X - th.Position.X, 0, myHrp.Position.Z - th.Position.Z)
+                local lf = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
+                if toMe.Magnitude > 0.01 and toMe.Magnitude <= 14 and lf.Magnitude > 0.01 and lf.Unit:Dot(toMe.Unit) >= 0.7 then
+                    parryCulprits[plr] = true
+                end
+            end
+        end
+    end
     track(RunService.Heartbeat:Connect(function()
         if not (settings.autoParry or settings.parryChase) then wasParrying = false return end
         local csNow = combatStateNow()
         local parrying = csNow == "parrying"
-        if parrying and not wasParrying then parryAt = os.clock() end
+        if parrying and not wasParrying then
+            parryAt = os.clock()
+            local me0 = LocalPlayer.Character
+            local mh0 = me0 and me0:FindFirstChild("HumanoidRootPart")
+            if mh0 then pickCulprits(mh0) end
+        end
         wasParrying = parrying
         if csNow == "kicking" then kickAt = os.clock() end      -- last moment my kick was running
         local afterParry = os.clock() - parryAt <= 1.0
@@ -2043,7 +2074,7 @@ do
                         local mf = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z)
                         kickOK = mf.Magnitude > 0.01 and mf.Unit:Dot(toThem.Unit) >= 0.3
                     end
-                    local viaParry = afterParry and wasAttacker and fightingMe
+                    local viaParry = afterParry and parryCulprits[plr] == true and fightingMe
                     if trk and okT and pos < 0.6 and (viaParry or kickOK) then   -- a FRESH stun right after my parry / kick
                         parryAt, kickAt = -math.huge, -math.huge  -- count it once
                         if viaParry then cutParry() end
@@ -3399,7 +3430,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v64"
+hint.Text = "Ctrl+H = hide  |  v65"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3929,7 +3960,7 @@ do
             } },
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
-                "After a parry it only starts for someone who attacked you recently and is close to you. After a kick it starts for whoever you stunned if they are close and in front of you. Either way it will not drag you toward bystanders.",
+                "After a parry it only chases the player your parry was against: someone who was swinging or kicking AT you. Other people fighting near you never pull you in. After a kick it starts for whoever you stunned if they are close and in front of you. Either way it will not drag you toward bystanders.",
             } },
             { "Multi delay (ms)", {
                 "Range {{0}} to {{800}}, default {{230}}. Extra wait between multi cycles.",
