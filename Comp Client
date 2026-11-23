@@ -75,6 +75,7 @@ local settings = {
     multiDelay = 230,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows)
     jumpChase = false,     -- Parry chase: for VERY far evades, dash-snipe with a jump (click, W+E, Space)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
+    perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
     espTeamCheck = false,  -- ESP: ON = enemies only, OFF = show your team too
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
@@ -2755,6 +2756,194 @@ end))
 -- (v68: the "Anti-kick: pre-unblock" feature - letting go of block when someone DASHES at you, before any
 -- kick - was removed. A plain dash at you must never drop your block. Anti-kick still lets go of block
 -- the instant a real kick starts, including far dash-kicks.)
+
+------------------------------------------------------------------------
+-- PERFECT TRADE (v75): you're blocking, an opponent's swing LANDS on your block - and the moment it does,
+-- you let go of block and answer with ONE multi (W + A + E dash cancelled into a swing) straight at them,
+-- then your block goes back up if you're still holding it. That's a trade: you took their hit on your
+-- block and gave one back while they're still finishing their swing.
+--   "Their swing landed on your block" is read from YOUR side, two ways (whichever comes first):
+--     * your block-hit reaction animation starts (the game plays it on every blocked hit)
+--     * your "Block" value drops (the server lowers it on every blocked hit)
+--   The attacker = whoever close to you is mid-swing / just swung and is facing you.
+--   Kicks are left to Anti-kick. Whitelisted players / teammates (Parry lists) are never traded with.
+------------------------------------------------------------------------
+do
+    local RESP = {} -- the block-hit reaction animations (fixed for every form)
+    for _, id in ipairs({ 6312280575, 6312281206, 6312281779, 6312282511, 6669641262, 7101397703, 6736233297,
+        7101402353, 6861038808, 6861088961, 6860799757, 7101356513, 6753361279, 6860759883, 10443668308 }) do
+        RESP[tostring(id)] = true
+    end
+    local tradeBusy, lastTrade = false, 0
+    local blockSince, wasBlocking = math.huge, false
+    local lastBlockObj, lastBlockVal
+
+    local function flatV(v) return Vector3.new(v.X, 0, v.Z) end
+
+    local function pickAttacker(mh)
+        local best, bestScore
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LocalPlayer and not inWhitelist("parry", plr) and not (settings.parryTeamCheck and sameTeam(plr)) then
+                local ch = plr.Character
+                local h = ch and ch:FindFirstChild("HumanoidRootPart")
+                local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+                if h and hum and hum.Health > 0 then
+                    local toMe = flatV(mh.Position - h.Position)
+                    local d = toMe.Magnitude
+                    if d <= 16 then
+                        local swinging = findAttackTrack(ch) ~= nil
+                        local la = lastAtk[plr]
+                        local recent = la ~= nil and os.clock() - la < 0.7
+                        if swinging or recent then
+                            local lf = flatV(h.CFrame.LookVector)
+                            local face = (d > 0.01 and lf.Magnitude > 0.01) and lf.Unit:Dot(toMe.Unit) or 1
+                            if d <= 6 or face >= 0.2 then
+                                local score = d - (swinging and 5 or 0) - face * 3
+                                if not best or score < bestScore then best, bestScore = plr, score end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+
+    local function doTrade(plr)
+        if tradeBusy then return end
+        tradeBusy, lastTrade = true, os.clock()
+        task.spawn(function()
+            local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
+            local char = LocalPlayer.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local moveDir
+            local function aim()
+                local tc = plr.Character
+                local th = tc and tc:FindFirstChild("HumanoidRootPart")
+                local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not th or not mh then return nil end
+                local to = flatV(th.Position - mh.Position)
+                if to.Magnitude > 0.3 then moveDir = to.Unit end
+                return th, mh
+            end
+            local function faceThem()
+                if settings.hbe then return end
+                local th, mh = aim()
+                if th and mh then
+                    pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(th.Position.X, mh.Position.Y, th.Position.Z)) end)
+                end
+            end
+            local function unblock()
+                pcall(function() saberComp:ProcessInput(true, { name = "BLOCK", inputState = Enum.UserInputState.End }) end)
+            end
+            local function swing()
+                pcall(function() saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin }) end)
+            end
+            local okT, errT = pcall(function()
+                aim()
+                pcall(function()
+                    RunService:BindToRenderStep("ForceHBE_TradeMove", Enum.RenderPriority.Last.Value, function()
+                        if hum and moveDir then hum:Move(moveDir, false) end
+                    end)
+                end)
+                if haveKeys then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
+                -- 1) let go of block
+                unblock()
+                -- 2) the dash: asked for again every frame until the game takes it (W has to register first)
+                local force = 0
+                pcall(function() force = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
+                local dashed = false
+                if haveKeys and force >= 40 then
+                    local tD = os.clock()
+                    while os.clock() - tD < 0.25 do
+                        aim()
+                        local cs = combatStateNow()
+                        if cs == "blocking" then unblock() end
+                        local onCd = false
+                        pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
+                        if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) then
+                            faceThem()
+                            sendDashInput()
+                        end
+                        RunService.RenderStepped:Wait()
+                        if movementState() == "dashing" then dashed = true break end
+                    end
+                end
+                -- 3) ...cancelled into the swing (or a plain swing if a dash wasn't possible)
+                if dashed then
+                    pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
+                    RunService.RenderStepped:Wait()
+                    aim()
+                    pcall(function() rawget(saberComp, "_janitor"):Remove("DashCancelInputBegan") end)
+                end
+                local tC = os.clock()
+                while os.clock() - tC < 0.15 and combatStateNow() ~= "ignited" do
+                    if combatStateNow() == "blocking" then unblock() end
+                    RunService.RenderStepped:Wait()
+                end
+                faceThem()
+                local h = dashed and saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
+                if type(h) == "function" then pcall(h, true) else swing() end
+                local tE = os.clock()
+                while os.clock() - tE < 0.12 do aim() RunService.RenderStepped:Wait() end
+            end)
+            if not okT then warn("[ForceHBE] perfect trade error: " .. tostring(errT)) end
+            pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeMove") end)
+            if haveKeys then pcall(keyrelease, KEY_W); pcall(keyrelease, KEY_A) end
+            tradeBusy = false
+            reblockIfHeld() -- block back up (only if you're still holding it)
+        end)
+    end
+
+    local function tryTrade()
+        if not settings.perfectTrade or tradeBusy or counterBusy or chaseBusy then return end
+        if os.clock() - lastTrade < 0.45 then return end
+        if not wasBlocking or os.clock() - blockSince < 0.1 then return end -- (the block pose at block start isn't a hit)
+        local char = LocalPlayer.Character
+        local mh = char and char:FindFirstChild("HumanoidRootPart")
+        if not mh then return end
+        local plr = pickAttacker(mh)
+        if not plr then return end
+        local st = swingState[plr]
+        if st and st.isKick then return end -- kicks belong to Anti-kick
+        doTrade(plr)
+    end
+
+    -- trigger 1: my block-hit reaction animation starts
+    local function hookChar(char)
+        task.spawn(function()
+            local hum = char:WaitForChild("Humanoid", 10)
+            local animator = hum and hum:WaitForChild("Animator", 10)
+            if not animator then return end
+            track(animator.AnimationPlayed:Connect(function(t)
+                if not settings.perfectTrade then return end
+                local ok, id = pcall(function() return string.match(t.Animation.AnimationId, "%d+") end)
+                if ok and id and RESP[id] then tryTrade() end
+            end))
+        end)
+    end
+    if LocalPlayer.Character then hookChar(LocalPlayer.Character) end
+    track(LocalPlayer.CharacterAdded:Connect(hookChar))
+
+    -- trigger 2: my Block value drops; plus "how long have I been blocking"
+    track(RunService.Heartbeat:Connect(function()
+        if not settings.perfectTrade then wasBlocking = false return end
+        local blocking = combatStateNow() == "blocking"
+        if blocking and not wasBlocking then blockSince = os.clock() end
+        if not blocking then blockSince = math.huge end
+        wasBlocking = blocking
+        local char = LocalPlayer.Character
+        local bv = char and char:FindFirstChild("Block")
+        if bv and bv:IsA("NumberValue") then
+            local v = bv.Value
+            if bv == lastBlockObj and lastBlockVal and v < lastBlockVal and blocking then tryTrade() end
+            lastBlockObj, lastBlockVal = bv, v
+        else
+            lastBlockObj, lastBlockVal = nil, nil
+        end
+    end))
+end
+
 -- Auto Evade, EARLY trigger: hook the exact spot where the server's stun message arrives
 -- (Lightsaber:HandleSignal, request 15) and start the evade right there - before the game
 -- has even finished switching to its Stunned state - instead of waiting to notice the
@@ -3819,7 +4008,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v74"
+hint.Text = "Ctrl+H = hide  |  v75"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4254,6 +4443,8 @@ makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) setti
 makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(38, "Chase only (none = all)", "chase", "Pick")
+-- someone's swing lands on your block -> you multi them once right after (then block again if held)
+makeSwitch(39, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
 
 ------------------------------------------------------------------------
 -- GUIDE: a button at the very top of the feature list opens a separate window that explains
@@ -4377,6 +4568,11 @@ do
                 "It ignores kicks aimed at someone else (another player closer to the kicker and in front of them). Every time it lets go of block, F9 prints who triggered it and from how far.",
                 "The small status line under it shows whether it is ready.",
                 "Toggle it with its switch or with its key. The default key is {{Right Ctrl}}.",
+            } },
+            { "Perfect trade (block, then multi)", {
+                "While you block, the moment an opponent's swing LANDS on your block you let go and hit back with ONE multi (dash cancelled into a swing) straight at them. Then your block goes back up if you're still holding it. That's a trade.",
+                "It answers the attacker who is close, swinging (or just swung) and facing you. Kicks are left to Anti-kick. Players on the Parry whitelist (and teammates with Parry team check on) are never traded with.",
+                "Needs about 40 Force for the multi (Infinite Force covers it). Without it you get a plain swing.",
             } },
             { "Anti-kick key", {
                 "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
