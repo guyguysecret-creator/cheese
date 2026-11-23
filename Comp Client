@@ -2546,6 +2546,7 @@ local function startKickCounter(plr, kickTrk)
             local lastTPos, tVel, lastTime = nil, (plrVelFast[plr] or Vector3.zero), os.clock()
             local DASH_COST, MELEE = 32 + 8, (settings.hbe and 7 or 5)
             local dashFrames, cancelled, nextMultiAt = 0, false, 0
+            local dashAsked, dashAskAt = false, nil
             local function sendAttack()
                 pcall(function()
                     saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
@@ -2615,6 +2616,11 @@ local function startKickCounter(plr, kickTrk)
 
                 if ms == "dashing" then
                     dashFrames += 1
+                    if dashAsked and dashFrames == 1 then
+                        -- a multi dash really started: NOW the pacing gap begins
+                        dashAsked, dashAskAt = false, nil
+                        nextMultiAt = os.clock() + math.min(multiGap(0.18), 0.2)
+                    end
                     pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
                     -- the dash runs its full length toward the flank; once on them, it becomes a swing
                     if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE + 3 and canSwing then
@@ -2640,11 +2646,25 @@ local function startKickCounter(plr, kickTrk)
                         -- over and over, paced like the Parry chase but never slower than 0.2s (the kick
                         -- window is short). A plain swing is only used when a dash isn't possible right now
                         -- (dash cooldown / no Force).
-                        if dashReady and not onCd and groundedMS(ms) and force >= DASH_COST and remEff >= 0.12 then
-                            faceTarget()
-                            sendDashInput()
-                            nextMultiAt = os.clock() + math.min(multiGap(0.18), 0.2)
+                        -- (v72) WHY IT USED TO SWING: the game only allows a dash while W is really down, and
+                        -- W is pressed the very frame the counter starts - so the first dash was refused,
+                        -- the script then waited a whole multi gap, and by then the kick was nearly over ->
+                        -- plain swings. Now a refused dash is simply asked for again on the next frame, the
+                        -- gap only starts once the dash REALLY started, and a plain swing is used only
+                        -- when you don't have the Force for a dash at all.
+                        -- (safety: if the game keeps refusing the dash for 0.12s+, swing instead so the
+                        -- kick is still answered)
+                        local stuck = dashAsked and dashAskAt and os.clock() - dashAskAt > 0.12
+                        if force >= DASH_COST and haveKeys and not stuck then
+                            if dashReady and not onCd and groundedMS(ms) then
+                                faceTarget()
+                                sendDashInput()
+                                if not dashAsked then dashAskAt = os.clock() end
+                                dashAsked = true
+                            end
+                            nextMultiAt = os.clock()              -- retry next frame until the dash starts
                         elseif swingReady then
+                            dashAsked, dashAskAt = false, nil
                             faceTarget()
                             sendAttack()
                             nextMultiAt = os.clock() + math.min(multiGap(0.15), 0.2)
@@ -3765,7 +3785,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v71"
+hint.Text = "Ctrl+H = hide  |  v72"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
