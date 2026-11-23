@@ -2169,6 +2169,18 @@ local function startChase(plr) -- returns true if a chase started
         --     can only become a swing while the combat state is "ignited".)
         local dashFrames, cancelled = 0, false
         local nextMultiAt = 0 -- pacing: the multi never starts a new cycle before this time
+        -- (v69) 3 HITS PER STUN: the pause between cycles is shrunk so that what's left of their stun fits
+        -- 3 cycles in total. "Multi delay" can only make it slower when there is time to spare; it never
+        -- pushes you below 3 hits. The game's own minimum (0.15s swing / 0.18s dash) is the floor.
+        local hitsDone, WANT_HITS = 0, 3
+        local function chaseGap(base, remLeft)
+            hitsDone += 1
+            local normal = multiGap(base)
+            local left = WANT_HITS - hitsDone
+            if left <= 0 then return normal end
+            local budget = math.max(base, (remLeft - 0.12) / left)
+            return math.min(normal, budget)
+        end
         local t0 = os.clock()
         while os.clock() - t0 < 6 and settings.parryChase do
             local tc = plr.Character
@@ -2224,6 +2236,7 @@ local function startChase(plr) -- returns true if a chase started
                 elseif dist <= ARRIVED and not cancelled and dashFrames >= 2 and ready and canSwing then
                     -- this full dash has REACHED them: its last moment becomes the first swing
                     mode = "multi"
+                    hitsDone += 1                               -- the arrival swing is hit #1
                     cancelIntoSwing()
                 end
                 -- otherwise: keep dashing - the whole length - just steering toward them
@@ -2240,7 +2253,7 @@ local function startChase(plr) -- returns true if a chase started
                         mode = "multi"
                         faceTarget()
                         sendAttack()
-                        nextMultiAt = os.clock() + multiGap(0.15)
+                        nextMultiAt = os.clock() + chaseGap(0.15, remEff)
                     end
                 elseif dist > MELEE then
                     mode = "approach"
@@ -2259,12 +2272,12 @@ local function startChase(plr) -- returns true if a chase started
                         if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
                             faceTarget()
                             sendDashInput()                     -- E (W and A are held)
-                            nextMultiAt = os.clock() + multiGap(0.18)
+                            nextMultiAt = os.clock() + chaseGap(0.18, remEff)
                         elseif cs == "ignited" then
                             -- dash still cooling down (or no force): keep hitting with plain swings
                             faceTarget()
                             sendAttack()
-                            nextMultiAt = os.clock() + multiGap(0.15)
+                            nextMultiAt = os.clock() + chaseGap(0.15, remEff)
                         end
                     end
                 end
@@ -3689,7 +3702,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v68"
+hint.Text = "Ctrl+H = hide  |  v69"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
