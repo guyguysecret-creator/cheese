@@ -2367,14 +2367,15 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
     if not name then return end
     -- the game "processes" its own left/right-click controls, so mouse binds can't wait for an
     -- unprocessed click; instead ignore clicks that land on this menu
-    local f = KB.guiFrame
-    if f and f.Visible then
-        local ok, inside = pcall(function()
-            local m = UserInputService:GetMouseLocation() - game:GetService("GuiService"):GetGuiInset()
-            local ap, as = f.AbsolutePosition, f.AbsoluteSize
-            return m.X >= ap.X and m.X <= ap.X + as.X and m.Y >= ap.Y and m.Y <= ap.Y + as.Y
-        end)
-        if ok and inside then return end
+    for _, f in ipairs({ KB.guiFrame, KB.guideFrame }) do
+        if f and f.Visible then
+            local ok, inside = pcall(function()
+                local m = UserInputService:GetMouseLocation() - game:GetService("GuiService"):GetGuiInset()
+                local ap, as = f.AbsolutePosition, f.AbsoluteSize
+                return m.X >= ap.X and m.X <= ap.X + as.X and m.Y >= ap.Y and m.Y <= ap.Y + as.Y
+            end)
+            if ok and inside then return end
+        end
     end
     KB.fire(name)
 end))
@@ -3322,7 +3323,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v60"
+hint.Text = "Ctrl+H = hide  |  v61"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -3748,6 +3749,400 @@ makeSwitch(36, "Jump chase (far evades)", settings.jumpChase, function(on) setti
 makeSwitch(37, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end)
 
 ------------------------------------------------------------------------
+-- GUIDE: a button at the very top of the feature list opens a separate window that explains
+-- every feature and its values. Drag the title bar to move it; drag any edge or corner to
+-- resize it (they glow green when you hover them).
+------------------------------------------------------------------------
+do
+    local SECTIONS = {
+        { "GETTING STARTED", {
+            { "Using this window", {
+                "Drag the title bar to move this window.",
+                "Drag any edge or corner to make it bigger or smaller. They glow green when you hover them.",
+                "Scroll with the mouse wheel. The X (or the Guide button) closes it.",
+            } },
+            { "The basics", {
+                "Click a switch to turn a feature ON or OFF (green = ON).",
+                "Type a number into a box and press Enter (or click away) to set it.",
+                "Mouse wheel scrolls the main menu. {{Ctrl+H}} hides or shows the menu and this guide. Features keep running while hidden.",
+                "Running the script again replaces the old copy, so you never get doubles.",
+            } },
+            { "Before you start", {
+                "Equip and ignite your lightsaber. Auto Parry, Stun evade, Parry chase, Anti-kick and the Infinite Parry/Kicks all find your saber by themselves. If one does nothing, unequip and re-equip it and wait a couple of seconds.",
+                "Turn on **Infinite Force** if you use Stun evade or Parry chase, because their dashes cost Force.",
+                "Press {{F9}} to open the Roblox console. The script prints what it found and what is still ON there.",
+            } },
+            { "What it can and can not do", {
+                "Everything here works on YOUR screen and with YOUR inputs. The server still decides damage, stuns, and whether a parry or kick lands, so nothing is a guarantee.",
+                "High ping makes timing harder. See the high ping tips at the bottom.",
+            } },
+        } },
+        { "RESOURCES", {
+            { "Infinite Force", {
+                "Your Force bar stops draining, so dashes, flips and Force powers are always available.",
+                "Recommended whenever Stun evade or Parry chase is on.",
+            } },
+            { "Infinite Block", {
+                "Your block can not be broken, so you do not get the block-break stun.",
+            } },
+            { "Infinite Parry", {
+                "Keeps your parry charges full. The normal parry cooldown still applies.",
+            } },
+            { "Infinite Kicks", {
+                "Keeps your kick charges full. The normal kick cooldown still applies.",
+            } },
+        } },
+        { "COMBAT", {
+            { "Auto Parry", {
+                "Watches enemy attack animations near you and clicks your parry at the right moment (swings, dash attacks and kicks).",
+                "Needs your saber equipped and ignited. Turn it on and check {{F9}} after 2 seconds: it says whether your saber and the click function were found.",
+                "The next boxes below it tune how it behaves.",
+            } },
+            { "Parry timing (ms)", {
+                "Range {{-500}} to {{500}}. It starts at a value chosen from YOUR ping when you ran the script (about -60 minus a quarter of your ping).",
+                "Parried too EARLY (your parry ended before the hit): raise the number, for example from -90 to -70.",
+                "Parried too LATE (you got hit first): lower the number, for example from -70 to -90.",
+                "Change it in steps of 10 to 20 and test again.",
+            } },
+            { "Parry follows ping", {
+                "ON (recommended): the timing follows your live ping, so ping spikes and drops are handled for you. Your Parry timing value is added on top.",
+                "OFF: only your fixed Parry timing is used.",
+            } },
+            { "Parry strictness (0-100)", {
+                "Default {{60}}. How picky Auto Parry is about what counts as a real hit.",
+                "Lower = parries more, but you may waste parries on near misses. Higher = only clear hits get parried.",
+                "Wasting parries? Try 70 to 80. Getting hit through it? Try 40 to 50.",
+            } },
+            { "Parry team check / Parry whitelist", {
+                "Team check ON: Auto Parry never reacts to your teammates.",
+                "Whitelist: click it, search a name and tick it. Ticked players are ignored by Auto Parry (friends, a sparring partner).",
+            } },
+            { "Dash guard (high ping)", {
+                "Also reacts early when an enemy force-dashes straight at you. Helps against dash-kicks and dash attacks when your ping is high.",
+                "It can spend a parry on a plain dash, so leave it OFF on low ping.",
+            } },
+            { "Stun evade", {
+                "The moment you get stunned, the script holds S and dashes away (diagonally if your attacker is facing you), zig-zagging so you are hard to follow.",
+                "Needs about 32 Force (Infinite Force covers it). A dash is capped at about 30 studs, and the game does not allow a second dash or a jump during a stun.",
+            } },
+            { "Evade zig-zag (deg)", {
+                "Range {{0}} to {{80}}, default {{50}}. How wide the zig-zag swings.",
+                "Lower = straighter, so you end up FARTHER away. Higher = harder to chase but you travel less distance.",
+            } },
+            { "Parry chase (multi)", {
+                "After you parry and stun an enemy who was fighting you, you dash to them and multi (W, E, swing) until their stun is about to end. The camera locks onto them and eases back afterwards.",
+                "It only starts for someone who attacked you recently and is close to you, so it will not drag you toward bystanders.",
+            } },
+            { "Multi delay (ms)", {
+                "Range {{0}} to {{800}}, default {{230}}. Extra wait between multi cycles.",
+                "0 = as fast as the game allows. Raise it if swings get eaten or feel out of sync, especially on high ping.",
+            } },
+            { "Jump chase (far evades)", {
+                "For enemies that evaded very far: click, W+E, then Space (a dash snipe with a jump) and multi when you land.",
+            } },
+            { "Chase: unblock to start", {
+                "OFF: the chase starts right away, even while you hold block.",
+                "ON: it only starts once you let go of block.",
+            } },
+            { "Anti-kick (counter)", {
+                "Ignores the kick stun on your screen and counters the kicker: it lets go of block, moves to their side and multis. The small status line under it shows whether it is ready.",
+                "Toggle it with its switch or with its key. The default key is {{Right Ctrl}}.",
+            } },
+            { "Anti-kick key", {
+                "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
+                "{{Esc}} cancels, {{Backspace}} or {{Delete}} clears it to None. Mouse side buttons (MB4 and MB5) only work if your executor supports iskeypressed.",
+                "Clicks on the menu or this guide never trigger a bind.",
+            } },
+            { "Anti-kick: pre-unblock (far dash)", {
+                "Also lets go of block the moment someone dashes at you from far away. Meant for high ping against dash-snipe kicks. Leave OFF otherwise.",
+            } },
+        } },
+        { "HITBOX EXPANDER", {
+            { "Hitbox Expander", {
+                "Makes other players' hitboxes bigger on your side, so your swings connect more easily.",
+            } },
+            { "Hitbox size", {
+                "Range {{2}} to {{50}} studs, default {{12}}. Bigger = easier hits, but looks odd and is easier to notice.",
+            } },
+            { "Transparency (0-1)", {
+                "{{0}} = solid box (easiest to see), {{1}} = invisible. Default {{0.7}}.",
+            } },
+            { "HBE team check / HBE whitelist", {
+                "Team check ON: teammates are not expanded.",
+                "Whitelist: ticked players are not expanded.",
+            } },
+        } },
+        { "VISUALS", {
+            { "ESP (through walls)", {
+                "Master switch. Shows other players through walls on your screen only.",
+            } },
+            { "ESP outline / ESP bars + info", {
+                "Outline: the through-walls glow around players (only the nearest 25 get one).",
+                "Bars + info: name, distance, health %, STUN time left, and estimated kick and parry cooldowns. The cooldowns and parry results are estimates.",
+            } },
+            { "ESP team check / ESP whitelist", {
+                "Team check ON: enemies only. OFF: your team is shown too.",
+                "Whitelist: ticked players are hidden from ESP.",
+            } },
+        } },
+        { "TIPS AND FIXES", {
+            { "A feature does nothing", {
+                "Equip and ignite your saber, wait 2 seconds, then check {{F9}} for what was found.",
+            } },
+            { "Auto Parry parries wrong", {
+                "Too early or too late: change Parry timing. Parrying at nothing: raise Parry strictness. Missing real hits: lower it.",
+            } },
+            { "High ping (150 ms and up)", {
+                "Keep Parry follows ping ON. Try Dash guard and Anti-kick pre-unblock. Raise Multi delay a little if your multi gets eaten.",
+                "Kick timing gets marginal around 250 ms and above.",
+            } },
+            { "Whitelists and teams", {
+                "Each feature has its own whitelist (Parry, HBE, ESP), so ticking someone in one does not affect the others.",
+            } },
+        } },
+    }
+
+    local MINW, MINH = 300, 200
+    local guide = Instance.new("Frame")
+    guide.Name = "Guide"
+    guide.BackgroundColor3 = COLORS.bg
+    guide.BorderSizePixel = 0
+    guide.Active = true
+    guide.Visible = false
+    guide.ZIndex = 5
+    guide.Parent = gui
+    Instance.new("UICorner", guide).CornerRadius = UDim.new(0, 8)
+    local gstroke = Instance.new("UIStroke")
+    gstroke.Color = COLORS.off
+    gstroke.Thickness = 1
+    gstroke.Parent = guide
+    KB.guideFrame = guide
+
+    -- title bar (drag to move)
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(1, 0, 0, 30)
+    bar.BackgroundColor3 = COLORS.panel
+    bar.BorderSizePixel = 0
+    bar.Active = true
+    bar.Parent = guide
+    Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
+    local barFix = Instance.new("Frame")
+    barFix.Size = UDim2.new(1, 0, 0, 8)
+    barFix.Position = UDim2.new(0, 0, 1, -8)
+    barFix.BackgroundColor3 = COLORS.panel
+    barFix.BorderSizePixel = 0
+    barFix.Parent = bar
+    local gtitle = Instance.new("TextLabel")
+    gtitle.Size = UDim2.new(1, -60, 1, 0)
+    gtitle.Position = UDim2.fromOffset(12, 0)
+    gtitle.BackgroundTransparency = 1
+    gtitle.Font = Enum.Font.GothamBold
+    gtitle.TextSize = 13
+    gtitle.TextXAlignment = Enum.TextXAlignment.Left
+    gtitle.TextColor3 = COLORS.text
+    gtitle.Text = "Comp Client - Guide"
+    gtitle.Parent = bar
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.fromOffset(24, 22)
+    closeBtn.Position = UDim2.new(1, -40, 0, 4)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(150, 60, 60)
+    closeBtn.BorderSizePixel = 0
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 12
+    closeBtn.TextColor3 = Color3.new(1, 1, 1)
+    closeBtn.Text = "X"
+    closeBtn.Parent = bar
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+    -- scrolling text area
+    local body = Instance.new("ScrollingFrame")
+    body.Position = UDim2.fromOffset(0, 30)
+    body.Size = UDim2.new(1, 0, 1, -30)
+    body.BackgroundTransparency = 1
+    body.BorderSizePixel = 0
+    body.ScrollBarThickness = 6
+    body.ScrollBarImageColor3 = COLORS.sub
+    body.ScrollingDirection = Enum.ScrollingDirection.Y
+    body.CanvasSize = UDim2.new(0, 0, 0, 0)
+    body.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    body.Parent = guide
+    do
+        local lay = Instance.new("UIListLayout")
+        lay.SortOrder = Enum.SortOrder.LayoutOrder
+        lay.Padding = UDim.new(0, 6)
+        lay.HorizontalAlignment = Enum.HorizontalAlignment.Center
+        lay.Parent = body
+        local pad = Instance.new("UIPadding")
+        pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 16)
+        pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 10), UDim.new(0, 14)
+        pad.Parent = body
+    end
+
+    local function fmt(s)
+        s = s:gsub("%*%*(.-)%*%*", "<b>%1</b>")
+        s = s:gsub("{{(.-)}}", '<font color="#f2c46d">%1</font>')
+        return s
+    end
+    local order = 0
+    for _, sec in ipairs(SECTIONS) do
+        order = order + 1
+        local h = Instance.new("TextLabel")
+        h.Size = UDim2.new(1, 0, 0, 24)
+        h.LayoutOrder = order
+        h.BackgroundTransparency = 1
+        h.Font = Enum.Font.GothamBold
+        h.TextSize = 14
+        h.TextColor3 = COLORS.on
+        h.TextXAlignment = Enum.TextXAlignment.Left
+        h.Text = sec[1]
+        h.Parent = body
+        local ln = Instance.new("Frame")
+        ln.Size = UDim2.new(1, 0, 0, 1)
+        ln.Position = UDim2.new(0, 0, 1, -1)
+        ln.BackgroundColor3 = COLORS.off
+        ln.BorderSizePixel = 0
+        ln.Parent = h
+        for _, item in ipairs(sec[2]) do
+            order = order + 1
+            local lines = {}
+            for i, l in ipairs(item[2]) do lines[i] = "- " .. l end
+            local card = Instance.new("TextLabel")
+            card.Size = UDim2.new(1, 0, 0, 0)
+            card.AutomaticSize = Enum.AutomaticSize.Y
+            card.LayoutOrder = order
+            card.BackgroundColor3 = COLORS.panel
+            card.BorderSizePixel = 0
+            card.Font = Enum.Font.Gotham
+            card.TextSize = 12
+            card.TextColor3 = COLORS.text
+            card.TextWrapped = true
+            card.RichText = true
+            card.LineHeight = 1.15
+            card.TextXAlignment = Enum.TextXAlignment.Left
+            card.TextYAlignment = Enum.TextYAlignment.Top
+            card.Text = '<b><font color="#6fd08a">' .. item[1] .. "</font></b>\n" .. fmt(table.concat(lines, "\n"))
+            card.Parent = body
+            Instance.new("UICorner", card).CornerRadius = UDim.new(0, 6)
+            local p = Instance.new("UIPadding")
+            p.PaddingTop, p.PaddingBottom = UDim.new(0, 7), UDim.new(0, 7)
+            p.PaddingLeft, p.PaddingRight = UDim.new(0, 9), UDim.new(0, 9)
+            p.Parent = card
+        end
+    end
+
+    -- move / resize
+    local gx, gy, gw, gh = 0, 0, 540, 420
+    local drag
+    local function viewport()
+        local cam = workspace.CurrentCamera
+        return cam and cam.ViewportSize or Vector2.new(1280, 720)
+    end
+    local function apply()
+        guide.Position = UDim2.fromOffset(gx, gy)
+        guide.Size = UDim2.fromOffset(gw, gh)
+    end
+    local function isPress(input)
+        return input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch
+    end
+    local function beginDrag(input, mode, l, r, t, b, handle)
+        if not isPress(input) then return end
+        drag = { mode = mode, l = l, r = r, t = t, b = b, hnd = handle,
+            mx = input.Position.X, my = input.Position.Y, x = gx, y = gy, w = gw, h = gh }
+    end
+    bar.InputBegan:Connect(function(input) beginDrag(input, "move") end)
+
+    -- the eight grab areas: 4 sides + 4 corners (invisible until hovered)
+    local HANDLES = {
+        { UDim2.new(0, -3, 0, 14), UDim2.new(0, 7, 1, -28), true, false, false, false },   -- left
+        { UDim2.new(1, -4, 0, 14), UDim2.new(0, 7, 1, -28), false, true, false, false },   -- right
+        { UDim2.new(0, 14, 0, -3), UDim2.new(1, -28, 0, 7), false, false, true, false },   -- top
+        { UDim2.new(0, 14, 1, -4), UDim2.new(1, -28, 0, 7), false, false, false, true },   -- bottom
+        { UDim2.new(0, -3, 0, -3), UDim2.fromOffset(16, 16), true, false, true, false },   -- top-left
+        { UDim2.new(1, -13, 0, -3), UDim2.fromOffset(16, 16), false, true, true, false },  -- top-right
+        { UDim2.new(0, -3, 1, -13), UDim2.fromOffset(16, 16), true, false, false, true },  -- bottom-left
+        { UDim2.new(1, -13, 1, -13), UDim2.fromOffset(16, 16), false, true, false, true }, -- bottom-right
+    }
+    for _, d in ipairs(HANDLES) do
+        local hnd = Instance.new("Frame")
+        hnd.Position, hnd.Size = d[1], d[2]
+        hnd.BackgroundColor3 = COLORS.on
+        hnd.BackgroundTransparency = 1
+        hnd.BorderSizePixel = 0
+        hnd.Active = true
+        hnd.ZIndex = 10
+        hnd.Parent = guide
+        Instance.new("UICorner", hnd).CornerRadius = UDim.new(0, 4)
+        hnd.MouseEnter:Connect(function() hnd.BackgroundTransparency = 0.55 end)
+        hnd.MouseLeave:Connect(function()
+            if not (drag and drag.hnd == hnd) then hnd.BackgroundTransparency = 1 end
+        end)
+        hnd.InputBegan:Connect(function(input) beginDrag(input, "resize", d[3], d[4], d[5], d[6], hnd) end)
+    end
+
+    track(UserInputService.InputChanged:Connect(function(input)
+        if not drag then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        local dx, dy = input.Position.X - drag.mx, input.Position.Y - drag.my
+        local v = viewport()
+        if drag.mode == "move" then
+            gx = math.clamp(drag.x + dx, 80 - gw, v.X - 80)
+            gy = math.clamp(drag.y + dy, 0, v.Y - 40)
+        else
+            local nw, nh = drag.w, drag.h
+            if drag.r then nw = drag.w + dx elseif drag.l then nw = drag.w - dx end
+            if drag.b then nh = drag.h + dy elseif drag.t then nh = drag.h - dy end
+            nw = math.clamp(nw, MINW, math.max(MINW, v.X - 8))
+            nh = math.clamp(nh, MINH, math.max(MINH, v.Y - 8))
+            gw, gh = nw, nh
+            if drag.l then gx = drag.x + (drag.w - nw) end
+            if drag.t then gy = drag.y + (drag.h - nh) end
+        end
+        apply()
+    end))
+    track(UserInputService.InputEnded:Connect(function(input)
+        if drag and isPress(input) then
+            if drag.hnd then drag.hnd.BackgroundTransparency = 1 end
+            drag = nil
+        end
+    end))
+
+    -- the button at the top of the feature list
+    local gb = Instance.new("TextButton")
+    gb.Size = UDim2.new(1, -16, 0, 28)
+    gb.LayoutOrder = 1
+    gb.BackgroundColor3 = COLORS.on
+    gb.BorderSizePixel = 0
+    gb.Font = Enum.Font.GothamBold
+    gb.TextSize = 12
+    gb.TextColor3 = Color3.new(1, 1, 1)
+    gb.AutoButtonColor = true
+    gb.Parent = content
+    Instance.new("UICorner", gb).CornerRadius = UDim.new(0, 6)
+
+    local placed = false
+    local function setOpen(on)
+        if on and not placed then
+            placed = true
+            local v = viewport()
+            gw = math.min(560, math.max(MINW, v.X - 40))
+            gh = math.min(440, math.max(MINH, v.Y - 80))
+            gx = math.floor((v.X - gw) / 2)
+            gy = math.floor((v.Y - gh) / 2)
+            apply()
+        end
+        guide.Visible = on
+        gb.Text = on and "CLOSE GUIDE" or "GUIDE - how everything works"
+    end
+    setOpen(false)
+    -- keeps the button label right when Ctrl+H hides the guide along with the menu
+    guide:GetPropertyChangedSignal("Visible"):Connect(function()
+        gb.Text = guide.Visible and "CLOSE GUIDE" or "GUIDE - how everything works"
+    end)
+    gb.MouseButton1Click:Connect(function() setOpen(not guide.Visible) end)
+    closeBtn.MouseButton1Click:Connect(function() setOpen(false) end)
+end
+
+------------------------------------------------------------------------
 -- Password lock. The panel shows only this screen until the right password is
 -- typed. Only a hash is stored here, not the password itself.
 -- NOTE: this keeps casual users out of the menu; it isn't real security (anyone
@@ -3872,6 +4267,7 @@ track(UserInputService.InputBegan:Connect(function(input, processed)
     if processed or input.KeyCode ~= Enum.KeyCode.H then return end
     if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) or UserInputService:IsKeyDown(Enum.KeyCode.RightControl) then
         frame.Visible = not frame.Visible
+        if not frame.Visible and KB.guideFrame then KB.guideFrame.Visible = false end -- nothing left on screen
         if frame.Visible then
             log("menu shown")
         else
