@@ -76,6 +76,7 @@ local settings = {
     jumpChase = false,     -- Parry chase: for VERY far evades, dash-snipe with a jump (click, W+E, Space)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
+    tradeAccuracy = 100,   -- %: 100 = perfect (every hit, instant, always a multi); lower = NATURAL (human-like)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
     parryChaseKey = "None", -- key that toggles Parry chase (set it in the panel)
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
@@ -2984,10 +2985,25 @@ do
         return best
     end
 
-    local function doTrade(plr)
+    -- delay = human reaction wait before starting (natural), plain = answer with a plain swing (no dash)
+    local function doTrade(plr, delay, plain)
         if tradeBusy then return end
         tradeBusy, lastTrade = true, os.clock()
         task.spawn(function()
+            if delay and delay > 0 then
+                task.wait(delay)
+                -- still worth it after "reacting"? you're still blocking and they're still close and alive
+                local tc = plr.Character
+                local th = tc and tc:FindFirstChild("HumanoidRootPart")
+                local thum = tc and tc:FindFirstChildOfClass("Humanoid")
+                local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+                if not settings.perfectTrade or counterBusy or chaseBusy or combatStateNow() ~= "blocking" or not th or not mh
+                    or not thum or thum.Health <= 0 or flatV(th.Position - mh.Position).Magnitude > 16 then
+                    tradeBusy = false
+                    return
+                end
+            end
+            local natural = (settings.tradeAccuracy or 100) < 100
             local haveKeys = type(keypress) == "function" and type(keyrelease) == "function"
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -3005,6 +3021,12 @@ do
                 if settings.hbe then return end
                 local th, mh = aim()
                 if th and mh then
+                    -- natural: no instant snap-turn unless they're well off to the side (you turn by moving)
+                    if natural then
+                        local to = flatV(th.Position - mh.Position)
+                        local lf = flatV(mh.CFrame.LookVector)
+                        if to.Magnitude > 0.1 and lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end
+                    end
                     pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(th.Position.X, mh.Position.Y, th.Position.Z)) end)
                 end
             end
@@ -3021,17 +3043,17 @@ do
                         if hum and moveDir then hum:Move(moveDir, false) end
                     end)
                 end)
-                if haveKeys then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
+                if haveKeys and not plain then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
                 -- 1) let go of block
                 unblock()
                 -- (v76) the dash needs W to really be down; the OS key press usually lands by the next
                 -- frame, so wait exactly that one frame instead of burning a refused dash first
-                if haveKeys and not UserInputService:IsKeyDown(Enum.KeyCode.W) then RunService.RenderStepped:Wait() end
+                if haveKeys and not plain and not UserInputService:IsKeyDown(Enum.KeyCode.W) then RunService.RenderStepped:Wait() end
                 -- 2) the dash: asked for again every frame until the game takes it (W has to register first)
                 local force = 0
                 pcall(function() force = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
                 local dashed = false
-                if haveKeys and force >= 40 then
+                if haveKeys and force >= 40 and not plain then
                     local tD = os.clock()
                     while os.clock() - tD < 0.25 do
                         aim()
@@ -3087,8 +3109,36 @@ do
         if not plr then return end
         local st = swingState[plr]
         if st and st.isKick then return end -- kicks belong to Anti-kick
-        doTrade(plr)
+        local acc = math.clamp(settings.tradeAccuracy or 100, 0, 100)
+        if acc >= 100 then
+            doTrade(plr, 0, false) -- PERFECT: every hit, instantly, always a multi (the original behaviour)
+            return
+        end
+        -- (v87) NATURAL (accuracy below 100): plays like a person. Everything follows the one number:
+        --   * Trade accuracy % of blocked hits get traded (the rest you "just keep blocking")
+        --   * after 2 trades in a row the next one is 4x less likely (no endless robotic streaks)
+        --   * a random human reaction first: ~60 ms at 100, slower the lower it goes (+-40% each time),
+        --     and after it we re-check you're still blocking and they're still there
+        --   * some trades are a plain swing instead of a multi: half of (100 - accuracy) %
+        --   * no instant snap-turn toward them (see faceThem)
+        -- one decision per blocked hit: each hit fires two triggers and the 2nd must not re-roll
+        local now = os.clock()
+        if now - AP.tradeDecideT < 0.12 then return end
+        AP.tradeDecideT = now
+        if now - lastTrade > 2.5 then AP.tradeStreak = 0 end -- a long pause = a new exchange
+        local chance = acc / 100
+        if AP.tradeStreak >= 2 then chance = chance * 0.25 end
+        if math.random() > chance then
+            AP.tradeStreak = 0
+            return
+        end
+        AP.tradeStreak += 1
+        local react = (60 + (100 - acc) * 1.5) / 1000
+        local delay = react * (0.6 + math.random() * 0.8)
+        local plain = math.random() * 100 < (100 - acc) * 0.5
+        doTrade(plr, delay, plain)
     end
+    AP.tradeDecideT, AP.tradeStreak = 0, 0
 
     -- trigger 1: my block-hit reaction animation starts
     local function hookChar(char)
@@ -4266,7 +4316,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v86"
+hint.Text = "Ctrl+H = hide  |  v87"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4632,12 +4682,12 @@ function KB.makeRow(order, labelText, settingKey)
         end)
     end)
 end
-KB.makeRow(24, "Anti-kick key", "antiKickKey")
+KB.makeRow(23, "Anti-kick key", "antiKickKey")
 do
     -- tells you whether the hooks are really in place (so you're not guessing)
     local st = Instance.new("TextLabel")
     st.Size = UDim2.new(1, -16, 0, 14)
-    st.LayoutOrder = 25
+    st.LayoutOrder = 24
     st.BackgroundTransparency = 1
     st.Font = Enum.Font.Gotham
     st.TextSize = 10
@@ -4710,7 +4760,9 @@ makeSwitch(43, "Chase: unblock to start", settings.chaseUnblock, function(on) se
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(44, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
-makeSwitch(26, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
+makeSwitch(25, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
+-- 100 = perfect (every hit, instant, always a multi); lower = natural / human-like (see the Guide)
+makeNumberBox(26, "Trade accuracy (%)", "tradeAccuracy", 0, 100)
 -- ON = Parry chase never goes after your own team (e.g. other Jedi when you're a Jedi)
 makeSwitch(45, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
 
@@ -4845,6 +4897,11 @@ do
                 "While you block, the moment an opponent's swing LANDS on your block you let go and hit back with ONE multi (dash cancelled into a swing) straight at them. Then your block goes back up if you're still holding it. That's a trade.",
                 "It answers the attacker who is close, swinging (or just swung) and facing you. Kicks are left to Anti-kick. If anyone is ticked in Parry only, it only trades with those players (and never with teammates when Parry team check is on).",
                 "Needs about 40 Force for the multi (Infinite Force covers it). Without it you get a plain swing.",
+            } },
+            { "Trade accuracy (%)", {
+                "Default {{100}} = PERFECT: every hit on your block is traded, instantly, always with a multi (the way it has always worked).",
+                "Below 100 = NATURAL, so it looks like a person. Only that % of hits get traded (the rest you just keep blocking). After 2 trades in a row the next is much less likely. There is a random human reaction first (about 60 ms at 100, slower the lower you go), and it re-checks after it that you're still blocking and they're still there. Some trades are a plain swing instead of a multi (half of 100 minus the accuracy, e.g. 20% at 60), and there's no instant snap-turn toward them.",
+                "Try {{65}} to {{80}} for natural-looking trades.",
             } },
             { "Anti-kick key", {
                 "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
