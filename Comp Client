@@ -1917,11 +1917,14 @@ local function doEvade()
         local prevCamType
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
         if cam then
+            -- (v78) turn the camera ONCE to face the escape direction - WITHOUT taking it over. It used to be
+            -- switched to Scriptable and frozen for the whole evade, so as you dashed away your view stayed
+            -- behind ("stuck far away"), and if anything went wrong it never came back.
             pcall(function()
-                prevCamType = cam.CameraType
-                cam.CameraType = Enum.CameraType.Scriptable
-                local eye = hrp.Position - faceDir * 10 + Vector3.new(0, 4, 0)
-                cam.CFrame = CFrame.lookAt(eye, hrp.Position + faceDir * 20)
+                if cam.CameraType == Enum.CameraType.Custom then
+                    local eye = hrp.Position - faceDir * 10 + Vector3.new(0, 4, 0)
+                    cam.CFrame = CFrame.lookAt(eye, hrp.Position + faceDir * 20)
+                end
             end)
         end
 
@@ -2020,6 +2023,44 @@ local function cutParry()
     end)
 end
 
+------------------------------------------------------------------------
+-- CAMERA SAFETY (v78). Only the Parry chase lock-on ever takes the camera over now. Handing it back
+-- ALWAYS gives you the normal game camera (Custom, following your own character) - never a "saved"
+-- type that could itself be a stuck Scriptable camera. And a watchdog: if the script was the last to
+-- take the camera and nothing of ours is using it any more, it is handed back within a quarter second.
+------------------------------------------------------------------------
+AP.camOwners = {}
+AP.camTouchedAt = -math.huge
+function AP.releaseCam(owner, want)
+    AP.camOwners[owner] = nil
+    if next(AP.camOwners) then return end -- someone else of ours still has it
+    pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseCam") end)
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        if cam.CameraType == Enum.CameraType.Scriptable then
+            cam.CameraType = (want and want ~= Enum.CameraType.Scriptable) and want or Enum.CameraType.Custom
+        end
+        local hum = LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+        if hum and cam.CameraSubject ~= hum then cam.CameraSubject = hum end
+    end)
+end
+do
+    local acc = 0
+    track(RunService.Heartbeat:Connect(function(dt)
+        acc = acc + dt
+        if acc < 0.25 then return end
+        acc = 0
+        if next(AP.camOwners) then return end
+        if os.clock() - AP.camTouchedAt > 30 then return end -- not ours (game menus etc. are left alone)
+        local cam = workspace.CurrentCamera
+        if cam and cam.CameraType == Enum.CameraType.Scriptable then
+            AP.releaseCam("watchdog")
+            log("camera was left stuck - handed back to you")
+        end
+    end))
+end
+
 local chaseBusy = false
 local function startChase(plr) -- returns true if a chase started
     if chaseBusy then return false end
@@ -2089,12 +2130,14 @@ local function startChase(plr) -- returns true if a chase started
                     cam.CFrame = cam.CFrame:Lerp(CFrame.lookAt(pos, pos + camStartLook), 0.3)
                     RunService.RenderStepped:Wait()
                 end
-                cam.CameraType = want
             end)
+            AP.releaseCam("chase", want)
         end
-        if settings.chaseCam and cam then
+        if settings.chaseCam and cam and cam.CameraType == Enum.CameraType.Custom then
             pcall(function()
                 prevCamType = cam.CameraType
+                AP.camOwners.chase = true
+                AP.camTouchedAt = os.clock()
                 camStartLook = cam.CFrame.LookVector
                 cam.CameraType = Enum.CameraType.Scriptable
                 RunService:BindToRenderStep("ForceHBE_ChaseCam", Enum.RenderPriority.Camera.Value + 1, function()
@@ -2396,10 +2439,7 @@ local function startChase(plr) -- returns true if a chase started
             pcall(keyrelease, KEY_W)
             pcall(keyrelease, KEY_A)
         end
-        pcall(function()
-            local c = workspace.CurrentCamera
-            if c and c.CameraType == Enum.CameraType.Scriptable then c.CameraType = Enum.CameraType.Custom end
-        end)
+        AP.releaseCam("chase")
         chaseBusy = false
         reblockIfHeld()
       end
@@ -4014,7 +4054,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v77"
+hint.Text = "Ctrl+H = hide  |  v78"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5371,6 +5411,11 @@ local function cleanup()
     settings.esp = false
     if espClear then espClear() end
     setHBE(false)
+    -- never leave the camera taken over when the script is stopped / re-run
+    pcall(function()
+        for k in pairs(AP.camOwners) do AP.camOwners[k] = nil end
+        if os.clock() - AP.camTouchedAt < 30 then AP.releaseCam("cleanup") end
+    end)
     for _, c in ipairs(connections) do
         if type(c) == "thread" then
             pcall(task.cancel, c)
