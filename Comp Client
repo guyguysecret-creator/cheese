@@ -2182,12 +2182,13 @@ local function startChase(plr) -- returns true if a chase started
             return math.min(normal, budget)
         end
         local t0 = os.clock()
+        local stunOver = false
         while os.clock() - t0 < 6 and settings.parryChase do
             local tc = plr.Character
             local thum = tc and tc:FindFirstChildOfClass("Humanoid")
             if not tc or not thum or thum.Health <= 0 then break end
             local stunTrk = findStunTrack(tc)
-            if not stunTrk then break end                      -- their stun ended: STOP at once
+            if not stunTrk then stunOver = true break end      -- their stun ended: stop (then one bonus multi)
             -- TIME LEFT IN THEIR STUN - the same number the ESP shows: their stun animation is played
             -- so that its length equals the stun length, so what's left of the animation is what's
             -- left of the stun. We see it one ping late (they're already further along), so ping is
@@ -2198,7 +2199,7 @@ local function startChase(plr) -- returns true if a chase started
                 return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
             end)
             if okR and type(rem) == "number" then remEff = rem - pingEma end
-            if remEff <= 0.05 then break end                   -- their stun is over (or about to be): STOP
+            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop (then one bonus multi)
             -- a new dash needs ~0.3s to land, a cancel-into-swing ~0.12s: don't START what can't land
             local canDash = remEff >= 0.3
             local canSwing = remEff >= 0.12
@@ -2283,6 +2284,47 @@ local function startChase(plr) -- returns true if a chase started
                 end
             end
             RunService.RenderStepped:Wait()
+        end
+
+        -- (v70) BONUS MULTI: when the script thinks their stun is over, it still throws ONE more multi
+        -- cycle (dash cancelled into a swing, or a plain swing) if they are close - what we see of their
+        -- stun is a ping late and often ends early on our screen, so this extra hit usually still lands.
+        if stunOver and settings.parryChase then
+            pcall(function()
+                local dist = updateAim()
+                if not dist or dist > MELEE + 3 then return end
+                local tB = os.clock()
+                -- wait (briefly) for a swing to be possible
+                while os.clock() - tB < 0.3 and combatStateNow() ~= "ignited" and combatStateNow() ~= "blocking" do
+                    updateAim()
+                    RunService.RenderStepped:Wait()
+                end
+                local cs = combatStateNow()
+                local onCd = false
+                pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
+                local force = 0
+                pcall(function() force = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
+                faceTarget()
+                if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) and force >= 40 then
+                    sendDashInput()
+                    -- let the dash start, then cancel it into the swing
+                    for _ = 1, 8 do
+                        RunService.RenderStepped:Wait()
+                        updateAim()
+                        cancelListener()
+                        if movementState() == "dashing" then break end
+                    end
+                    RunService.RenderStepped:Wait()
+                    faceTarget()
+                    local h = saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
+                    if type(h) == "function" then pcall(h, true) else sendAttack() end
+                elseif cs == "ignited" then
+                    sendAttack()
+                end
+                -- give the swing a moment to go out before the keys are released
+                local tE = os.clock()
+                while os.clock() - tE < 0.12 do updateAim() RunService.RenderStepped:Wait() end
+            end)
         end
 
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseMove") end)
@@ -3702,7 +3744,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v69"
+hint.Text = "Ctrl+H = hide  |  v70"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
