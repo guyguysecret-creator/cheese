@@ -309,7 +309,8 @@ end))
 ------------------------------------------------------------------------
 local MAX_PARRIES, MAX_KICKS = 5, 3
 local saberComp
-local lastScan = 0
+-- (v83) memory scanner state - see gcScan below
+local GC = { busy = false, nextAt = 0, wait = 2 }
 local warnedNoGC = false
 
 local function isMySaber(t)
@@ -327,28 +328,6 @@ local function saberStillValid(t)
     return ok and valid
 end
 
-local function scanForSaber()
-    lastScan = os.clock()
-    -- filtergc is faster where it exists; fall back to a full getgc walk
-    if type(filtergc) == "function" then
-        local ok, res = pcall(filtergc, "table", { Keys = { "ParriesLeft", "KicksLeft" } })
-        if ok and type(res) == "table" then
-            for _, t in pairs(res) do
-                if saberStillValid(t) then return t end
-            end
-        end
-    end
-    if type(getgc) ~= "function" then
-        if not warnedNoGC then warnedNoGC = true; log("no getgc in this executor - parry/kicks can't work") end
-        return nil
-    end
-    local ok, list = pcall(getgc, true)
-    if not ok or type(list) ~= "table" then return nil end
-    for _, t in ipairs(list) do
-        if saberStillValid(t) then return t end
-    end
-    return nil
-end
 
 ------------------------------------------------------------------------
 -- Force pin (fix for "force randomly stops until I toggle it")
@@ -363,7 +342,6 @@ end
 --   directly. The attributes stay on as a backup.
 ------------------------------------------------------------------------
 local charComp
-local lastCharScan = 0
 
 local function isMyCharComp(t)
     if type(t) ~= "table" then return false end
@@ -376,38 +354,103 @@ local function isMyCharComp(t)
     return ok and valid
 end
 
-local function scanForCharComp()
-    lastCharScan = os.clock()
-    -- quickest: the saber component points at it
-    if saberComp then
-        local cc = rawget(saberComp, "CharacterComponent")
-        if isMyCharComp(cc) then return cc end
-    end
-    if type(filtergc) == "function" then
-        local ok, res = pcall(filtergc, "table", { Keys = { "Force", "MaxForce" } })
-        if ok and type(res) == "table" then
-            for _, t in pairs(res) do
-                if isMyCharComp(t) then return t end
+-- (v83) THE FREEZE FIX. Finding your saber / character component means walking the game's whole
+-- memory (getgc). That used to run INSIDE a Heartbeat frame, all in one go, every 2s whenever the
+-- saber wasn't found (unequipped, dead, respawning, in a menu) - and the 2s were counted from the
+-- START of the scan, so on a busy server where one scan took over 2s the next one began on the very
+-- next frame: the game never got a frame in between and froze until you rejoined.
+-- Now: ONE scan at a time, in its own thread, pausing every few thousand objects so the game keeps
+-- running; it looks for both components in the same pass with a cheap check first; the wait is
+-- counted from when the scan ENDS and doubles (up to 20s) while nothing is found. Respawning or
+-- equipping a tool makes the next scan come quickly again.
+local function gcScan(wantS, wantC)
+    if GC.busy or os.clock() < GC.nextAt then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then GC.nextAt = os.clock() + 1 return end
+    GC.busy = true
+    task.spawn(function()
+        local foundS, foundC
+        local okRun, errRun = pcall(function()
+            local function check(t)
+                if type(t) ~= "table" then return end
+                if wantS and not foundS and type(rawget(t, "ParriesLeft")) == "number"
+                    and type(rawget(t, "KicksLeft")) == "number" and saberStillValid(t) then
+                    foundS = t
+                end
+                if wantC and not foundC and type(rawget(t, "Force")) == "number"
+                    and type(rawget(t, "MaxForce")) == "number" and isMyCharComp(t) then
+                    foundC = t
+                end
             end
+            local function done() return (foundS or not wantS) and (foundC or not wantC) end
+            -- filtergc is quick where it exists
+            if type(filtergc) == "function" then
+                if wantS then
+                    local ok, res = pcall(filtergc, "table", { Keys = { "ParriesLeft", "KicksLeft" } })
+                    if ok and type(res) == "table" then for _, t in pairs(res) do check(t) if foundS then break end end end
+                end
+                if wantC and not foundC then
+                    local ok, res = pcall(filtergc, "table", { Keys = { "Force", "MaxForce" } })
+                    if ok and type(res) == "table" then for _, t in pairs(res) do check(t) if foundC then break end end end
+                end
+            end
+            if done() then return end
+            if type(getgc) ~= "function" then
+                if not warnedNoGC then warnedNoGC = true; log("no getgc in this executor - parry/kicks can't work") end
+                return
+            end
+            local ok, list = pcall(getgc, true)
+            if not ok or type(list) ~= "table" then return end
+            local n = 0
+            for _, t in ipairs(list) do
+                check(t)
+                if done() then break end
+                n += 1
+                if n % 3000 == 0 then task.wait() end -- let the game draw a frame
+            end
+            list = nil
+        end)
+        if not okRun then warn("[ForceHBE] memory scan error: " .. tostring(errRun)) end
+        if foundS and saberStillValid(foundS) and not saberStillValid(saberComp) then
+            saberComp = foundS
+            log("found your lightsaber component")
         end
-    end
-    if type(getgc) ~= "function" then return nil end
-    local ok, list = pcall(getgc, true)
-    if not ok or type(list) ~= "table" then return nil end
-    for _, t in ipairs(list) do
-        if isMyCharComp(t) then return t end
-    end
-    return nil
+        if foundC and isMyCharComp(foundC) and not isMyCharComp(charComp) then
+            charComp = foundC
+            log("Infinite Force: found your character component (bar is held full)")
+        end
+        local gotAll = (foundS or not wantS) and (foundC or not wantC)
+        GC.wait = gotAll and 2 or math.min(GC.wait * 2, 20)
+        GC.nextAt = os.clock() + GC.wait
+        GC.busy = false
+    end)
 end
+-- respawn / equip: scan again soon instead of waiting out the long back-off
+local function gcSoon()
+    GC.wait = 2
+    GC.nextAt = math.min(GC.nextAt, os.clock() + 0.5)
+end
+local function gcWatchChar(char)
+    gcSoon()
+    track(char.ChildAdded:Connect(function(c) if c:IsA("Tool") then gcSoon() end end))
+end
+if LocalPlayer.Character then gcWatchChar(LocalPlayer.Character) end
+track(LocalPlayer.CharacterAdded:Connect(gcWatchChar))
 
 track(RunService.Heartbeat:Connect(function()
     if not settings.force then return end
     if not isMyCharComp(charComp) then
         charComp = nil
-        if os.clock() - lastCharScan < 2 then return end
-        charComp = scanForCharComp()
-        if not charComp then return end
-        log("Infinite Force: found your character component (bar is held full)")
+        -- quickest: the saber component points at it (no scan needed)
+        local cc = saberComp and rawget(saberComp, "CharacterComponent")
+        if isMyCharComp(cc) then
+            charComp = cc
+            log("Infinite Force: found your character component (bar is held full)")
+        else
+            gcScan(false, true)
+            return
+        end
     end
     local maxF = rawget(charComp, "MaxForce")
     if rawget(charComp, "Force") < maxF then
@@ -418,14 +461,12 @@ end))
 
 track(RunService.Heartbeat:Connect(function()
     local pinBlock = settings.block and blockMode == "hook"
-    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick or settings.parryChase) then return end
+    if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick or settings.parryChase or settings.perfectTrade) then return end
     if not saberStillValid(saberComp) then
         saberComp = nil
-        -- the component is rebuilt when you equip/respawn; rescan every 2s until found
-        if os.clock() - lastScan < 2 then return end
-        saberComp = scanForSaber()
-        if not saberComp then return end
-        log("found your lightsaber component")
+        -- the component is rebuilt when you equip/respawn; scanned for in the background (see gcScan)
+        gcScan(true, settings.force and not isMyCharComp(charComp))
+        return
     end
     if settings.parry and rawget(saberComp, "ParriesLeft") < MAX_PARRIES then
         saberComp.ParriesLeft = MAX_PARRIES
@@ -4188,7 +4229,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v82"
+hint.Text = "Ctrl+H = hide  |  v83"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
