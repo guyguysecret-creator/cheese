@@ -846,6 +846,43 @@ end
 -- called once per frame: refresh every attacker's blade speed + time-to-hit
 local plrVel, plrVelFast, plrLastPos, plrPeak = {}, {}, {}, {} -- every player's body velocity, tracked all the time
 
+-- WHO IS THIS KICK FOR? (v82) Of everyone near the kicker (you included), the most likely target is
+-- whoever is closest AND most in line with where the kicker is heading (their movement if they're
+-- dashing - forwards or backwards - otherwise where they face). Anti-kick only reacts if that's YOU,
+-- so a kick in someone else's duel never pulls you in while you watch.
+function AP.kickTargetIsMe(plr, kHrp, myHrp)
+    local dir
+    local v = plrVelFast[plr] or Vector3.zero
+    local fv = Vector3.new(v.X, 0, v.Z)
+    if fv.Magnitude >= 15 then dir = fv.Unit else
+        local lf = Vector3.new(kHrp.CFrame.LookVector.X, 0, kHrp.CFrame.LookVector.Z)
+        if lf.Magnitude < 0.01 then return true end
+        dir = lf.Unit
+    end
+    local function score(pos)
+        local to = Vector3.new(pos.X - kHrp.Position.X, 0, pos.Z - kHrp.Position.Z)
+        local d = to.Magnitude
+        if d < 0.01 then return 0 end
+        local dot = dir:Dot(to / d)
+        if dot < 0.3 and d > 6 then return nil end      -- behind / beside them and not right next to them
+        return d * (2 - dot)                             -- closer and more in line = lower = likelier
+    end
+    local mine = score(myHrp.Position)
+    if not mine then return false end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer and p ~= plr then
+            local c = p.Character
+            local h = c and c:FindFirstChild("HumanoidRootPart")
+            local hum = c and c:FindFirstChildOfClass("Humanoid")
+            if h and hum and hum.Health > 0 then
+                local s = score(h.Position)
+                if s and s < mine then return false end
+            end
+        end
+    end
+    return true
+end
+
 -- FEINT MEMORY: every time a player's swing at you gets block-cancelled early (a feint), their score goes
 -- up by 1; it halves every 30s. Known feinters get a longer look before Auto Parry commits.
 function AP.feintScore(plr)
@@ -1207,7 +1244,9 @@ local function assessThreat(plr, myHrp, forCounter)
             -- net instead of Auto Parry's precise "will it hit me" test: any kicker within COUNTER_RANGE
             -- (plus the distance a dash + lag hides) who isn't facing away from you.
             local hiddenC = math.min(plrPeak[plr] or 0, 90) * (pingEma + 0.15)
-            if betterTargetThanMe(hrp, myHrp) then return no("kick is aimed at somebody else") end
+            if betterTargetThanMe(hrp, myHrp) or not AP.kickTargetIsMe(plr, hrp, myHrp) then
+                return no("kick is aimed at somebody else")
+            end
             -- (v73) EVERY KIND OF KICK: a kicker can face you and dash forward, FACE AWAY and dash
             -- BACKWARDS into you (S - the "reverse kick"), or just stand and kick. So "coming at you"
             -- counts as much as "facing you": how fast they're moving toward you right now, and how fast
@@ -2782,6 +2821,10 @@ end
 -- AnimationPlayed hook the moment a kick animation starts on anyone
 local function tryCounterKick(plr)
     if not settings.antiKick or counterBusy then return end
+    -- (v82) only while you're actually in a fight: saber ignited (ignited / blocking / parrying / swinging).
+    -- Sheathed, unequipped, or just walking around = Anti-kick never moves you.
+    local csK = combatStateNow()
+    if csK ~= "ignited" and csK ~= "blocking" and csK ~= "parrying" and csK ~= "swinging" then return end
     local me = LocalPlayer.Character
     local mh = me and me:FindFirstChild("HumanoidRootPart")
     if not mh then return end
@@ -4145,7 +4188,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v81"
+hint.Text = "Ctrl+H = hide  |  v82"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
