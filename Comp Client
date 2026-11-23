@@ -3135,7 +3135,10 @@ do
     end))
 end
 -- Anti-kick's toggle key
-KB.add(function() return settings.antiKickKey end, function() setAntiKick(not settings.antiKick) end)
+KB.add(function() return settings.antiKickKey end, function()
+    setAntiKick(not settings.antiKick)
+    if AP.toast then AP.toast("Anti-kick", settings.antiKick) end
+end)
 
 ------------------------------------------------------------------------
 -- Visuals (ESP) - purely a drawing on YOUR screen; nothing is sent to the server and
@@ -3437,6 +3440,80 @@ gui.ResetOnSpawn = false
 gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 local okSet = pcall(function() gui.Parent = parentGui end)
 if not okSet then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+-- TOASTS (v81): a little pop-up in the TOP-RIGHT corner whenever a keybind toggles a feature, e.g.
+-- "Anti-kick  ON". It shows even while the menu is hidden (Ctrl+H) and fades away after ~2.5s.
+do
+    local TweenService = game:GetService("TweenService")
+    local holder = Instance.new("Frame")
+    holder.Name = "Toasts"
+    holder.AnchorPoint = Vector2.new(1, 0)
+    holder.Position = UDim2.new(1, -16, 0, 16)
+    holder.Size = UDim2.fromOffset(260, 0)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.BackgroundTransparency = 1
+    holder.ZIndex = 50
+    holder.Parent = gui
+    local lay = Instance.new("UIListLayout")
+    lay.SortOrder = Enum.SortOrder.LayoutOrder
+    lay.Padding = UDim.new(0, 6)
+    lay.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    lay.Parent = holder
+    local n = 0
+    function AP.toast(name, on)
+        pcall(function()
+            n += 1
+            local box = Instance.new("Frame")
+            box.LayoutOrder = n
+            box.Size = UDim2.fromOffset(0, 30)
+            box.AutomaticSize = Enum.AutomaticSize.X
+            box.BackgroundColor3 = Color3.fromRGB(24, 24, 28)
+            box.BackgroundTransparency = 1
+            box.BorderSizePixel = 0
+            box.ZIndex = 50
+            box.Parent = holder
+            Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+            local stroke = Instance.new("UIStroke")
+            stroke.Color = on and Color3.fromRGB(60, 170, 90) or Color3.fromRGB(200, 70, 70)
+            stroke.Thickness = 1.5
+            stroke.Transparency = 1
+            stroke.Parent = box
+            local pad = Instance.new("UIPadding")
+            pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 12), UDim.new(0, 12)
+            pad.Parent = box
+            local lbl = Instance.new("TextLabel")
+            lbl.Size = UDim2.fromScale(0, 1)
+            lbl.AutomaticSize = Enum.AutomaticSize.X
+            lbl.BackgroundTransparency = 1
+            lbl.Font = Enum.Font.GothamBold
+            lbl.TextSize = 13
+            lbl.RichText = true
+            lbl.TextColor3 = Color3.fromRGB(235, 235, 240)
+            lbl.TextTransparency = 1
+            lbl.Text = ('%s  <font color="%s">%s</font>'):format(name, on and "#4fd27a" or "#e06060", on and "ON" or "OFF")
+            lbl.ZIndex = 51
+            lbl.Parent = box
+            -- keep at most 4 on screen (oldest goes first)
+            local kids = {}
+            for _, c in ipairs(holder:GetChildren()) do if c:IsA("Frame") then kids[#kids + 1] = c end end
+            table.sort(kids, function(a, b) return a.LayoutOrder < b.LayoutOrder end)
+            for i = 1, #kids - 4 do kids[i]:Destroy() end
+            local fin = TweenInfo.new(0.15)
+            TweenService:Create(box, fin, { BackgroundTransparency = 0.1 }):Play()
+            TweenService:Create(stroke, fin, { Transparency = 0 }):Play()
+            TweenService:Create(lbl, fin, { TextTransparency = 0 }):Play()
+            task.delay(2.5, function()
+                if not box.Parent then return end
+                local fout = TweenInfo.new(0.4)
+                TweenService:Create(box, fout, { BackgroundTransparency = 1 }):Play()
+                TweenService:Create(stroke, fout, { Transparency = 1 }):Play()
+                TweenService:Create(lbl, fout, { TextTransparency = 1 }):Play()
+                task.wait(0.45)
+                if box.Parent then box:Destroy() end
+            end)
+        end)
+    end
+end
 
 ------------------------------------------------------------------------
 -- Intro splash: the Comp Client logo pops in with a pulsing red glow, then fades away.
@@ -4068,7 +4145,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v80"
+hint.Text = "Ctrl+H = hide  |  v81"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4501,6 +4578,7 @@ KB.add(function() return settings.parryChaseKey end, function()
     settings.parryChase = not settings.parryChase
     if parryChaseSwitch then parryChaseSwitch(settings.parryChase, true) end
     log("Parry chase " .. (settings.parryChase and "ON" or "OFF") .. " (key)")
+    if AP.toast then AP.toast("Parry chase", settings.parryChase) end
 end)
 -- 0-800 ms. At 50 or below = ULTRA multi (no pacing: as fast as the game allows)
 makeNumberBox(41, "Multi delay (ms)", "multiDelay", 0, 800)
