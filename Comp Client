@@ -1,9 +1,10 @@
 --[[
     Infinite Force + Hitbox Expander - one script, one small UI (made for Potassium)
 
-    Infinite Force (same as InfiniteForce.lua v5):
-      - ForceRegenMultiplier = huge      -> normal refill is instant
-      - AfflictionForceDrainPerTick = -450 -> +1 full bar every second, no 2.5s wait
+    Infinite Force:
+      - Keeps Force pinned at MaxForce in memory so moves never fail, while
+        rendering a natural visual force bar that drains on use and regens at
+        the normal rate (40/s after 2.5s delay) so it looks completely legit.
 
     Hitbox Expander (written from scratch, replaces the obfuscated ScriptBlox one):
       - The game's lightsaber hits are client raycasts from your blade: any part of
@@ -13,8 +14,9 @@
       - Turning it off deletes the boxes.
 
     Infinite Block:
-      - hook mode (getgc + hookfunction): hit-block animation still plays, meter is
-        pinned at full, and only the client's own "block broken" stun is dropped.
+      - hook mode (getgc + hookfunction): hit-block animation still plays, block
+        meter drains naturally on hits and regens when not blocking, and only
+        the client's own "block broken" stun is dropped so your block never breaks.
       - delete mode (fallback, e.g. Xeno): deletes the server's "Block" value on your
         side; works, but the hit-block animation won't play.
 
@@ -22,7 +24,9 @@
     turns anything off. Hidden = fully gone; F9 prints what's still ON.
 
     Infinite Parry / Infinite Kicks (need a real getgc - NOT Xeno):
-      - finds your Lightsaber component in memory and keeps ParriesLeft = 5, KicksLeft = 3.
+      - Keeps ParriesLeft = 5 and KicksLeft = 3 in memory so moves never fail,
+        while rendering natural circle consumption and regening at normal rates
+        on the HUD (5s for parry when not blocking; 2s for kicks while blocking/sheathed).
 
     Auto Parry (needs getgc; hold right-click with your saber ignited): clicks left-click
       for you when a swing is really aimed at you - see the "Auto Parry" section below.
@@ -113,50 +117,38 @@ local connections = {}
 local function track(c) table.insert(connections, c); return c end
 
 ------------------------------------------------------------------------
--- Infinite Force
+-- Infinite Force (Visual Spoofing)
+--   Instead of setting hyper-regen attributes (which make the force bar
+--   instantly snap to full on your screen), we clean those attributes and
+--   maintain MaxForce directly in memory so force moves never fail, while
+--   rendering a natural visual force bar that drains on use and regens at
+--   the game's normal rate (40/s after 2.5s delay).
 ------------------------------------------------------------------------
 local DRAIN_ATTR, REGEN_ATTR = "AfflictionForceDrainPerTick", "ForceRegenMultiplier"
 local REFILL_PER_TICK, REGEN_MULTIPLIER = 450, 100000
-local forceConns = {}
 
-local function forceDisconnect()
-    for _, c in ipairs(forceConns) do c:Disconnect() end
-    table.clear(forceConns)
-end
-
-local function forceApply(char)
-    forceDisconnect()
+local function cleanForceAttrs(char)
     if not char then return end
-    local function enforce(attr, value)
-        if char:GetAttribute(attr) ~= value then char:SetAttribute(attr, value) end
-    end
-    enforce(REGEN_ATTR, REGEN_MULTIPLIER)
-    enforce(DRAIN_ATTR, -REFILL_PER_TICK)
-    table.insert(forceConns, char:GetAttributeChangedSignal(REGEN_ATTR):Connect(function()
-        if settings.force then enforce(REGEN_ATTR, REGEN_MULTIPLIER) end
-    end))
-    table.insert(forceConns, char:GetAttributeChangedSignal(DRAIN_ATTR):Connect(function()
-        if settings.force then enforce(DRAIN_ATTR, -REFILL_PER_TICK) end
-    end))
-end
-
-local function forceRemove(char)
-    forceDisconnect()
-    if not char then return end
-    if char:GetAttribute(REGEN_ATTR) == REGEN_MULTIPLIER then char:SetAttribute(REGEN_ATTR, nil) end
-    if char:GetAttribute(DRAIN_ATTR) == -REFILL_PER_TICK then char:SetAttribute(DRAIN_ATTR, nil) end
+    pcall(function()
+        if char:GetAttribute(REGEN_ATTR) == REGEN_MULTIPLIER then char:SetAttribute(REGEN_ATTR, nil) end
+        if char:GetAttribute(DRAIN_ATTR) == -REFILL_PER_TICK then char:SetAttribute(DRAIN_ATTR, nil) end
+    end)
 end
 
 local function setForce(on)
     settings.force = on
-    if on then forceApply(LocalPlayer.Character) else forceRemove(LocalPlayer.Character) end
+    cleanForceAttrs(LocalPlayer.Character)
+    if not on then
+        if visualForce ~= nil then visualForce = nil end
+        if charComp and isMyCharComp(charComp) then
+            local maxF = rawget(charComp, "MaxForce") or 100
+            pcall(function() charComp.SetForce:Fire(charComp.Force / maxF) end)
+        end
+    end
 end
 
 track(LocalPlayer.CharacterAdded:Connect(function(char)
-    if settings.force then
-        task.wait(1) -- let the game's Character component set up first
-        if settings.force then forceApply(char) end
-    end
+    cleanForceAttrs(char)
 end))
 
 -- Some executors send print() to their OWN console instead of Roblox's F9 console, so
@@ -210,7 +202,7 @@ local function hookBlockBreakStun()
     end
     if type(getgc) ~= "function" or type(hookfunction) ~= "function" then return false end
 
-    local fireFn
+    local fireFn, blockFireFn
     local ok, list = pcall(getgc, true)
     if not ok or type(list) ~= "table" then return false end
     -- 1) the zap module's export table: { LightsaberStunFromClient = { Fire = fn }, LightsaberBlock = ... }
@@ -220,6 +212,10 @@ local function hookBlockBreakStun()
             if type(entry) == "table" and rawget(t, "LightsaberBlock") ~= nil
                 and type(rawget(entry, "Fire")) == "function" then
                 fireFn = rawget(entry, "Fire")
+                local bEntry = rawget(t, "LightsaberBlock")
+                if type(bEntry) == "table" and type(rawget(bEntry, "Fire")) == "function" then
+                    blockFireFn = rawget(bEntry, "Fire")
+                end
                 break
             end
         end
@@ -252,6 +248,18 @@ local function hookBlockBreakStun()
             return old(payload, ...)
         end)
     end)
+    if blockFireFn then
+        pcall(function()
+            local oldB
+            oldB = hookfunction(blockFireFn, function(payload, ...)
+                local s = env.ForceHBE_Settings
+                if s and s.block and type(payload) == "table" then
+                    payload.BlocksLeft = MAX_BLOCK
+                end
+                return oldB(payload, ...)
+            end)
+        end)
+    end
     if okH then
         stunHooked = true
         env.ForceHBE_StunHooked = true
@@ -289,10 +297,16 @@ local function setBlock(on)
     if on and not blockMode then
         if hookBlockBreakStun() then
             blockMode = "hook"
-            log("Infinite Block: hook mode (hit-block animation still plays)")
+            log("Infinite Block: hook mode (hit-block animation still plays, legit meter simulation)")
         else
             blockMode = "delete"
             log("Infinite Block: delete mode (no getgc/hookfunction - hit animation won't play)")
+        end
+    end
+    if not on then
+        if visualBlock ~= nil then visualBlock = nil end
+        if saberComp and saberStillValid(saberComp) then
+            pcall(function() saberComp:SetBlock() end)
         end
     end
     blockDeleteHook(LocalPlayer.Character) -- only does anything in delete mode
@@ -307,8 +321,8 @@ end))
 --   Both counters live on your Lightsaber component (Client.Components.Lightsaber):
 --     ParriesLeft (max 5)  -> Parrying state does ParriesLeft -= 1
 --     KicksLeft   (max 3)  -> Kicking state does KicksLeft -= 1
---   We find YOUR component in memory (has ParriesLeft + KicksLeft and Local == true)
---   and keep both at max every frame. SetParries/SetKicks refresh the circles on the HUD.
+--   We find YOUR component in memory and keep both at max so actions never fail,
+--   while rendering normal visual circle/bar consumption and regens on your HUD.
 ------------------------------------------------------------------------
 local MAX_PARRIES, MAX_KICKS = 5, 3
 local saberComp
@@ -331,20 +345,141 @@ local function saberStillValid(t)
     return ok and valid
 end
 
+local function combatStateNow()
+    local sc = saberComp
+    if not saberStillValid(sc) then return nil end
+    local ok, st = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
+    return ok and st or nil
+end
+
+local function userHoldsBlock()
+    local held = false
+    pcall(function()
+        local sc = saberComp
+        local b = sc and rawget(sc, "_pcBlockBinding")
+        if b == nil then
+            held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+        elseif typeof(b) == "EnumItem" and b.EnumType == Enum.UserInputType then
+            held = UserInputService:IsMouseButtonPressed(b)
+        elseif typeof(b) == "EnumItem" then
+            held = UserInputService:IsKeyDown(b)
+        end
+        local gp = sc and rawget(sc, "_gpBlockKey")
+        if not held and gp ~= nil then
+            held = UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, gp)
+        end
+    end)
+    return held
+end
 
 ------------------------------------------------------------------------
--- Force pin (fix for "force randomly stops until I toggle it")
---   Cause: the game's drain loop (Character component) only runs
---     `if not (Force <= 0) then Force -= drain end`
---   so with our negative drain it ADDS force - except when Force is exactly 0.
---   And RechargeForce skips normal regen while the drain attribute exists.
---   So once the bar hit 0 (a move costing more than you had, an enemy
---   affliction draining you, etc.) nothing refilled it until you toggled
---   (toggling clears the attribute -> RechargeForce runs -> bar refills).
---   Fix: with getgc, find YOUR Character component and hold Force at MaxForce
---   directly. The attributes stay on as a backup.
+-- Visual Resource Simulation (Legit HUD appearance)
 ------------------------------------------------------------------------
+local visualForce = nil
+local lastForceSpend = 0
+local FORCE_RECHARGE_DELAY = 2.5
+local FORCE_REGEN_RATE = 40
+
+local visualParries = nil
+local lastParryTime = 0
+local PARRY_REGEN_INTERVAL = 5
+
+local visualKicks = nil
+local lastKickTime = 0
+local KICK_REGEN_INTERVAL = 2
+local KICK_REGEN_WAIT = 1
+local blockStartTime = 0
+
+local visualBlock = nil
+local lastBlockHit = 0
+local BLOCK_REGEN_DELAY = 2.5
+local BLOCK_REGEN_RATE = 14
+
+local function resetVisualResources()
+    visualForce = nil
+    visualParries = nil
+    visualKicks = nil
+    visualBlock = nil
+    lastForceSpend = 0
+    lastParryTime = 0
+    lastKickTime = 0
+    lastBlockHit = 0
+    blockStartTime = 0
+end
+track(LocalPlayer.CharacterAdded:Connect(resetVisualResources))
+
+local function wrapSaber(sc)
+    if not sc or sc._wrapped then return end
+    sc._wrapped = true
+
+    local oldSetParries = sc.SetParries
+    if type(oldSetParries) == "function" then
+        sc.SetParries = function(self, ...)
+            if settings.parry and visualParries ~= nil then
+                local real = rawget(self, "ParriesLeft")
+                rawset(self, "ParriesLeft", visualParries)
+                local ok, res = pcall(oldSetParries, self, ...)
+                rawset(self, "ParriesLeft", real)
+                return res
+            end
+            return oldSetParries(self, ...)
+        end
+    end
+
+    local oldSetKicks = sc.SetKicks
+    if type(oldSetKicks) == "function" then
+        sc.SetKicks = function(self, ...)
+            if settings.kick and visualKicks ~= nil then
+                local real = rawget(self, "KicksLeft")
+                rawset(self, "KicksLeft", visualKicks)
+                local ok, res = pcall(oldSetKicks, self, ...)
+                rawset(self, "KicksLeft", real)
+                return res
+            end
+            return oldSetKicks(self, ...)
+        end
+    end
+
+    local oldSetBlock = sc.SetBlock
+    if type(oldSetBlock) == "function" then
+        sc.SetBlock = function(self, ...)
+            if settings.block and visualBlock ~= nil then
+                local real = rawget(self, "BlocksLeft")
+                rawset(self, "BlocksLeft", visualBlock)
+                local ok, res = pcall(oldSetBlock, self, ...)
+                rawset(self, "BlocksLeft", real)
+                return res
+            end
+            return oldSetBlock(self, ...)
+        end
+    end
+end
+
 local charComp
+
+local function wrapCharComp(cc)
+    if not cc or cc._wrapped then return end
+    cc._wrapped = true
+
+    local sf = cc.SetForce
+    if sf and sf.Fire then
+        local realSetForce = sf
+        local proxy = {
+            Fire = function(self, val, ...)
+                if settings.force and visualForce ~= nil then
+                    local maxF = rawget(cc, "MaxForce") or 100
+                    val = math.clamp(visualForce / maxF, 0, 1)
+                end
+                return realSetForce:Fire(val, ...)
+            end
+        }
+        setmetatable(proxy, {
+            __index = realSetForce,
+            __newindex = realSetForce,
+        })
+        cc.SetForce = proxy
+    end
+end
 
 local function isMyCharComp(t)
     if type(t) ~= "table" then return false end
@@ -358,14 +493,7 @@ local function isMyCharComp(t)
 end
 
 -- (v83) THE FREEZE FIX. Finding your saber / character component means walking the game's whole
--- memory (getgc). That used to run INSIDE a Heartbeat frame, all in one go, every 2s whenever the
--- saber wasn't found (unequipped, dead, respawning, in a menu) - and the 2s were counted from the
--- START of the scan, so on a busy server where one scan took over 2s the next one began on the very
--- next frame: the game never got a frame in between and froze until you rejoined.
--- Now: ONE scan at a time, in its own thread, pausing every few thousand objects so the game keeps
--- running; it looks for both components in the same pass with a cheap check first; the wait is
--- counted from when the scan ENDS and doubles (up to 20s) while nothing is found. Respawning or
--- equipping a tool makes the next scan come quickly again.
+-- memory (getgc).
 local function gcScan(wantS, wantC)
     if GC.busy or os.clock() < GC.nextAt then return end
     local char = LocalPlayer.Character
@@ -417,11 +545,13 @@ local function gcScan(wantS, wantC)
         if not okRun then warn("[ForceHBE] memory scan error: " .. tostring(errRun)) end
         if foundS and saberStillValid(foundS) and not saberStillValid(saberComp) then
             saberComp = foundS
+            wrapSaber(saberComp)
             log("found your lightsaber component")
         end
         if foundC and isMyCharComp(foundC) and not isMyCharComp(charComp) then
             charComp = foundC
-            log("Infinite Force: found your character component (bar is held full)")
+            wrapCharComp(charComp)
+            log("Infinite Force: found your character component")
         end
         local gotAll = (foundS or not wantS) and (foundC or not wantC)
         GC.wait = gotAll and 2 or math.min(GC.wait * 2, 20)
@@ -441,7 +571,7 @@ end
 if LocalPlayer.Character then gcWatchChar(LocalPlayer.Character) end
 track(LocalPlayer.CharacterAdded:Connect(gcWatchChar))
 
-track(RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function(dt)
     if not settings.force then return end
     if not isMyCharComp(charComp) then
         charComp = nil
@@ -449,20 +579,38 @@ track(RunService.Heartbeat:Connect(function()
         local cc = saberComp and rawget(saberComp, "CharacterComponent")
         if isMyCharComp(cc) then
             charComp = cc
-            log("Infinite Force: found your character component (bar is held full)")
+            wrapCharComp(charComp)
+            log("Infinite Force: found your character component")
         else
             gcScan(false, true)
             return
         end
     end
-    local maxF = rawget(charComp, "MaxForce")
-    if rawget(charComp, "Force") < maxF then
+    wrapCharComp(charComp)
+    local maxF = rawget(charComp, "MaxForce") or 100
+    if not visualForce then visualForce = maxF end
+
+    local currentF = rawget(charComp, "Force")
+    if type(currentF) == "number" and currentF < maxF then
+        local spent = maxF - currentF
+        visualForce = math.max(0, visualForce - spent)
+        lastForceSpend = os.clock()
         charComp.Force = maxF
-        pcall(function() charComp.SetForce:Fire(1) end)
+        pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
+    else
+        if os.clock() - lastForceSpend >= FORCE_RECHARGE_DELAY then
+            if visualForce < maxF then
+                visualForce = math.min(maxF, visualForce + FORCE_REGEN_RATE * dt)
+                pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
+            end
+        end
+        if currentF and currentF < maxF then
+            charComp.Force = maxF
+        end
     end
 end))
 
-track(RunService.Heartbeat:Connect(function()
+track(RunService.Heartbeat:Connect(function(dt)
     local pinBlock = settings.block and blockMode == "hook"
     if not (settings.parry or settings.kick or pinBlock or settings.autoParry or settings.autoEvade or settings.antiKick or settings.parryChase or settings.perfectTrade) then return end
     if not saberStillValid(saberComp) then
@@ -471,19 +619,90 @@ track(RunService.Heartbeat:Connect(function()
         gcScan(true, settings.force and not isMyCharComp(charComp))
         return
     end
-    if settings.parry and rawget(saberComp, "ParriesLeft") < MAX_PARRIES then
-        saberComp.ParriesLeft = MAX_PARRIES
-        pcall(function() saberComp:SetParries() end)
+    wrapSaber(saberComp)
+
+    local cs = combatStateNow()
+    local isBlocking = (cs == "blocking") or userHoldsBlock()
+
+    -- 1. Infinite Parry (visual depletion & normal 5s regen)
+    if settings.parry then
+        if not visualParries then visualParries = MAX_PARRIES end
+        local p = rawget(saberComp, "ParriesLeft")
+        if type(p) == "number" and p < MAX_PARRIES then
+            local spent = MAX_PARRIES - p
+            visualParries = math.max(0, visualParries - spent)
+            lastParryTime = os.clock()
+            saberComp.ParriesLeft = MAX_PARRIES
+            pcall(function() saberComp:SetParries() end)
+        else
+            if not isBlocking and visualParries < MAX_PARRIES then
+                if os.clock() - lastParryTime >= PARRY_REGEN_INTERVAL then
+                    visualParries = math.min(MAX_PARRIES, visualParries + 1)
+                    lastParryTime = os.clock()
+                    pcall(function() saberComp:SetParries() end)
+                end
+            elseif isBlocking then
+                lastParryTime = os.clock()
+            end
+            if type(p) == "number" and p < MAX_PARRIES then
+                saberComp.ParriesLeft = MAX_PARRIES
+            end
+        end
     end
-    if settings.kick and rawget(saberComp, "KicksLeft") < MAX_KICKS then
-        saberComp.KicksLeft = MAX_KICKS
-        pcall(function() saberComp:SetKicks() end)
+
+    -- 2. Infinite Kicks (visual depletion & normal 2s regen while blocking/sheathed)
+    if settings.kick then
+        if not visualKicks then visualKicks = MAX_KICKS end
+        local k = rawget(saberComp, "KicksLeft")
+        if type(k) == "number" and k < MAX_KICKS then
+            local spent = MAX_KICKS - k
+            visualKicks = math.max(0, visualKicks - spent)
+            lastKickTime = os.clock()
+            saberComp.KicksLeft = MAX_KICKS
+            pcall(function() saberComp:SetKicks() end)
+        else
+            local isBlockingOrAway = isBlocking or (cs == "sheathed") or (cs == "idle_m")
+            if isBlockingOrAway then
+                if blockStartTime == 0 then blockStartTime = os.clock() end
+                if os.clock() - blockStartTime >= KICK_REGEN_WAIT then
+                    if visualKicks < MAX_KICKS and (os.clock() - lastKickTime >= KICK_REGEN_INTERVAL) then
+                        visualKicks = math.min(MAX_KICKS, visualKicks + 1)
+                        lastKickTime = os.clock()
+                        pcall(function() saberComp:SetKicks() end)
+                    end
+                end
+            else
+                blockStartTime = 0
+                lastKickTime = os.clock()
+            end
+            if type(k) == "number" and k < MAX_KICKS then
+                saberComp.KicksLeft = MAX_KICKS
+            end
+        end
     end
+
+    -- 3. Infinite Block (visual damage & normal 14/s regen when not blocking; stun dropped)
     if pinBlock then
+        if not visualBlock then visualBlock = MAX_BLOCK end
         local b = rawget(saberComp, "BlocksLeft")
         if type(b) == "number" and b < MAX_BLOCK then
+            local dmg = MAX_BLOCK - b
+            visualBlock = math.max(0, visualBlock - dmg)
+            lastBlockHit = os.clock()
             saberComp.BlocksLeft = MAX_BLOCK
             pcall(function() saberComp:SetBlock() end)
+        else
+            if not isBlocking and visualBlock < MAX_BLOCK then
+                if os.clock() - lastBlockHit >= BLOCK_REGEN_DELAY then
+                    visualBlock = math.min(MAX_BLOCK, visualBlock + BLOCK_REGEN_RATE * dt)
+                    pcall(function() saberComp:SetBlock() end)
+                end
+            elseif isBlocking then
+                lastBlockHit = os.clock()
+            end
+            if type(b) == "number" and b < MAX_BLOCK then
+                saberComp.BlocksLeft = MAX_BLOCK
+            end
         end
     end
 end))
@@ -1900,36 +2119,10 @@ local function unbindSink(name)
     pcall(function() game:GetService("ContextActionService"):UnbindAction(name) end)
 end
 
-local function combatStateNow()
-    local sc = saberComp
-    if not saberStillValid(sc) then return nil end
-    local ok, st = pcall(function() return rawget(sc, "CombatStateMachine"):GetCurrentState() end)
-    return ok and st or nil
-end
-
 -- While the Anti-kick counter / Parry chase runs, the game is told "block released" (and swings fire),
 -- but your real block button is usually still held. The game only re-blocks by itself from some
 -- states, so afterwards you could be left with the saber out and no block. This puts the block
 -- back the moment it is possible - but ONLY if you are really still holding your block button.
-local function userHoldsBlock()
-    local held = false
-    pcall(function()
-        local sc = saberComp
-        local b = sc and rawget(sc, "_pcBlockBinding")
-        if b == nil then
-            held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-        elseif typeof(b) == "EnumItem" and b.EnumType == Enum.UserInputType then
-            held = UserInputService:IsMouseButtonPressed(b)
-        elseif typeof(b) == "EnumItem" then
-            held = UserInputService:IsKeyDown(b)
-        end
-        local gp = sc and rawget(sc, "_gpBlockKey")
-        if not held and gp ~= nil then
-            held = UserInputService:IsGamepadButtonDown(Enum.UserInputType.Gamepad1, gp)
-        end
-    end)
-    return held
-end
 local function reblockIfHeld()
     task.spawn(function()
         local t0 = os.clock()
@@ -2018,15 +2211,8 @@ local function doEvade()
         local prevCamType
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
         if cam then
-            -- (v78) turn the camera ONCE to face the escape direction - WITHOUT taking it over. It used to be
-            -- switched to Scriptable and frozen for the whole evade, so as you dashed away your view stayed
-            -- behind ("stuck far away"), and if anything went wrong it never came back.
-            pcall(function()
-                if cam.CameraType == Enum.CameraType.Custom then
-                    local eye = hrp.Position - faceDir * 10 + Vector3.new(0, 4, 0)
-                    cam.CFrame = CFrame.lookAt(eye, hrp.Position + faceDir * 20)
-                end
-            end)
+            -- (v88) EASE the camera round to the escape direction (no snap), at your own zoom, view kept level.
+            AP.followFacing(1.2) -- camera swings round to where you're facing for the whole evade
         end
 
         -- 2) CAMERA-BREAKING ZIG-ZAG. Whoever chases you has their camera following you, so big
@@ -2136,6 +2322,7 @@ function AP.releaseCam(owner, want)
     AP.camOwners[owner] = nil
     if next(AP.camOwners) then return end -- someone else of ours still has it
     pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseCam") end)
+    pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EaseCam") end)
     pcall(function()
         local cam = workspace.CurrentCamera
         if not cam then return end
@@ -2160,6 +2347,72 @@ do
             log("camera was left stuck - handed back to you")
         end
     end))
+end
+
+-- SMOOTH CAMERA (v88). Every time the script turns your view it now EASES round (no snapping), turning
+-- the short way, and it keeps the view LEVEL: the up/down angle is held between a little above the
+-- horizon and a comfortable look-down, so you never end up staring at the floor or up from under it.
+-- It only rotates the normal game camera around your character at your own zoom - never takes it over.
+AP.CAM_PITCH_MIN, AP.CAM_PITCH_MAX = math.rad(-30), math.rad(5)
+function AP.camStep(cam, flatDir, dt, speed)
+    if not cam or cam.CameraType ~= Enum.CameraType.Custom then return 0 end
+    if not flatDir or flatDir.Magnitude < 0.01 then return 0 end
+    local focus = cam.Focus.Position
+    local cf = cam.CFrame
+    local dist = (cf.Position - focus).Magnitude
+    local look = cf.LookVector
+    local pitch = math.asin(math.clamp(look.Y, -1, 1))
+    local fromYaw = math.atan2(look.X, look.Z)
+    if Vector3.new(look.X, 0, look.Z).Magnitude < 0.01 then fromYaw = math.atan2(flatDir.X, flatDir.Z) end
+    local toYaw = math.atan2(flatDir.X, flatDir.Z)
+    local d = (toYaw - fromYaw + math.pi) % (2 * math.pi) - math.pi -- shortest way round
+    local a = 1 - math.exp(-speed * math.min(dt, 0.1))           -- same feel at any FPS
+    local yaw = fromYaw + d * a
+    local p = pitch + (math.clamp(pitch, AP.CAM_PITCH_MIN, AP.CAM_PITCH_MAX) - pitch) * a
+    local newLook = Vector3.new(math.sin(yaw) * math.cos(p), math.sin(p), math.cos(yaw) * math.cos(p))
+    if dist < 0.6 then
+        cam.CFrame = CFrame.lookAt(cf.Position, cf.Position + newLook)   -- first person: turn on the spot
+    else
+        cam.CFrame = CFrame.lookAt(focus - newLook * dist, focus)
+    end
+    return math.abs(d)
+end
+-- CAMERA FOLLOWS YOUR FACING (v89): whenever the script turns your character (chase, evade, anti-kick,
+-- perfect trade) the camera smoothly swings round to look the way your character is facing, kept level.
+AP.camFollowUntil = 0
+function AP.followFacing(sec)
+    AP.camFollowUntil = math.max(AP.camFollowUntil, os.clock() + (sec or 0.6))
+end
+pcall(function() RunService:UnbindFromRenderStep("ForceHBE_FollowCam") end)
+pcall(function()
+    RunService:BindToRenderStep("ForceHBE_FollowCam", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        if os.clock() > AP.camFollowUntil then return end
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        local lv = hrp.CFrame.LookVector
+        local flat = Vector3.new(lv.X, 0, lv.Z)
+        if flat.Magnitude < 0.05 then return end
+        AP.camStep(workspace.CurrentCamera, flat.Unit, dt, 7)
+    end)
+end)
+-- ease the view round to face a direction over a short moment, then let go
+function AP.easeCamTo(dir, dur)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    local flat = Vector3.new(dir.X, 0, dir.Z)
+    if flat.Magnitude < 0.01 then return end
+    flat = flat.Unit
+    local t0 = os.clock()
+    pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EaseCam") end)
+    pcall(function()
+        RunService:BindToRenderStep("ForceHBE_EaseCam", Enum.RenderPriority.Camera.Value + 1, function(dt)
+            local left = AP.camStep(cam, flat, dt, 9)
+            if os.clock() - t0 > (dur or 0.45) or left < math.rad(1.5) then
+                pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EaseCam") end)
+            end
+        end)
+    end)
 end
 
 local chaseBusy = false
@@ -2233,26 +2486,11 @@ local function startChase(plr) -- returns true if a chase started
         if settings.chaseCam and cam and cam.CameraType == Enum.CameraType.Custom then
             pcall(function()
                 prevCamType = cam.CameraType
-                RunService:BindToRenderStep("ForceHBE_ChaseCam", Enum.RenderPriority.Camera.Value + 1, function()
+                pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EaseCam") end)
+                RunService:BindToRenderStep("ForceHBE_ChaseCam", Enum.RenderPriority.Camera.Value + 1, function(dt)
                     if not lockPos or cam.CameraType ~= Enum.CameraType.Custom then return end
-                    local focus = cam.Focus.Position
-                    local cf = cam.CFrame
-                    local dist = (cf.Position - focus).Magnitude
-                    local flat = Vector3.new(lockPos.X - focus.X, 0, lockPos.Z - focus.Z)
-                    if flat.Magnitude < 1 then return end
-                    -- keep your pitch (how far up/down you look), just swing the heading round to them
-                    local look = cf.LookVector
-                    local pitch = math.asin(math.clamp(look.Y, -0.95, 0.95))
-                    local want = flat.Unit * math.cos(pitch) + Vector3.new(0, math.sin(pitch), 0)
-                    local newLook = look:Lerp(want, 0.3)
-                    if newLook.Magnitude < 0.05 then return end
-                    newLook = newLook.Unit
-                    if dist < 0.6 then
-                        -- first person (zoomed all the way in): just turn on the spot
-                        cam.CFrame = CFrame.lookAt(cf.Position, cf.Position + newLook)
-                    else
-                        cam.CFrame = CFrame.lookAt(focus - newLook * dist, focus)
-                    end
+                    -- (v89) camera looks where YOUR CHARACTER faces (it's turned onto them each frame)
+                    AP.followFacing(0.3)
                 end)
             end)
             -- safety net: whatever happens, the camera is handed back (a chase lasts 6s at most)
@@ -2723,6 +2961,7 @@ local function startKickCounter(plr, kickTrk)
             if flat.Magnitude > 0.5 then
                 moveDir = flat.Unit
                 hrp.CFrame = CFrame.lookAt(pos, pos + flat)
+                AP.followFacing(0.6)
             end
         end)
         pcall(function()
@@ -2733,7 +2972,7 @@ local function startKickCounter(plr, kickTrk)
                 if faceAt and hrp and hrp.Parent then
                     local pos = hrp.Position
                     local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
-                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat) end
+                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.4) end
                 end
             end)
         end)
@@ -2762,7 +3001,7 @@ local function startKickCounter(plr, kickTrk)
                 pcall(function()
                     local pos = hrp.Position
                     local flat = Vector3.new(lastTPos.X - pos.X, 0, lastTPos.Z - pos.Z)
-                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat) end
+                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.5) end
                 end)
             end
 
@@ -3028,6 +3267,7 @@ do
                         if to.Magnitude > 0.1 and lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end
                     end
                     pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(th.Position.X, mh.Position.Y, th.Position.Z)) end)
+                    AP.followFacing(0.6)
                 end
             end
             local function unblock()
@@ -4316,7 +4556,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v87"
+hint.Text = "Ctrl+H = hide  |  v89"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4566,8 +4806,20 @@ makeHeader(150, "VISUALS")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce, "force")
 makeSwitch(12, "Infinite Block", settings.block, setBlock, "block")
-makeSwitch(13, "Infinite Parry", settings.parry, function(on) settings.parry = on end, "parry")
-makeSwitch(14, "Infinite Kicks", settings.kick, function(on) settings.kick = on end, "kick")
+makeSwitch(13, "Infinite Parry", settings.parry, function(on)
+    settings.parry = on
+    if not on then
+        if visualParries ~= nil then visualParries = nil end
+        if saberComp and saberStillValid(saberComp) then pcall(function() saberComp:SetParries() end) end
+    end
+end, "parry")
+makeSwitch(14, "Infinite Kicks", settings.kick, function(on)
+    settings.kick = on
+    if not on then
+        if visualKicks ~= nil then visualKicks = nil end
+        if saberComp and saberStillValid(saberComp) then pcall(function() saberComp:SetKicks() end) end
+    end
+end, "kick")
 makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
@@ -5698,6 +5950,8 @@ local function cleanup()
     -- never leave the camera taken over when the script is stopped / re-run
     pcall(function()
         for k in pairs(AP.camOwners) do AP.camOwners[k] = nil end
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_FollowCam") end)
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_EaseCam") end)
         if os.clock() - AP.camTouchedAt < 30 then AP.releaseCam("cleanup") end
     end)
     for _, c in ipairs(connections) do
