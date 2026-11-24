@@ -376,6 +376,7 @@ end
 -- Visual Resource Simulation (Legit HUD appearance)
 ------------------------------------------------------------------------
 local visualForce = nil
+local forceDrainAcc = 0
 local lastForceSpend = 0
 local FORCE_RECHARGE_DELAY = 2.5
 local FORCE_REGEN_RATE = 40
