@@ -4778,7 +4778,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v101"
+hint.Text = "Ctrl+H = hide  |  v102"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4975,13 +4975,14 @@ local function makeWhitelist(order, labelText, listName, btnWord, single)
         for _ in pairs(wl) do n += 1 end
         btn.Text = ("%s (%d) %s"):format(btnWord or "Whitelist", n, panel.Visible and "^" or "v")
         if single then
-            -- (v101) single pick: show who is picked right in the label
-            local who
+            -- (v102) show who is picked right in the label (any number of players)
+            local names = {}
             for uid in pairs(wl) do
                 local p = Players:GetPlayerByUserId(uid)
-                who = p and (p.DisplayName ~= "" and p.DisplayName or p.Name) or ("id " .. tostring(uid))
+                names[#names + 1] = p and (p.DisplayName ~= "" and p.DisplayName or p.Name) or ("id " .. tostring(uid))
             end
-            lbl.Text = who and (labelText .. ": " .. who) or (labelText .. " (none = all)")
+            table.sort(names)
+            lbl.Text = #names > 0 and (labelText .. ": " .. table.concat(names, ", ")) or (labelText .. " (none = all)")
         end
     end
     local function rebuild()
@@ -5015,7 +5016,6 @@ local function makeWhitelist(order, labelText, listName, btnWord, single)
                     if wl[plr.UserId] then
                         wl[plr.UserId] = nil
                     else
-                        if single then for k in pairs(wl) do wl[k] = nil end end -- only ONE player at a time
                         wl[plr.UserId] = true
                     end
                     count()
@@ -5037,7 +5037,7 @@ local function makeWhitelist(order, labelText, listName, btnWord, single)
 end
 makeHeader(10, "RESOURCES")
 makeHeader(190, "COMBAT")
--- (v101) Universal whitelist: pick ONE player and every feature only acts on them
+-- (v101/v102) Universal whitelist: pick one or more players and every feature only acts on them
 makeWhitelist(195, "Universal whitelist", "universal", "Pick", true)
 makeHeader(1400, "HITBOX EXPANDER")
 makeHeader(1500, "VISUALS")
@@ -5469,7 +5469,7 @@ do
             { "Whitelists and teams", {
                 "Each feature has its own list (Parry only, Chase only, HBE, ESP), so ticking someone in one does not affect the others.",
                 "Parry only and Chase only are pick lists: ticked players are the ONLY ones it acts on. The HBE and ESP whitelists skip whoever is ticked.",
-                "Universal whitelist (top of COMBAT): pick ONE player and every feature (HBE, ESP, Auto Parry, Anti-kick, Perfect trade, Parry chase, Stun evade) only acts on them. Picking someone else swaps to them; click the picked name again to clear it (everyone again). Stun evade only goes off when the picked player is near you. It works on top of each feature's own list.",
+                "Universal whitelist (top of COMBAT): tick one or more players and every feature (HBE, ESP, Auto Parry, Anti-kick, Perfect trade, Parry chase, Stun evade) only acts on them. Click a ticked name again to untick it; nobody ticked = everyone again. Stun evade only goes off when a picked player is near you. It works on top of each feature's own list.",
             } },
         } },
     }
