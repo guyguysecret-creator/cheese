@@ -1846,6 +1846,10 @@ apStep = function(dt)
 
         -- kicks are the time-critical case: use the game's own input path (no OS mouse
         -- latency), with a real click as a back-up if it didn't take
+        -- (v90) attacked from BEHIND (or the side): turn round to face them first, so the parry and the
+        -- multis that follow go out forward at them
+        if AP.faceToward then AP.faceToward(bestPlr, true) end
+        AP.noBackKey()
         local sent
         if st2 and (st2.isKick or st2.isDash) then sent = sendParryDirect() else sent = sendParryClick() end
         -- when the parry ends, make sure your block comes back if you're still holding block (the game only
@@ -1925,6 +1929,27 @@ local evadeBusy, wasStunned, lastCSM = false, false, nil
 local KEY_W, KEY_E = 0x57, 0x45
 
 local KEY_A, KEY_D = 0x41, 0x44
+
+-- (v90) NEVER BACKWARDS: the game reads S before W, so S held = a BACKWARDS dash / multi. Every script
+-- move (chase, trade, evade, anti-kick) calls this each frame: if S is down it is let go, so moves
+-- always go out FORWARD (W) the way your character faces.
+function AP.noBackKey()
+    if type(keyrelease) == "function" and UserInputService:IsKeyDown(Enum.KeyCode.S) then pcall(keyrelease, 0x53) end
+end
+-- turn your character to face a player (flat, no tilt); the camera follows (AP.followFacing)
+function AP.faceToward(plr, onlyIfBehind)
+    local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local th = plr and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+    if not mh or not th then return end
+    local to = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
+    if to.Magnitude < 0.3 then return end
+    if onlyIfBehind then
+        local lf = Vector3.new(mh.CFrame.LookVector.X, 0, mh.CFrame.LookVector.Z)
+        if lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end -- already roughly facing them
+    end
+    pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, mh.Position + to) end)
+    if AP.followFacing then AP.followFacing(0.6) end
+end
 
 local STUN_ANIM_IDS = { ["6297531803"] = true, ["6322313635"] = true, ["6322315386"] = true }
 local function findStunTrack(char)
@@ -2252,6 +2277,7 @@ local function doEvade()
                 -- (the heading offset + the path swing never turn you more than ~88 deg off the escape line)
                 local a = math.clamp(pathAngle(el), -88 - baseOff, 88 - baseOff)
                 hum:Move(CFrame.Angles(0, math.rad(a), 0):VectorToWorldSpace(faceDir), false)
+                AP.noBackKey()
             end)
         end)
 
@@ -2467,10 +2493,13 @@ local function startChase(plr) -- returns true if a chase started
         -- Steering: ONE move vector, applied after the game's own controls every frame. We never
         -- set the character's CFrame or touch the camera (the humanoid turns toward where it's
         -- moving by itself), so changing direction in the middle of a dash is just a new vector.
+        -- (v90) face the person you parried FIRST (they may be behind you), so every dash / multi is forward
+        AP.faceToward(plr, false)
         local moveDir = hrp.CFrame.LookVector
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_ChaseMove", Enum.RenderPriority.Last.Value, function()
                 if hum then hum:Move(moveDir, false) end
+                AP.noBackKey()
             end)
         end)
 
@@ -2552,10 +2581,12 @@ local function startChase(plr) -- returns true if a chase started
         -- expander makes their hit area ~12 studs wide, which forgives both). So with it off, the chase
         -- closes in tighter and snaps your character to face them for each swing / multi dash.
         local function faceTarget()
-            if settings.hbe or not lastTPos or not hrp then return end
+            -- (v90) always (HBE on too): every chase dash / multi goes out FACING them, forward
+            if not lastTPos or not hrp then return end
             pcall(function()
                 local pos = hrp.Position
                 hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
+                AP.followFacing(0.4)
             end)
         end
         local function cancelListener()
@@ -3275,11 +3306,11 @@ do
                 return th, mh
             end
             local function faceThem()
-                if settings.hbe then return end
                 local th, mh = aim()
                 if th and mh then
-                    -- natural: no instant snap-turn unless they're well off to the side (you turn by moving)
-                    if natural then
+                    -- natural (or HBE on): no snap-turn unless they're well off to the side / BEHIND you -
+                    -- then you always turn round to face them so the multi goes out forward (v90)
+                    if natural or settings.hbe then
                         local to = flatV(th.Position - mh.Position)
                         local lf = flatV(mh.CFrame.LookVector)
                         if to.Magnitude > 0.1 and lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end
@@ -3299,6 +3330,7 @@ do
                 pcall(function()
                     RunService:BindToRenderStep("ForceHBE_TradeMove", Enum.RenderPriority.Last.Value, function()
                         if hum and moveDir then hum:Move(moveDir, false) end
+                        AP.noBackKey()
                     end)
                 end)
                 if haveKeys and not plain then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
@@ -4574,7 +4606,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v89"
+hint.Text = "Ctrl+H = hide  |  v90"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
