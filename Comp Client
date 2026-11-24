@@ -81,6 +81,9 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
     tradeAccuracy = 100,   -- %: 100 = perfect (every hit, instant, always a multi); lower = NATURAL (human-like)
+    tradeCircle = true,    -- Perfect trade: while you block near an opponent, face them and circle round them
+    aimAssist = true,      -- Perfect trade: face them + lead your aim to where they're moving (toggle key below)
+    aimAssistKey = "None", -- key that toggles Aim assist (set it in the panel)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
     parryChaseKey = "None", -- key that toggles Parry chase (set it in the panel)
     autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
@@ -93,7 +96,7 @@ local settings = {
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
     -- [UserId] = true: that player is skipped by that feature (chase / parryOnly: the ONLY ones chased / parried)
     -- ("parry" is the old skip list - no longer used, kept so old configs still load)
-    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {} },
+    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {}, antiKickOnly = {} },
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
@@ -595,7 +598,7 @@ track(RunService.Heartbeat:Connect(function(dt)
         end
     end
     wrapCharComp(charComp)
-    -- Use observed max force (≈446)
+    -- Use observed max force (â‰ˆ446)
     local maxF = rawget(charComp, "MaxForce") or 446
     if not visualForce then visualForce = maxF end
     if prevForce == nil then prevForce = maxF end
@@ -1476,7 +1479,14 @@ end
 -- is this player's current swing a real threat to us? returns urgency (lower = sooner), swingTrack
 local function assessThreat(plr, myHrp, forCounter)
     -- Auto Parry only reacts to players on the "Parry only" list (everyone if it's empty), never teammates with team check on
-    if not parryPicked(plr) or (settings.parryTeamCheck and sameTeam(plr)) then return nil end
+    -- (v92) Anti-kick has its OWN pick list: when anyone is ticked there, it decides alone for kicks
+    local akl = forCounter and settings.whitelist.antiKickOnly
+    if akl and next(akl) ~= nil then
+        if not akl[plr.UserId] then return nil end
+    elseif not parryPicked(plr) then
+        return nil
+    end
+    if settings.parryTeamCheck and sameTeam(plr) then return nil end
     local char = plr.Character
     if not char then return nil end
     local hrp = char:FindFirstChild("HumanoidRootPart")
@@ -1948,7 +1958,7 @@ function AP.faceToward(plr, onlyIfBehind)
         if lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end -- already roughly facing them
     end
     pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, mh.Position + to) end)
-    if AP.followFacing then AP.followFacing(0.6) end
+    if AP.lockOn then AP.lockOn(plr, 0.6) end -- camera taken over and snapped onto them (v91)
 end
 
 local STUN_ANIM_IDS = { ["6297531803"] = true, ["6322313635"] = true, ["6322315386"] = true }
@@ -2428,8 +2438,52 @@ function AP.followFacing(sec)
     AP.camFollowUntil = math.max(AP.camFollowUntil, os.clock() + (sec or 0.6))
 end
 pcall(function() RunService:UnbindFromRenderStep("ForceHBE_FollowCam") end)
+-- (v91) CAMERA LOCK-ON: while the script fights someone (auto parry from behind, parry chase, perfect
+-- trade) the camera is TAKEN OVER and snapped onto them every frame, level, and your character is turned
+-- with it. With shift lock the game turns your character to the CAMERA, so if the camera still pointed
+-- away the dash / multi went out backwards - now camera and character both face the opponent first.
+AP.lockPlr, AP.lockUntil = nil, 0
+function AP.lockOn(plr, sec)
+    if not plr then return end
+    local keep = (AP.lockPlr == plr) and AP.lockUntil or 0
+    AP.lockPlr = plr
+    AP.lockUntil = math.max(keep, os.clock() + (sec or 0.6))
+end
+function AP.lockTargetDir()
+    if not AP.lockPlr or os.clock() > AP.lockUntil then return nil end
+    local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    local tc = AP.lockPlr.Character
+    local th = tc and tc:FindFirstChild("HumanoidRootPart")
+    local th2 = tc and tc:FindFirstChildOfClass("Humanoid")
+    if not mh or not th or (th2 and th2.Health <= 0) then return nil end
+    local to = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
+    if to.Magnitude < 0.3 then return nil end
+    return to.Unit, mh
+end
+-- wait (a few frames at most) until you are really facing them, so the attack goes out forward
+function AP.waitFacing(plr, maxT)
+    local t0 = os.clock()
+    while os.clock() - t0 < (maxT or 0.2) do
+        local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local th = plr and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+        if not mh or not th then return end
+        local to = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
+        local lf = Vector3.new(mh.CFrame.LookVector.X, 0, mh.CFrame.LookVector.Z)
+        local cam = workspace.CurrentCamera
+        local cl = cam and Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z) or lf
+        if to.Magnitude < 0.3 or (lf.Magnitude > 0.1 and cl.Magnitude > 0.1
+            and lf.Unit:Dot(to.Unit) > 0.9 and cl.Unit:Dot(to.Unit) > 0.85) then return end
+        RunService.RenderStepped:Wait()
+    end
+end
 pcall(function()
     RunService:BindToRenderStep("ForceHBE_FollowCam", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        local lockDir, lockHrp = AP.lockTargetDir()
+        if lockDir then
+            AP.camStep(workspace.CurrentCamera, lockDir, dt, 1e6) -- instant: camera snapped onto them
+            pcall(function() lockHrp.CFrame = CFrame.lookAt(lockHrp.Position, lockHrp.Position + lockDir) end)
+            return
+        end
         if os.clock() > AP.camFollowUntil then return end
         local char = LocalPlayer.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -2495,13 +2549,16 @@ local function startChase(plr) -- returns true if a chase started
         -- moving by itself), so changing direction in the middle of a dash is just a new vector.
         -- (v90) face the person you parried FIRST (they may be behind you), so every dash / multi is forward
         AP.faceToward(plr, false)
+        AP.lockOn(plr, 0.4)
         local moveDir = hrp.CFrame.LookVector
         pcall(function()
             RunService:BindToRenderStep("ForceHBE_ChaseMove", Enum.RenderPriority.Last.Value, function()
                 if hum then hum:Move(moveDir, false) end
                 AP.noBackKey()
+                AP.lockOn(plr, 0.3) -- camera stays locked on them for the whole chase (lets go 0.3s after)
             end)
         end)
+        AP.waitFacing(plr, 0.25) -- face them FIRST, then start attacking
 
         -- the dash reads "is W down?"; the multi is W + A + E
         if haveKeys then
@@ -3188,6 +3245,9 @@ end
 -- AnimationPlayed hook the moment a kick animation starts on anyone
 local function tryCounterKick(plr)
     if not settings.antiKick or counterBusy then return end
+    -- (v92) "Anti-kick only": anyone ticked = ONLY those players' kicks are countered (none ticked = all)
+    local akl = settings.whitelist.antiKickOnly
+    if akl and next(akl) ~= nil and not akl[plr.UserId] then return end
     -- (v82) only while you're actually in a fight: saber ignited (ignited / blocking / parrying / swinging).
     -- Sheathed, unequipped, or just walking around = Anti-kick never moves you.
     local csK = combatStateNow()
@@ -3296,27 +3356,39 @@ do
             local char = LocalPlayer.Character
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             local moveDir
+            local steer = false -- (v92) only steer YOUR movement during the dash + swing itself
+            -- (v92) AIM ASSIST: aim where they'll BE when the hit lands (their position + their speed x a
+            -- moment), not where they are now - so circling / strafing opponents still get hit
+            local assist = settings.aimAssist ~= false -- (v93) Aim assist switch / key
+            local function aimPoint(th)
+                if not assist then return th.Position end -- off: aim where they are, no lead
+                local v = Vector3.zero
+                pcall(function() v = th.AssemblyLinearVelocity end)
+                return th.Position + Vector3.new(v.X, 0, v.Z) * (0.12 + math.min(pingEma, 0.3))
+            end
             local function aim()
                 local tc = plr.Character
                 local th = tc and tc:FindFirstChild("HumanoidRootPart")
                 local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if not th or not mh then return nil end
-                local to = flatV(th.Position - mh.Position)
+                local to = flatV(aimPoint(th) - mh.Position)
                 if to.Magnitude > 0.3 then moveDir = to.Unit end
                 return th, mh
             end
             local function faceThem()
+                -- (v92) ALWAYS face them (aim assist): the multi never goes out while you look elsewhere
                 local th, mh = aim()
                 if th and mh then
-                    -- natural (or HBE on): no snap-turn unless they're well off to the side / BEHIND you -
-                    -- then you always turn round to face them so the multi goes out forward (v90)
-                    if natural or settings.hbe then
+                    if not assist then
+                        -- aim assist OFF: only turn you if they're off to the side / behind (so the multi
+                        -- still never goes out backwards); otherwise your own aim is left alone
                         local to = flatV(th.Position - mh.Position)
                         local lf = flatV(mh.CFrame.LookVector)
                         if to.Magnitude > 0.1 and lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end
                     end
-                    pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(th.Position.X, mh.Position.Y, th.Position.Z)) end)
-                    AP.followFacing(0.6)
+                    local p = aimPoint(th)
+                    pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(p.X, mh.Position.Y, p.Z)) end)
+                    AP.lockOn(plr, 0.4)
                 end
             end
             local function unblock()
@@ -3329,10 +3401,16 @@ do
                 aim()
                 pcall(function()
                     RunService:BindToRenderStep("ForceHBE_TradeMove", Enum.RenderPriority.Last.Value, function()
-                        if hum and moveDir then hum:Move(moveDir, false) end
+                        -- (v92) your own movement is NOT stopped: we only steer during the dash + swing
+                        if steer and hum and moveDir then hum:Move(moveDir, false) end
                         AP.noBackKey()
+                        if assist then AP.lockOn(plr, 0.3) end -- camera locked on them for the trade (v91)
                     end)
                 end)
+                if assist then AP.lockOn(plr, 0.4) end
+                faceThem()
+                AP.waitFacing(plr, 0.15) -- face them FIRST, then dash / multi
+                steer = true
                 if haveKeys and not plain then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
                 -- 1) let go of block
                 unblock()
@@ -3384,6 +3462,62 @@ do
             tradeBusy = false
             reblockIfHeld() -- block back up (only if you're still holding it)
         end)
+    end
+
+    -- (v92) TRADE CIRCLING: real trades are two players circling each other on block. While Perfect trade
+    -- is on and you're blocking near an opponent, your character + camera face them and you strafe round
+    -- them at trading distance (~8 studs), switching direction every 1-3s. Press any of W/A/S/D and YOUR
+    -- movement takes over (it keeps facing them). Never during a trade / chase / anti-kick / evade.
+    do
+        local side, flipAt = 1, 0
+        local function circleTarget(mh)
+            local best, bestD
+            for _, p in ipairs(Players:GetPlayers()) do
+                if p ~= LocalPlayer and parryPicked(p) and not (settings.parryTeamCheck and sameTeam(p)) then
+                    local ch = p.Character
+                    local h = ch and ch:FindFirstChild("HumanoidRootPart")
+                    local hu = ch and ch:FindFirstChildOfClass("Humanoid")
+                    if h and hu and hu.Health > 0 then
+                        local d = flatV(h.Position - mh.Position).Magnitude
+                        if d <= 14 and (not bestD or d < bestD) then best, bestD = p, d end
+                    end
+                end
+            end
+            return best
+        end
+        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeCircle") end)
+        RunService:BindToRenderStep("ForceHBE_TradeCircle", Enum.RenderPriority.Last.Value, function()
+            if not (settings.perfectTrade and settings.tradeCircle) then return end
+            if tradeBusy or counterBusy or chaseBusy or evadeBusy then return end
+            if combatStateNow() ~= "blocking" then return end
+            local char = LocalPlayer.Character
+            local mh = char and char:FindFirstChild("HumanoidRootPart")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not mh or not hum then return end
+            local tgt = circleTarget(mh)
+            if not tgt then return end
+            AP.lockOn(tgt, 0.25) -- face them (character + camera)
+            local K = Enum.KeyCode
+            if UserInputService:IsKeyDown(K.W) or UserInputService:IsKeyDown(K.A)
+                or UserInputService:IsKeyDown(K.S) or UserInputService:IsKeyDown(K.D) then
+                return -- your keys win
+            end
+            local th = tgt.Character and tgt.Character:FindFirstChild("HumanoidRootPart")
+            if not th then return end
+            local to = flatV(th.Position - mh.Position)
+            if to.Magnitude < 0.3 then return end
+            local now = os.clock()
+            if now > flipAt then
+                if flipAt > 0 and math.random() < 0.7 then side = -side end
+                flipAt = now + 1 + math.random() * 2
+            end
+            local u = to.Unit
+            local tangent = Vector3.new(-u.Z, 0, u.X) * side
+            local radial = u * math.clamp((to.Magnitude - 8) / 4, -1, 1) -- keep ~8 studs apart
+            local dir = tangent + radial * 0.8
+            if dir.Magnitude > 0.05 then hum:Move(dir.Unit, false) end
+        end)
+        track({ Disconnect = function() pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeCircle") end) end })
     end
 
     local function tryTrade()
@@ -4606,7 +4740,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v90"
+hint.Text = "Ctrl+H = hide  |  v93"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4850,9 +4984,9 @@ local function makeWhitelist(order, labelText, listName, btnWord)
     count()
 end
 makeHeader(10, "RESOURCES")
-makeHeader(19, "COMBAT")
-makeHeader(140, "HITBOX EXPANDER")
-makeHeader(150, "VISUALS")
+makeHeader(190, "COMBAT")
+makeHeader(1400, "HITBOX EXPANDER")
+makeHeader(1500, "VISUALS")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce, "force")
 makeSwitch(12, "Infinite Block", settings.block, setBlock, "block")
@@ -4870,7 +5004,7 @@ makeSwitch(14, "Infinite Kicks", settings.kick, function(on)
         if saberComp and saberStillValid(saberComp) then pcall(function() saberComp:SetKicks() end) end
     end
 end, "kick")
-makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
+makeSwitch(270, "Auto Parry", settings.autoParry, function(on)
     settings.autoParry = on
     if on then
         -- self-test so you can see in F9 whether everything Auto Parry needs is there
@@ -4883,23 +5017,23 @@ makeSwitch(27, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end, "autoParry")
-makeSwitch(141, "Hitbox Expander", settings.hbe, setHBE, "hbe")
-makeSwitch(142, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
-makeSwitch(28, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
-makeWhitelist(29, "Parry only (none = all)", "parryOnly", "Pick")
-makeSwitch(31, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
+makeSwitch(1410, "Hitbox Expander", settings.hbe, setHBE, "hbe")
+makeSwitch(1420, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
+makeSwitch(280, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
+makeWhitelist(290, "Parry only (none = all)", "parryOnly", "Pick")
+makeSwitch(310, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
 -- early warning for dash-kicks / dash-attacks (best for high ping); parries enemies
 -- force-dashing straight at you, so it can also spend a parry on a plain dash
-makeSwitch(32, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end, "dashGuard")
+makeSwitch(320, "Dash guard (high ping)", settings.dashGuard, function(on) settings.dashGuard = on end, "dashGuard")
 -- when you get stunned: instantly hold S + dash backwards (Force needed - Infinite Force helps)
-makeSwitch(20, "Stun evade", settings.autoEvade, function(on)
+makeSwitch(200, "Stun evade", settings.autoEvade, function(on)
     settings.autoEvade = on
     if on then installEvadeHook() end -- early trigger (the 2s self-heal keeps retrying if the saber isn't found yet)
 end, "autoEvade")
 
 -- Anti-kick: toggle here or with its key (rebindable in the row below)
 -- (placed right after the Anti-kick rows - order 26)
-antiKickSwitch = makeSwitch(22, "Anti-kick (counter)", settings.antiKick, function(on)
+antiKickSwitch = makeSwitch(220, "Anti-kick (counter)", settings.antiKick, function(on)
     if on ~= settings.antiKick then setAntiKick(on) end
 end, "antiKick")
 
@@ -4984,12 +5118,14 @@ function KB.makeRow(order, labelText, settingKey)
         end)
     end)
 end
-KB.makeRow(23, "Anti-kick key", "antiKickKey")
+KB.makeRow(230, "Anti-kick key", "antiKickKey")
+-- tick players here and Anti-kick ONLY counters their kicks (nobody ticked = everyone)
+makeWhitelist(245, "Anti-kick only (none = all)", "antiKickOnly", "Pick")
 do
     -- tells you whether the hooks are really in place (so you're not guessing)
     local st = Instance.new("TextLabel")
     st.Size = UDim2.new(1, -16, 0, 14)
-    st.LayoutOrder = 24
+    st.LayoutOrder = 240
     st.BackgroundTransparency = 1
     st.Font = Enum.Font.Gotham
     st.TextSize = 10
@@ -5024,29 +5160,29 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     CFG_UI.num[key] = { min = minV, max = maxV, refresh = function() box.Text = tostring(settings[key]) end }
 end
 
-makeWhitelist(143, "HBE whitelist", "hbe")
-makeNumberBox(144, "Hitbox size", "hbeSize", 2, 50)
+makeWhitelist(1430, "HBE whitelist", "hbe")
+makeNumberBox(1440, "Hitbox size", "hbeSize", 2, 50)
 -- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(145, "Transparency (0-1)", "hbeTransparency", 0, 1)
+makeNumberBox(1450, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
 -- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
-makeSwitch(151, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
-makeSwitch(152, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end, "espOutline")
-makeSwitch(153, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
-makeSwitch(154, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
-makeWhitelist(155, "ESP whitelist", "esp")
+makeSwitch(1510, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
+makeSwitch(1520, "ESP outline", settings.espOutline, function(on) settings.espOutline = on end, "espOutline")
+makeSwitch(1530, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
+makeSwitch(1540, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
+makeWhitelist(1550, "ESP whitelist", "esp")
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
-makeNumberBox(33, "Parry timing (ms)", "parryOffset", -500, 500)
+makeNumberBox(330, "Parry timing (ms)", "parryOffset", -500, 500)
 -- how wide the Stun evade zig-zag swings (degrees): lower = ends up FARTHER away, higher = harder to chase
-makeNumberBox(21, "Evade zig-zag (deg)", "zigAngle", 0, 80)
+makeNumberBox(210, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
-makeNumberBox(30, "Parry strictness (0-100)", "parryStrict", 0, 100)
+makeNumberBox(300, "Parry strictness (0-100)", "parryStrict", 0, 100)
 -- after you parry + stun someone: dash to them and multi (W, E, swing) until their stun ends
-local parryChaseSwitch = makeSwitch(34, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
+local parryChaseSwitch = makeSwitch(340, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
 -- keybind that toggles Parry chase on/off (click the box, press a key / combo / mouse button)
-KB.makeRow(35, "Parry chase key", "parryChaseKey")
+KB.makeRow(350, "Parry chase key", "parryChaseKey")
 KB.add(function() return settings.parryChaseKey end, function()
     settings.parryChase = not settings.parryChase
     if parryChaseSwitch then parryChaseSwitch(settings.parryChase, true) end
@@ -5054,19 +5190,30 @@ KB.add(function() return settings.parryChaseKey end, function()
     if AP.toast then AP.toast("Parry chase", settings.parryChase) end
 end)
 -- 0-800 ms. At 50 or below = ULTRA multi (no pacing: as fast as the game allows)
-makeNumberBox(41, "Multi delay (ms)", "multiDelay", 0, 800)
+makeNumberBox(410, "Multi delay (ms)", "multiDelay", 0, 800)
 -- very far evades: click, W+E, Space (dash snipe with a jump), then multi on landing
-makeSwitch(42, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
+makeSwitch(420, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
-makeSwitch(43, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
+makeSwitch(430, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
-makeWhitelist(44, "Chase only (none = all)", "chase", "Pick")
+makeWhitelist(440, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
-makeSwitch(25, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
+makeSwitch(250, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
 -- 100 = perfect (every hit, instant, always a multi); lower = natural / human-like (see the Guide)
-makeNumberBox(26, "Trade accuracy (%)", "tradeAccuracy", 0, 100)
+makeNumberBox(260, "Trade accuracy (%)", "tradeAccuracy", 0, 100)
+-- while blocking near an opponent: face them and keep circling round them (your own keys always win)
+makeSwitch(265, "Trade: circle opponent", settings.tradeCircle, function(on) settings.tradeCircle = on end, "tradeCircle")
+-- (v93) Aim assist for trades: switch + its own toggle key
+AP.aimAssistSwitch = makeSwitch(262, "Aim assist (trades)", settings.aimAssist, function(on) settings.aimAssist = on end, "aimAssist")
+KB.makeRow(263, "Aim assist key", "aimAssistKey")
+KB.add(function() return settings.aimAssistKey end, function()
+    settings.aimAssist = not settings.aimAssist
+    if AP.aimAssistSwitch then AP.aimAssistSwitch(settings.aimAssist, true) end
+    log("Aim assist " .. (settings.aimAssist and "ON" or "OFF") .. " (key)")
+    if AP.toast then AP.toast("Aim assist", settings.aimAssist) end
+end)
 -- ON = Parry chase never goes after your own team (e.g. other Jedi when you're a Jedi)
-makeSwitch(45, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
+makeSwitch(450, "Chase team check", settings.chaseTeamCheck, function(on) settings.chaseTeamCheck = on end, "chaseTeamCheck")
 
 ------------------------------------------------------------------------
 -- GUIDE: a button at the very top of the feature list opens a separate window that explains
@@ -5202,8 +5349,21 @@ do
             } },
             { "Trade accuracy (%)", {
                 "Default {{100}} = PERFECT: every hit on your block is traded, instantly, always with a multi (the way it has always worked).",
-                "Below 100 = NATURAL, so it looks like a person. Only that % of hits get traded (the rest you just keep blocking). After 2 trades in a row the next is much less likely. There is a random human reaction first (about 60 ms at 100, slower the lower you go), and it re-checks after it that you're still blocking and they're still there. Some trades are a plain swing instead of a multi (half of 100 minus the accuracy, e.g. 20% at 60), and there's no instant snap-turn toward them.",
+                "Below 100 = NATURAL, so it looks like a person. Only that % of hits get traded (the rest you just keep blocking). After 2 trades in a row the next is much less likely. There is a random human reaction first (about 60 ms at 100, slower the lower you go), and it re-checks after it that you're still blocking and they're still there. Some trades are a plain swing instead of a multi (half of 100 minus the accuracy, e.g. 20% at 60).",
+                "Every trade faces them first and aims where they're moving to (aim assist), and your own movement is never stopped - only the dash + swing itself is steered.",
                 "Try {{65}} to {{80}} for natural-looking trades.",
+            } },
+            { "Aim assist (trades) + Aim assist key", {
+                "Default ON. Every Perfect trade turns you to face them first, keeps the camera on them, and aims where they're moving to (their speed + your ping), so trades land on strafing opponents.",
+                "OFF: it aims where they are (no lead) and only turns you if they're off to the side or behind you (so the multi still never goes out backwards).",
+                "Set a key in the Aim assist key box to flip it on/off mid-fight - a small pop-up shows ON or OFF.",
+            } },
+            { "Trade: circle opponent", {
+                "Default ON. While Perfect trade is on and you're blocking near an opponent (14 studs), your character and camera face them and you strafe round them at about 8 studs, switching direction every 1-3 seconds - like players circling each other while trading.",
+                "Press W, A, S or D and your own movement takes over (you still face them). Turn it OFF to keep the old behaviour.",
+            } },
+            { "Anti-kick only (none = all)", {
+                "Tick players here and Anti-kick only counters THEIR kicks. Nobody ticked = it counters everyone (it then follows the Parry only list like before).",
             } },
             { "Anti-kick key", {
                 "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
