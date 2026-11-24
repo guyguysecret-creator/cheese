@@ -81,7 +81,6 @@ local settings = {
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
     tradeAccuracy = 100,   -- %: 100 = perfect (every hit, instant, always a multi); lower = NATURAL (human-like)
-    tradeCircle = true,    -- Perfect trade: while you block near an opponent, face them and circle round them
     aimAssist = true,      -- Perfect trade: face them + lead your aim to where they're moving (toggle key below)
     aimAssistKey = "None", -- key that toggles Aim assist (set it in the panel)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
@@ -3397,13 +3396,22 @@ do
             local function swing()
                 pcall(function() saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin }) end)
             end
+            -- (v94) KEEP YOUR MOVEMENT: remember which movement keys YOU were already holding. At the end only the
+            -- keys the script pressed itself are let go - before, letting go of W / A also let go of YOUR W / A,
+            -- so you stopped dead after every trade until you pressed the key again.
+            local KC = Enum.KeyCode
+            local heldW = UserInputService:IsKeyDown(KC.W)
+            local heldA = UserInputService:IsKeyDown(KC.A)
+            local heldS = UserInputService:IsKeyDown(KC.S)
+            local lastSSeen = heldS and os.clock() or -math.huge
             local okT, errT = pcall(function()
                 aim()
                 pcall(function()
                     RunService:BindToRenderStep("ForceHBE_TradeMove", Enum.RenderPriority.Last.Value, function()
                         -- (v92) your own movement is NOT stopped: we only steer during the dash + swing
                         if steer and hum and moveDir then hum:Move(moveDir, false) end
-                        AP.noBackKey()
+                        if UserInputService:IsKeyDown(KC.S) then lastSSeen = os.clock() end
+                        if steer then AP.noBackKey() end -- S only let go during the dash + swing (never a backwards multi)
                         if assist then AP.lockOn(plr, 0.3) end -- camera locked on them for the trade (v91)
                     end)
                 end)
@@ -3455,69 +3463,23 @@ do
                 RunService.RenderStepped:Wait()
                 aim()
                 RunService.RenderStepped:Wait()
+                steer = false -- the move is out: your own movement from here on
             end)
             if not okT then warn("[ForceHBE] perfect trade error: " .. tostring(errT)) end
+            steer = false
             pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeMove") end)
-            if haveKeys then pcall(keyrelease, KEY_W); pcall(keyrelease, KEY_A) end
+            if haveKeys then
+                -- (v94) only let go of keys the SCRIPT pressed; yours stay down so you keep moving
+                if not heldW then pcall(keyrelease, KEY_W) end
+                if not heldA then pcall(keyrelease, KEY_A) end
+                -- S was let go during the dash: if you're still holding it, put it back
+                if heldS and os.clock() - lastSSeen < 0.15 and not UserInputService:IsKeyDown(KC.S) then
+                    pcall(keypress, 0x53)
+                end
+            end
             tradeBusy = false
             reblockIfHeld() -- block back up (only if you're still holding it)
         end)
-    end
-
-    -- (v92) TRADE CIRCLING: real trades are two players circling each other on block. While Perfect trade
-    -- is on and you're blocking near an opponent, your character + camera face them and you strafe round
-    -- them at trading distance (~8 studs), switching direction every 1-3s. Press any of W/A/S/D and YOUR
-    -- movement takes over (it keeps facing them). Never during a trade / chase / anti-kick / evade.
-    do
-        local side, flipAt = 1, 0
-        local function circleTarget(mh)
-            local best, bestD
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= LocalPlayer and parryPicked(p) and not (settings.parryTeamCheck and sameTeam(p)) then
-                    local ch = p.Character
-                    local h = ch and ch:FindFirstChild("HumanoidRootPart")
-                    local hu = ch and ch:FindFirstChildOfClass("Humanoid")
-                    if h and hu and hu.Health > 0 then
-                        local d = flatV(h.Position - mh.Position).Magnitude
-                        if d <= 14 and (not bestD or d < bestD) then best, bestD = p, d end
-                    end
-                end
-            end
-            return best
-        end
-        pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeCircle") end)
-        RunService:BindToRenderStep("ForceHBE_TradeCircle", Enum.RenderPriority.Last.Value, function()
-            if not (settings.perfectTrade and settings.tradeCircle) then return end
-            if tradeBusy or counterBusy or chaseBusy or evadeBusy then return end
-            if combatStateNow() ~= "blocking" then return end
-            local char = LocalPlayer.Character
-            local mh = char and char:FindFirstChild("HumanoidRootPart")
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            if not mh or not hum then return end
-            local tgt = circleTarget(mh)
-            if not tgt then return end
-            AP.lockOn(tgt, 0.25) -- face them (character + camera)
-            local K = Enum.KeyCode
-            if UserInputService:IsKeyDown(K.W) or UserInputService:IsKeyDown(K.A)
-                or UserInputService:IsKeyDown(K.S) or UserInputService:IsKeyDown(K.D) then
-                return -- your keys win
-            end
-            local th = tgt.Character and tgt.Character:FindFirstChild("HumanoidRootPart")
-            if not th then return end
-            local to = flatV(th.Position - mh.Position)
-            if to.Magnitude < 0.3 then return end
-            local now = os.clock()
-            if now > flipAt then
-                if flipAt > 0 and math.random() < 0.7 then side = -side end
-                flipAt = now + 1 + math.random() * 2
-            end
-            local u = to.Unit
-            local tangent = Vector3.new(-u.Z, 0, u.X) * side
-            local radial = u * math.clamp((to.Magnitude - 8) / 4, -1, 1) -- keep ~8 studs apart
-            local dir = tangent + radial * 0.8
-            if dir.Magnitude > 0.05 then hum:Move(dir.Unit, false) end
-        end)
-        track({ Disconnect = function() pcall(function() RunService:UnbindFromRenderStep("ForceHBE_TradeCircle") end) end })
     end
 
     local function tryTrade()
@@ -4740,7 +4702,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v93"
+hint.Text = "Ctrl+H = hide  |  v94"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5201,8 +5163,6 @@ makeWhitelist(440, "Chase only (none = all)", "chase", "Pick")
 makeSwitch(250, "Perfect trade (block, then multi)", settings.perfectTrade, function(on) settings.perfectTrade = on end, "perfectTrade")
 -- 100 = perfect (every hit, instant, always a multi); lower = natural / human-like (see the Guide)
 makeNumberBox(260, "Trade accuracy (%)", "tradeAccuracy", 0, 100)
--- while blocking near an opponent: face them and keep circling round them (your own keys always win)
-makeSwitch(265, "Trade: circle opponent", settings.tradeCircle, function(on) settings.tradeCircle = on end, "tradeCircle")
 -- (v93) Aim assist for trades: switch + its own toggle key
 AP.aimAssistSwitch = makeSwitch(262, "Aim assist (trades)", settings.aimAssist, function(on) settings.aimAssist = on end, "aimAssist")
 KB.makeRow(263, "Aim assist key", "aimAssistKey")
@@ -5357,10 +5317,6 @@ do
                 "Default ON. Every Perfect trade turns you to face them first, keeps the camera on them, and aims where they're moving to (their speed + your ping), so trades land on strafing opponents.",
                 "OFF: it aims where they are (no lead) and only turns you if they're off to the side or behind you (so the multi still never goes out backwards).",
                 "Set a key in the Aim assist key box to flip it on/off mid-fight - a small pop-up shows ON or OFF.",
-            } },
-            { "Trade: circle opponent", {
-                "Default ON. While Perfect trade is on and you're blocking near an opponent (14 studs), your character and camera face them and you strafe round them at about 8 studs, switching direction every 1-3 seconds - like players circling each other while trading.",
-                "Press W, A, S or D and your own movement takes over (you still face them). Turn it OFF to keep the old behaviour.",
             } },
             { "Anti-kick only (none = all)", {
                 "Tick players here and Anti-kick only counters THEIR kicks. Nobody ticked = it counters everyone (it then follows the Parry only list like before).",
