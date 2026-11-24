@@ -2749,12 +2749,13 @@ local function startChase(plr) -- returns true if a chase started
         end
         local t0 = os.clock()
         local stunOver = false
+        local lastRaw = 0 -- (v97) stun time left as we SEE it (no ping taken off) when the loop stopped
         while os.clock() - t0 < 6 and settings.parryChase do
             local tc = plr.Character
             local thum = tc and tc:FindFirstChildOfClass("Humanoid")
             if not tc or not thum or thum.Health <= 0 then break end
             local stunTrk = findStunTrack(tc)
-            if not stunTrk then stunOver = true break end      -- their stun ended: stop (then one bonus multi)
+            if not stunTrk then stunOver = true break end      -- their stun ended: stop (no extra hit - see SMART LAST HIT)
             -- TIME LEFT IN THEIR STUN - the same number the ESP shows: their stun animation is played
             -- so that its length equals the stun length, so what's left of the animation is what's
             -- left of the stun. We see it one ping late (they're already further along), so ping is
@@ -2764,11 +2765,12 @@ local function startChase(plr) -- returns true if a chase started
             local okR, rem = pcall(function()
                 return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
             end)
-            if okR and type(rem) == "number" then remEff = rem - pingEma end
-            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop (then one bonus multi)
-            -- a new dash needs ~0.3s to land, a cancel-into-swing ~0.12s: don't START what can't land
-            local canDash = remEff >= 0.3
-            local canSwing = remEff >= 0.12
+            if okR and type(rem) == "number" then remEff = rem - pingEma; lastRaw = rem end
+            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop
+            -- a new dash needs ~0.35s to land, a cancel-into-swing ~0.15s: don't START what can't land
+            -- (v97: a little more margin - the last hit used to land just as they could parry again)
+            local canDash = remEff >= 0.35
+            local canSwing = remEff >= 0.15
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
             MELEE, ARRIVED = (settings.hbe and 7 or 5), (settings.hbe and 5 or 3.5)
@@ -2852,61 +2854,24 @@ local function startChase(plr) -- returns true if a chase started
             RunService.RenderStepped:Wait()
         end
 
-        -- (v70) BONUS MULTI: when the script thinks their stun is over, it still throws ONE more multi
-        -- cycle (dash cancelled into a swing, or a plain swing) if they are close - what we see of their
-        -- stun is a ping late and often ends early on our screen, so this extra hit usually still lands.
+        -- (v97) SMART LAST HIT. The old "bonus multi" always threw one more full multi after their stun ended -
+        -- and that's the hit that got parried. Now there's only a last hit when it can still land:
+        --   * their stun animation is still playing on our screen with at least ~0.1s left, AND
+        --   * they're right next to you (no dash needed), AND your saber can swing RIGHT NOW
+        -- then it's ONE instant plain swing (the fastest hit there is, no dash, no waiting). If they're
+        -- already out of the stun, too far, or you can't swing this frame: no extra hit.
         if stunOver and settings.parryChase then
             pcall(function()
+                local tc = plr.Character
+                if not tc or not findStunTrack(tc) then return end       -- already free: they'd parry it
+                if lastRaw < 0.1 then return end                         -- not enough stun left to land it
                 local dist = updateAim()
-                if not dist or dist > MELEE + 3 then return end
-                local tB = os.clock()
-                -- wait (briefly) for a swing to be possible
-                while os.clock() - tB < 0.3 and combatStateNow() ~= "ignited" and combatStateNow() ~= "blocking" do
-                    updateAim()
-                    RunService.RenderStepped:Wait()
-                end
-                -- ALWAYS A MULTI: keep asking for the dash (up to ~0.4s, e.g. while the dash cooldown runs
-                -- out) until it really starts, then cancel THAT dash into the swing. A plain swing is
-                -- only the last resort if a dash is impossible (no Force).
-                local function force()
-                    local f = 0
-                    pcall(function() f = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
-                    return f
-                end
-                local dashed = false
-                if force() >= 40 then
-                    local tD = os.clock()
-                    while os.clock() - tD < 0.4 do
-                        updateAim()
-                        local cs = combatStateNow()
-                        local onCd = false
-                        pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
-                        if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) then
-                            faceTarget()
-                            sendDashInput()
-                        end
-                        RunService.RenderStepped:Wait()
-                        if movementState() == "dashing" then dashed = true break end
-                    end
-                end
-                if dashed then
-                    cancelListener()
-                    RunService.RenderStepped:Wait()             -- dash running 2 frames: now cancel it
-                    updateAim()
-                    cancelListener()
-                    -- the cancel turns into a swing only from "ignited": wait for it briefly
-                    local tC = os.clock()
-                    while os.clock() - tC < 0.2 and combatStateNow() ~= "ignited" do RunService.RenderStepped:Wait() end
-                    faceTarget()
-                    local h = saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
-                    if type(h) == "function" then pcall(h, true) else sendAttack() end
-                elseif combatStateNow() == "ignited" then
-                    faceTarget()
-                    sendAttack()
-                end
-                -- give the swing a moment to go out before the keys are released
+                if not dist or dist > MELEE + 1 then return end          -- would need a dash: too slow
+                if combatStateNow() ~= "ignited" then return end         -- can't swing this instant
+                faceTarget()
+                sendAttack()
                 local tE = os.clock()
-                while os.clock() - tE < 0.12 do updateAim() RunService.RenderStepped:Wait() end
+                while os.clock() - tE < 0.08 do updateAim() RunService.RenderStepped:Wait() end
             end)
         end
 
@@ -4743,7 +4708,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v96"
+hint.Text = "Ctrl+H = hide  |  v97"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
