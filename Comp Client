@@ -893,6 +893,12 @@ local AP = {
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     KICK_CLOSE = 9,      -- (v95) Anti-kick: a plain kick (no dash) is only countered from this close (studs)
     DASH_RUSH = 30,      -- (v96) studs/s toward you that counts as DASHING at you (walking is 16)
+    -- (v98) PARRY CHASE STOP RULE (see the chase loop)
+    HIT_SWING = 0.15,    -- s from sending a swing until it can land on the server
+    HIT_DASH = 0.35,     -- s from sending a dash (then cancel-swing) until it can land
+    OPP_PARRY_CD = 1.5,  -- s an opponent's parry cools down after they use it
+    chaseMargin = 0.06,  -- s of extra safety; LEARNS: +0.06 every time a chase hit gets parried, -0.01 when not
+    oppParryT = {},      -- [player] = when we saw them start a parry
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
     CLOSE_CONE = 0.55,   -- cos(~57 deg): how directly they must face you for the close rule
@@ -1267,6 +1273,9 @@ local function updateSwings(myHrp, dt)
                 g.blockVal = bv ~= nil and bv:IsA("NumberValue") and not AP.markerBad
                 g.blockAnim, g.parryAnim = AP.scanGuard(char)
                 if g.blockVal or g.blockAnim or g.parryAnim then g.last = os.clock() end
+                -- (v98) when did THEY last start a parry? (their parry then cools down AP.OPP_PARRY_CD)
+                if g.parryAnim and not g.wasParry then AP.oppParryT[plr] = os.clock() end
+                g.wasParry = g.parryAnim
             end
             -- RUSH TRACKER: last time they were moving toward me fast (any facing - back-dashes count)
             if hrp0 then
@@ -2765,12 +2774,26 @@ local function startChase(plr) -- returns true if a chase started
             local okR, rem = pcall(function()
                 return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
             end)
-            if okR and type(rem) == "number" then remEff = rem - pingEma; lastRaw = rem end
-            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop
-            -- a new dash needs ~0.35s to land, a cancel-into-swing ~0.15s: don't START what can't land
-            -- (v97: a little more margin - the last hit used to land just as they could parry again)
-            local canDash = remEff >= 0.35
-            local canSwing = remEff >= 0.15
+            -- (v98) REAL TIMING. What we see of their stun is late by THEIR lag to the server plus the server's lag
+            -- to us (~1 ping), and our hit reaches the server one more ping after we send it. So the stun
+            -- time that's really left for OUR hit = what we see - 2 x ping - a safety margin (which learns:
+            -- every chase hit that gets parried adds to it, see the end of the chase).
+            if okR and type(rem) == "number" then
+                lastRaw = rem
+                remEff = rem - 2 * pingEma - AP.chaseMargin
+            end
+            -- they're PARRYING right now: stop at once, never swing into it
+            local gP = AP.guard[plr]
+            if gP and gP.parryAnim then stunOver = true break end
+            -- their parry still COOLING DOWN when our hit lands (they used it within the last ~1.5s, the
+            -- same thing the ESP's "Parry - CD" shows): they can't parry it, so hits stay safe even past the stun
+            local pT = AP.oppParryT[plr]
+            local parryLocked = pT ~= nil
+                and (os.clock() - pT) + pingEma + AP.HIT_SWING < AP.OPP_PARRY_CD - 0.1
+            if remEff <= 0 and not parryLocked then stunOver = true break end -- no hit can land in time: stop
+            -- only START what lands while they're still stunned (or can't parry)
+            local canDash = remEff >= AP.HIT_DASH or parryLocked
+            local canSwing = remEff >= AP.HIT_SWING or parryLocked
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
             MELEE, ARRIVED = (settings.hbe and 7 or 5), (settings.hbe and 5 or 3.5)
@@ -2854,24 +2877,24 @@ local function startChase(plr) -- returns true if a chase started
             RunService.RenderStepped:Wait()
         end
 
-        -- (v97) SMART LAST HIT. The old "bonus multi" always threw one more full multi after their stun ended -
-        -- and that's the hit that got parried. Now there's only a last hit when it can still land:
-        --   * their stun animation is still playing on our screen with at least ~0.1s left, AND
-        --   * they're right next to you (no dash needed), AND your saber can swing RIGHT NOW
-        -- then it's ONE instant plain swing (the fastest hit there is, no dash, no waiting). If they're
-        -- already out of the stun, too far, or you can't swing this frame: no extra hit.
-        if stunOver and settings.parryChase then
-            pcall(function()
-                local tc = plr.Character
-                if not tc or not findStunTrack(tc) then return end       -- already free: they'd parry it
-                if lastRaw < 0.1 then return end                         -- not enough stun left to land it
-                local dist = updateAim()
-                if not dist or dist > MELEE + 1 then return end          -- would need a dash: too slow
-                if combatStateNow() ~= "ignited" then return end         -- can't swing this instant
-                faceTarget()
-                sendAttack()
-                local tE = os.clock()
-                while os.clock() - tE < 0.08 do updateAim() RunService.RenderStepped:Wait() end
+        -- (v98) NO EXTRA HIT after the stun (that was the hit that got parried). And the chase LEARNS: if you get
+        -- stunned by THEIR parry right after the chase, the safety margin goes up for next time; a clean
+        -- chase lowers it a little. So it settles on your ping and their reactions by itself.
+        do
+            local endedAt = os.clock()
+            task.spawn(function()
+                local parried = false
+                while os.clock() - endedAt < 1.0 do
+                    local pT = AP.oppParryT[plr]
+                    if combatStateNow() == "stunned" and pT and pT >= endedAt - 0.6 then parried = true break end
+                    RunService.Heartbeat:Wait()
+                end
+                if parried then
+                    AP.chaseMargin = math.min(0.4, AP.chaseMargin + 0.06)
+                    log(("Parry chase: last hit got parried - stopping earlier now (margin %.0f ms)"):format(AP.chaseMargin * 1000))
+                else
+                    AP.chaseMargin = math.max(0.02, AP.chaseMargin - 0.01)
+                end
             end)
         end
 
@@ -2955,7 +2978,8 @@ do
             if settings.chaseTeamCheck and sameTeam(plr) then allowed = false end
             -- enough stun left to be worth it
             local okR, rem = pcall(function() return (trk.Length - trk.TimePosition) / math.max(trk.Speed, 0.05) end)
-            local worth = not okR or type(rem) ~= "number" or rem - pingEma > 0.2
+            -- (v98) only worth chasing if at least one hit can still land inside their stun (same timing as the chase)
+            local worth = not okR or type(rem) ~= "number" or rem - 2 * pingEma - AP.chaseMargin > AP.HIT_SWING + 0.05
             if allowed and worth then
                 local seen = stunSeen[trk] or now
                 local la = lastAtk[plr]
@@ -4708,7 +4732,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v97"
+hint.Text = "Ctrl+H = hide  |  v98"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5281,6 +5305,7 @@ do
             } },
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
+                "**When it stops (v98):** a hit is only started if it lands on the server while they're STILL stunned: stun left as you see it, minus 2x your ping (their stun reaches you late, your hit reaches the server late), minus a safety margin. No extra hit after the stun. It stops at once if they start a parry, and keeps hitting past the stun only while their parry is still on cooldown (used in the last ~1.5s, like the ESP shows). The margin LEARNS: each time a chase hit gets parried it stops earlier next time, and clean chases slowly bring it back.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
