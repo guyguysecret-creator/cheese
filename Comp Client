@@ -85,7 +85,7 @@ local settings = {
     aimAssistKey = "None", -- key that toggles Aim assist (set it in the panel)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
     parryChaseKey = "None", -- key that toggles Parry chase (set it in the panel)
-    autoEvade = false,     -- when you get stunned: hold S + dash (E) backwards, faster than human timing
+    autoEvade = false,     -- when you get stunned: turn to face away, then a FORWARD (W) dash, faster than human timing
     espTeamCheck = false,  -- ESP: ON = enemies only, OFF = show your team too
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
@@ -892,6 +892,7 @@ local AP = {
     COUNTER_FAR = 50,    -- Anti-kick counter: a kicker this far who is FACING you also counts (a dash-kick starts its kick from up to ~one dash + one kick away)
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
     KICK_CLOSE = 9,      -- (v95) Anti-kick: a plain kick (no dash) is only countered from this close (studs)
+    DASH_RUSH = 30,      -- (v96) studs/s toward you that counts as DASHING at you (walking is 16)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
     CLOSE_CONE = 0.55,   -- cos(~57 deg): how directly they must face you for the close rule
@@ -1271,8 +1272,10 @@ local function updateSwings(myHrp, dt)
             if hrp0 then
                 local vr = plrVelFast[plr]
                 local toMeR = Vector3.new(myPos.X - hrp0.Position.X, 0, myPos.Z - hrp0.Position.Z)
+                -- (v96) DASH speed only (30+ studs/s toward me). It used to be 15 - and plain WALKING is 16,
+                -- so a W + kick from far away counted as a "dash-kick" and set off Anti-kick.
                 if vr and toMeR.Magnitude > 0.5 and toMeR.Magnitude <= 60
-                    and Vector3.new(vr.X, 0, vr.Z):Dot(toMeR.Unit) >= 15 then
+                    and Vector3.new(vr.X, 0, vr.Z):Dot(toMeR.Unit) >= AP.DASH_RUSH then
                     AP.rushT[plr] = os.clock()
                 end
             end
@@ -1551,7 +1554,7 @@ local function assessThreat(plr, myHrp, forCounter)
             local vNow = plrVelFast[plr] or Vector3.zero
             local dirToMe = toMe / d
             local closing = Vector3.new(vNow.X, 0, vNow.Z):Dot(Vector3.new(dirToMe.X, 0, dirToMe.Z))
-            local rushing = closing >= 15
+            local rushing = closing >= AP.DASH_RUSH -- (v96) a real dash, not walking (walk = 16 studs/s)
             -- a rush at me in the last 0.6s (tracked for everyone in updateSwings - the kick often comes
             -- right as their dash ends, forwards or backwards)
             local rushedRecently = AP.rushT[plr] ~= nil and os.clock() - AP.rushT[plr] < 0.8
@@ -1567,7 +1570,7 @@ local function assessThreat(plr, myHrp, forCounter)
             if d <= closeR then
                 return 0, trk
             end
-            if d <= closeR + 5 and closing >= 8 then
+            if d <= closeR + 3 and closing >= 8 then -- walking in: they can only cover ~3 more studs before the kick lands
                 return 0, trk
             end
             if dashedAtMe and d <= AP.COUNTER_FAR + hiddenC then
@@ -2237,6 +2240,7 @@ local function doEvade()
             if hum then pcall(function() hum:SetStateEnabled(Enum.HumanoidStateType.Jumping, true) end) end
             if haveKeys then pcall(keyrelease, KEY_W) end
             if camToRestore and camType then pcall(function() camToRestore.CameraType = camType end) end
+            AP.lockDirUntil = 0 -- camera handed back
             evadeBusy = false
         end
 
@@ -2271,9 +2275,22 @@ local function doEvade()
         faceDir = CFrame.Angles(0, math.rad(baseOff), 0):VectorToWorldSpace(faceDir)
         local prevCamType
         pcall(function() hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + faceDir) end)
-        if cam then
-            -- (v88) EASE the camera round to the escape direction (no snap), at your own zoom, view kept level.
-            AP.followFacing(1.2) -- camera swings round to where you're facing for the whole evade
+        -- (v96) TURN AROUND FIRST, then a FORWARD (W) dash - nobody evades backwards with S. The camera is
+        -- taken over and snapped to the escape direction too: with shift lock the game turns your character
+        -- to the CAMERA, so if the camera still faced the attacker you'd run away backwards.
+        AP.lockDirVec, AP.lockDirUntil = faceDir, os.clock() + 3
+        do
+            local tw = os.clock()
+            while os.clock() - tw < 0.08 do -- a frame or two: until you really face the escape way
+                local lv = hrp.CFrame.LookVector
+                local c = workspace.CurrentCamera
+                local cl = c and c.CFrame.LookVector or lv
+                local f = Vector3.new(faceDir.X, 0, faceDir.Z)
+                if f.Magnitude < 0.05 then break end
+                f = f.Unit
+                if Vector3.new(lv.X, 0, lv.Z).Unit:Dot(f) > 0.9 and Vector3.new(cl.X, 0, cl.Z).Unit:Dot(f) > 0.85 then break end
+                RunService.RenderStepped:Wait()
+            end
         end
 
         -- 2) CAMERA-BREAKING ZIG-ZAG. Whoever chases you has their camera following you, so big
@@ -2294,7 +2311,11 @@ local function doEvade()
                 local el = os.clock() - zigStart
                 -- (the heading offset + the path swing never turn you more than ~88 deg off the escape line)
                 local a = math.clamp(pathAngle(el), -88 - baseOff, 88 - baseOff)
-                hum:Move(CFrame.Angles(0, math.rad(a), 0):VectorToWorldSpace(faceDir), false)
+                local mv = CFrame.Angles(0, math.rad(a), 0):VectorToWorldSpace(faceDir)
+                hum:Move(mv, false)
+                -- (v96) you FACE where you run (forward dash, never backwards); camera follows it
+                AP.lockDirVec = mv
+                AP.lockDirUntil = math.max(AP.lockDirUntil or 0, os.clock() + 0.3)
                 AP.noBackKey()
             end)
         end)
@@ -2486,6 +2507,17 @@ function AP.waitFacing(plr, maxT)
 end
 pcall(function()
     RunService:BindToRenderStep("ForceHBE_FollowCam", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        -- (v96) direction lock (Stun evade): camera + character snapped to face the way you escape
+        if AP.lockDirVec and os.clock() < (AP.lockDirUntil or 0) then
+            local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            local v = Vector3.new(AP.lockDirVec.X, 0, AP.lockDirVec.Z)
+            if mh and v.Magnitude > 0.05 then
+                v = v.Unit
+                AP.camStep(workspace.CurrentCamera, v, dt, 1e6)
+                pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, mh.Position + v) end)
+                return
+            end
+        end
         local lockDir, lockHrp = AP.lockTargetDir()
         if lockDir then
             AP.camStep(workspace.CurrentCamera, lockDir, dt, 1e6) -- instant: camera snapped onto them
@@ -4711,7 +4743,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v95"
+hint.Text = "Ctrl+H = hide  |  v96"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5274,7 +5306,7 @@ do
                 "A dash on its own never makes you parry or unblock.",
             } },
             { "Stun evade", {
-                "The moment you get stunned, the script dashes you away from your attacker.",
+                "The moment you get stunned, the script turns you round to face AWAY from your attacker (character and camera), then does a FORWARD (W) dash - never a backwards S dash. While you run, you and the camera face the way you're going; the camera is handed back when the dash ends.",
                 "Every evade is different: the heading is random (straight, a diagonal or a wide side-step, left or right) and so is the path shape (fake-and-cut, triple cut, arc, late cut or small wobble), never the same shape twice in a row if it can help it.",
                 "Needs about 32 Force (Infinite Force covers it). A dash is capped at about 30 studs, and the game does not allow a second dash or a jump during a stun.",
             } },
@@ -5329,7 +5361,7 @@ do
             } },
             { "Anti-kick only (none = all)", {
                 "Tick players here and Anti-kick only counters THEIR kicks. Nobody ticked = it counters everyone (it then follows the Parry only list like before).",
-                "Range rule (v95): a plain kick (no dash) is only countered from about {{9}} studs (a little more on high ping), or up to ~14 if they're walking in at you. From further away it only counters if they DASHED at you (forwards or backwards) - a real dash-kick. So standing back and just pressing kick no longer drags you over.",
+                "Range rule (v96): a plain kick (no dash) is only countered from about {{9}} studs (a little more on high ping), or up to ~12 if they're walking in at you (walking + kick from further no longer counts as a dash). From further away it only counters if they DASHED at you (forwards or backwards) - a real dash-kick. So standing back and just pressing kick no longer drags you over.",
             } },
             { "Anti-kick key", {
                 "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
