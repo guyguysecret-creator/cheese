@@ -891,6 +891,7 @@ local AP = {
     COUNTER_RANGE = 26,  -- Anti-kick counter: react to a kicker this close (studs), wider than Auto Parry's kick test
     COUNTER_FAR = 50,    -- Anti-kick counter: a kicker this far who is FACING you also counts (a dash-kick starts its kick from up to ~one dash + one kick away)
     NEAR_RANGE = 7,      -- studs: inside this, facing is ignored (sweeping swings from the side)
+    KICK_CLOSE = 9,      -- (v95) Anti-kick: a plain kick (no dash) is only countered from this close (studs)
     CLOSE_COMMIT = 0.015, -- s: shorter feint filter when the attacker is within CLOSE_RANGE
     CLOSE_RANGE = 12,  -- studs: inside this, a swing animation facing you = parry right away
     CLOSE_CONE = 0.55,   -- cos(~57 deg): how directly they must face you for the close rule
@@ -1553,18 +1554,26 @@ local function assessThreat(plr, myHrp, forCounter)
             local rushing = closing >= 15
             -- a rush at me in the last 0.6s (tracked for everyone in updateSwings - the kick often comes
             -- right as their dash ends, forwards or backwards)
-            local rushedRecently = AP.rushT[plr] ~= nil and os.clock() - AP.rushT[plr] < 0.6
-            local comingAtMe = face >= -0.2 or rushing or rushedRecently
-            if d <= AP.COUNTER_RANGE + hiddenC and (comingAtMe or d <= AP.NEAR_RANGE) then
+            local rushedRecently = AP.rushT[plr] ~= nil and os.clock() - AP.rushT[plr] < 0.8
+            local dashedAtMe = rushing or rushedRecently
+            -- (v95) NO MORE "FAKE KICK FROM FAR": someone standing a few studs back and just pressing kick
+            -- (no dash) can't reach you - but the counter used to answer it anyway and dragged you over to
+            -- them. Now it goes by distance:
+            --   * CLOSE (kick range ~9 studs, a bit more on high ping): a standing kick CAN hit -> counter
+            --   * a bit further (up to 14) but WALKING in at you -> counter (they can step into range)
+            --   * further than that: ONLY if they DASHED at you (forwards or backwards) just now / are
+            --     dashing at you - a real dash-kick. A plain kick from there is ignored.
+            local closeR = AP.KICK_CLOSE + math.min(pingEma, 0.3) * 10
+            if d <= closeR then
                 return 0, trk
             end
-            -- FAR: a dash-kick starts its kick animation up to about one dash + one kick away (~40 studs),
-            -- before the kicker has even picked up speed. Anyone that far who is looking straight at you,
-            -- or already dashing (forwards OR backwards) at you, counts.
-            if d <= AP.COUNTER_FAR + hiddenC and (face >= 0.75 or rushing or rushedRecently) then
+            if d <= closeR + 5 and closing >= 8 then
                 return 0, trk
             end
-            return no("kicker too far / not coming at you for the counter")
+            if dashedAtMe and d <= AP.COUNTER_FAR + hiddenC then
+                return 0, trk
+            end
+            return no(("kick from %.0f studs with no dash at you - ignored"):format(d))
         end        -- HIGH PING: we only SEE the kick about one ping after it really started, and the
         -- kicker's position we see is that old too. So: (1) the kick is further along than
         -- it looks, (2) a kicker who dashes in during the 0.4s windup is closer than shown.
@@ -4702,7 +4711,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v94"
+hint.Text = "Ctrl+H = hide  |  v95"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5320,6 +5329,7 @@ do
             } },
             { "Anti-kick only (none = all)", {
                 "Tick players here and Anti-kick only counters THEIR kicks. Nobody ticked = it counters everyone (it then follows the Parry only list like before).",
+                "Range rule (v95): a plain kick (no dash) is only countered from about {{9}} studs (a little more on high ping), or up to ~14 if they're walking in at you. From further away it only counters if they DASHED at you (forwards or backwards) - a real dash-kick. So standing back and just pressing kick no longer drags you over.",
             } },
             { "Anti-kick key", {
                 "Click the box, then press the key or combo you want (for example Ctrl+U), a mouse button, or a modifier by itself such as Right Ctrl.",
