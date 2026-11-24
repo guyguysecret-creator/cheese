@@ -69,7 +69,7 @@ local function recommendedParryOffset()
     return math.clamp(v, -300, -40)
 end
 local settings = {
-    force = false,
+    force = true, -- enabled by default for debugging; can be toggled via HBE UI
     block = false,
     parry = false,
     kick = false,
