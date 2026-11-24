@@ -592,26 +592,30 @@ track(RunService.Heartbeat:Connect(function(dt)
     wrapCharComp(charComp)
     local maxF = rawget(charComp, "MaxForce") or 100
     if not visualForce then visualForce = maxF end
+    if prevForce == nil then prevForce = maxF end
 
     local currentF = rawget(charComp, "Force")
-    if type(currentF) == "number" and currentF < maxF then
-        local spent = maxF - currentF
-        -- Only apply visual drain if sufficient force was spent (>=1)
-        if spent >= 1 then
+    if type(currentF) == "number" then
+        if currentF < prevForce then
+            local spent = prevForce - currentF
             visualForce = math.max(0, visualForce - spent)
             lastForceSpend = os.clock()
-            pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
+            pcall(function()
+                charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1))
+            end)
         end
-        charComp.Force = maxF
-    else
-        if os.clock() - lastForceSpend >= FORCE_RECHARGE_DELAY then
-            if visualForce < maxF then
-                visualForce = math.min(maxF, visualForce + FORCE_REGEN_RATE * dt)
-                pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
-            end
-        end
-        if currentF and currentF < maxF then
-            charComp.Force = maxF
+    end
+    -- Reset force to max for infinite force
+    charComp.Force = maxF
+    prevForce = maxF
+
+    -- Regeneration when idle
+    if os.clock() - lastForceSpend >= FORCE_RECHARGE_DELAY then
+        if visualForce < maxF then
+            visualForce = math.min(maxF, visualForce + FORCE_REGEN_RATE * dt)
+            pcall(function()
+                charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1))
+            end)
         end
     end
 end))
