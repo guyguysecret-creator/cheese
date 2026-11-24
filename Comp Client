@@ -1736,6 +1736,7 @@ local function canParryNow()
 end
 
 local function sendParryClick()
+    AP.selfClickT = os.clock() -- (v99) our own click: never read as "you clicked to stop the chase"
     if type(mouse1click) == "function" and pcall(mouse1click) then return true end
     if type(mouse1press) == "function" and type(mouse1release) == "function" then
         if pcall(mouse1press) then
@@ -2615,6 +2616,19 @@ local function startChase(plr) -- returns true if a chase started
             pcall(keypress, KEY_A)
         end
 
+        -- (v99) YOU CAN STOP IT: one LEFT-CLICK during a chase stops it on the spot (no more hits, no bonus
+        -- multi). That click is swallowed, so it doesn't throw a swing of its own. The script's own clicks
+        -- (Auto Parry) are ignored.
+        AP.chaseStop = false
+        pcall(function()
+            game:GetService("ContextActionService"):BindActionAtPriority("ForceHBE_ChaseStop", function(_, state)
+                if state == Enum.UserInputState.Begin and os.clock() - (AP.selfClickT or -math.huge) > 0.15 then
+                    AP.chaseStop = true
+                end
+                return Enum.ContextActionResult.Sink
+            end, false, 9001, Enum.UserInputType.MouseButton1)
+        end)
+
         local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
 
@@ -2760,11 +2774,12 @@ local function startChase(plr) -- returns true if a chase started
         local stunOver = false
         local lastRaw = 0 -- (v97) stun time left as we SEE it (no ping taken off) when the loop stopped
         while os.clock() - t0 < 6 and settings.parryChase do
+            if AP.chaseStop then break end -- (v99) you left-clicked: stop right here, no more hits
             local tc = plr.Character
             local thum = tc and tc:FindFirstChildOfClass("Humanoid")
             if not tc or not thum or thum.Health <= 0 then break end
             local stunTrk = findStunTrack(tc)
-            if not stunTrk then stunOver = true break end      -- their stun ended: stop (no extra hit - see SMART LAST HIT)
+            if not stunTrk then stunOver = true break end      -- their stun ended: stop (then one bonus multi)
             -- TIME LEFT IN THEIR STUN - the same number the ESP shows: their stun animation is played
             -- so that its length equals the stun length, so what's left of the animation is what's
             -- left of the stun. We see it one ping late (they're already further along), so ping is
@@ -2774,26 +2789,11 @@ local function startChase(plr) -- returns true if a chase started
             local okR, rem = pcall(function()
                 return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
             end)
-            -- (v98) REAL TIMING. What we see of their stun is late by THEIR lag to the server plus the server's lag
-            -- to us (~1 ping), and our hit reaches the server one more ping after we send it. So the stun
-            -- time that's really left for OUR hit = what we see - 2 x ping - a safety margin (which learns:
-            -- every chase hit that gets parried adds to it, see the end of the chase).
-            if okR and type(rem) == "number" then
-                lastRaw = rem
-                remEff = rem - 2 * pingEma - AP.chaseMargin
-            end
-            -- they're PARRYING right now: stop at once, never swing into it
-            local gP = AP.guard[plr]
-            if gP and gP.parryAnim then stunOver = true break end
-            -- their parry still COOLING DOWN when our hit lands (they used it within the last ~1.5s, the
-            -- same thing the ESP's "Parry - CD" shows): they can't parry it, so hits stay safe even past the stun
-            local pT = AP.oppParryT[plr]
-            local parryLocked = pT ~= nil
-                and (os.clock() - pT) + pingEma + AP.HIT_SWING < AP.OPP_PARRY_CD - 0.1
-            if remEff <= 0 and not parryLocked then stunOver = true break end -- no hit can land in time: stop
-            -- only START what lands while they're still stunned (or can't parry)
-            local canDash = remEff >= AP.HIT_DASH or parryLocked
-            local canSwing = remEff >= AP.HIT_SWING or parryLocked
+            if okR and type(rem) == "number" then remEff = rem - pingEma; lastRaw = rem end
+            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop (then one bonus multi)
+            -- a new dash needs ~0.3s to land, a cancel-into-swing ~0.12s: don't START what can't land
+            local canDash = remEff >= 0.3
+            local canSwing = remEff >= 0.12
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
             MELEE, ARRIVED = (settings.hbe and 7 or 5), (settings.hbe and 5 or 3.5)
@@ -2877,24 +2877,61 @@ local function startChase(plr) -- returns true if a chase started
             RunService.RenderStepped:Wait()
         end
 
-        -- (v98) NO EXTRA HIT after the stun (that was the hit that got parried). And the chase LEARNS: if you get
-        -- stunned by THEIR parry right after the chase, the safety margin goes up for next time; a clean
-        -- chase lowers it a little. So it settles on your ping and their reactions by itself.
-        do
-            local endedAt = os.clock()
-            task.spawn(function()
-                local parried = false
-                while os.clock() - endedAt < 1.0 do
-                    local pT = AP.oppParryT[plr]
-                    if combatStateNow() == "stunned" and pT and pT >= endedAt - 0.6 then parried = true break end
-                    RunService.Heartbeat:Wait()
+        -- (v70) BONUS MULTI: when the script thinks their stun is over, it still throws ONE more multi
+        -- cycle (dash cancelled into a swing, or a plain swing) if they are close - what we see of their
+        -- stun is a ping late and often ends early on our screen, so this extra hit usually still lands.
+        if stunOver and settings.parryChase and not AP.chaseStop then -- (v99) left-click = no bonus multi either
+            pcall(function()
+                local dist = updateAim()
+                if not dist or dist > MELEE + 3 then return end
+                local tB = os.clock()
+                -- wait (briefly) for a swing to be possible
+                while os.clock() - tB < 0.3 and combatStateNow() ~= "ignited" and combatStateNow() ~= "blocking" do
+                    updateAim()
+                    RunService.RenderStepped:Wait()
                 end
-                if parried then
-                    AP.chaseMargin = math.min(0.4, AP.chaseMargin + 0.06)
-                    log(("Parry chase: last hit got parried - stopping earlier now (margin %.0f ms)"):format(AP.chaseMargin * 1000))
-                else
-                    AP.chaseMargin = math.max(0.02, AP.chaseMargin - 0.01)
+                -- ALWAYS A MULTI: keep asking for the dash (up to ~0.4s, e.g. while the dash cooldown runs
+                -- out) until it really starts, then cancel THAT dash into the swing. A plain swing is
+                -- only the last resort if a dash is impossible (no Force).
+                local function force()
+                    local f = 0
+                    pcall(function() f = rawget(rawget(saberComp, "CharacterComponent"), "Force") or 0 end)
+                    return f
                 end
+                local dashed = false
+                if force() >= 40 then
+                    local tD = os.clock()
+                    while os.clock() - tD < 0.4 do
+                        updateAim()
+                        local cs = combatStateNow()
+                        local onCd = false
+                        pcall(function() onCd = rawget(saberComp, "Cooldowns"):OnCooldown("dash") end)
+                        if (cs == "ignited" or cs == "blocking") and not onCd and groundedMS(movementState()) then
+                            faceTarget()
+                            sendDashInput()
+                        end
+                        RunService.RenderStepped:Wait()
+                        if movementState() == "dashing" then dashed = true break end
+                    end
+                end
+                if dashed then
+                    cancelListener()
+                    RunService.RenderStepped:Wait()             -- dash running 2 frames: now cancel it
+                    updateAim()
+                    cancelListener()
+                    -- the cancel turns into a swing only from "ignited": wait for it briefly
+                    local tC = os.clock()
+                    while os.clock() - tC < 0.2 and combatStateNow() ~= "ignited" do RunService.RenderStepped:Wait() end
+                    faceTarget()
+                    local h = saberStillValid(saberComp) and rawget(saberComp, "_dashCancelHandler")
+                    if type(h) == "function" then pcall(h, true) else sendAttack() end
+                elseif combatStateNow() == "ignited" then
+                    faceTarget()
+                    sendAttack()
+                end
+                -- give the swing a moment to go out before the keys are released
+                local tE = os.clock()
+                while os.clock() - tE < 0.12 do updateAim() RunService.RenderStepped:Wait() end
             end)
         end
 
@@ -2907,6 +2944,10 @@ local function startChase(plr) -- returns true if a chase started
         chaseBusy = false
         reblockIfHeld()
       end)
+      -- (v99) the left-click stop is only listening during a chase
+      pcall(function() game:GetService("ContextActionService"):UnbindAction("ForceHBE_ChaseStop") end)
+      if AP.chaseStop then log("Parry chase stopped (left-click)") end
+      AP.chaseStop = false
       if not okChase then
         warn("[ForceHBE] parry chase error (cleaned up, next chase will work): " .. tostring(errChase))
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseMove") end)
@@ -2979,7 +3020,7 @@ do
             -- enough stun left to be worth it
             local okR, rem = pcall(function() return (trk.Length - trk.TimePosition) / math.max(trk.Speed, 0.05) end)
             -- (v98) only worth chasing if at least one hit can still land inside their stun (same timing as the chase)
-            local worth = not okR or type(rem) ~= "number" or rem - 2 * pingEma - AP.chaseMargin > AP.HIT_SWING + 0.05
+            local worth = not okR or type(rem) ~= "number" or rem - pingEma > 0.2
             if allowed and worth then
                 local seen = stunSeen[trk] or now
                 local la = lastAtk[plr]
@@ -4732,7 +4773,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v98"
+hint.Text = "Ctrl+H = hide  |  v99"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5305,7 +5346,7 @@ do
             } },
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
-                "**When it stops (v98):** a hit is only started if it lands on the server while they're STILL stunned: stun left as you see it, minus 2x your ping (their stun reaches you late, your hit reaches the server late), minus a safety margin. No extra hit after the stun. It stops at once if they start a parry, and keeps hitting past the stun only while their parry is still on cooldown (used in the last ~1.5s, like the ESP shows). The margin LEARNS: each time a chase hit gets parried it stops earlier next time, and clean chases slowly bring it back.",
+                "**Stop it yourself:** LEFT-CLICK once during a chase and it stops right there - no more hits and no bonus multi at the end. That click doesn't throw a swing of its own. Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
