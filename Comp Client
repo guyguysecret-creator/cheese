@@ -96,7 +96,7 @@ local settings = {
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
     -- [UserId] = true: that player is skipped by that feature (chase / parryOnly: the ONLY ones chased / parried)
     -- ("parry" is the old skip list - no longer used, kept so old configs still load)
-    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {}, antiKickOnly = {} },
+    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {}, antiKickOnly = {}, universal = {} },
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
@@ -750,7 +750,15 @@ local function inWhitelist(listName, plr)
 end
 -- (v84) "Parry only": when anyone is ticked, Auto Parry / Anti-kick / Perfect trade answer ONLY those
 -- players; with nobody ticked they answer everyone
+-- (v101) "Universal whitelist": when ONE player is picked there, EVERY feature (HBE, ESP, Auto Parry,
+-- Anti-kick, Perfect trade, Parry chase, Stun evade) acts ONLY on that player. Nobody picked = normal.
+-- Checked on top of each feature's own list.
+local function uniPicked(plr)
+    local u = settings.whitelist and settings.whitelist.universal
+    return u == nil or next(u) == nil or u[plr.UserId] == true
+end
 local function parryPicked(plr)
+    if not uniPicked(plr) then return false end
     local wl = settings.whitelist and settings.whitelist.parryOnly
     return wl == nil or next(wl) == nil or wl[plr.UserId] == true
 end
@@ -772,6 +780,7 @@ end
 local function isEnemy(plr)
     if plr == LocalPlayer then return false end
     if inWhitelist("hbe", plr) then return false end        -- HBE whitelist: no expanded hitbox on them
+    if not uniPicked(plr) then return false end              -- (v101) Universal whitelist: only the picked player
     if not settings.teamCheck then return true end
     if LocalPlayer.Team == nil or plr.Team == nil then return true end
     return plr.Team ~= LocalPlayer.Team
@@ -1494,6 +1503,7 @@ local function assessThreat(plr, myHrp, forCounter)
     -- Auto Parry only reacts to players on the "Parry only" list (everyone if it's empty), never teammates with team check on
     -- (v92) Anti-kick has its OWN pick list: when anyone is ticked there, it decides alone for kicks
     local akl = forCounter and settings.whitelist.antiKickOnly
+    if not uniPicked(plr) then return nil end -- (v101) Universal whitelist
     if akl and next(akl) ~= nil then
         if not akl[plr.UserId] then return nil end
     elseif not parryPicked(plr) then
@@ -2043,7 +2053,7 @@ local function evadePlan(hrp)
                 local ch = plr.Character
                 local h = ch and ch:FindFirstChild("HumanoidRootPart")
                 local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-                if h and hum and hum.Health > 0 and (pass == 2 or not findStunTrack(ch)) then
+                if h and hum and hum.Health > 0 and (pass == 2 or not findStunTrack(ch)) and uniPicked(plr) then
                     local d = (h.Position - hrp.Position).Magnitude
                     if d <= 60 then
                         local since = lastAtk[plr] and (now - lastAtk[plr]) or 99
@@ -2061,6 +2071,8 @@ local function evadePlan(hrp)
         return v.Unit
     end
     local myLook = unit(flat(hrp.CFrame.LookVector), Vector3.new(0, 0, -1))
+    -- (v101) Universal whitelist set and the picked player isn't near you: they didn't stun you, no evade
+    if not best and next(settings.whitelist.universal) ~= nil then return nil end
     if not best then
         local back = -myLook -- nobody near: just turn around
         return back, back, nil
@@ -2279,6 +2291,7 @@ local function doEvade()
 
         -- 1) DECIDE the way (see evadePlan), TURN instantly (character + camera)
         local faceDir = evadePlan(hrp)
+        if not faceDir then cleanup() return end -- (v101) Universal whitelist: not the picked player
         -- RANDOM ESCAPE (v67): every evade picks its own heading off the "away" line (straight, a diagonal
         -- or a wide side-step, left or right) and its own path shape (see AP.makeEvadePath), never the
         -- same shape twice in a row if it can help it - so there is no pattern to read or chase.
@@ -3005,7 +3018,7 @@ do
             local plr, th, trk = s.plr, s.th, s.trk
             -- "Chase only" list: when anyone is ticked, ONLY those players are ever chased
             local allow = settings.whitelist.chase
-            local allowed = (next(allow) == nil) or allow[plr.UserId] == true
+            local allowed = ((next(allow) == nil) or allow[plr.UserId] == true) and uniPicked(plr)
             -- "Chase team check": never your own team
             if settings.chaseTeamCheck and sameTeam(plr) then allowed = false end
             -- enough stun left to be worth it
@@ -3309,6 +3322,7 @@ local function tryCounterKick(plr)
     -- (v92) "Anti-kick only": anyone ticked = ONLY those players' kicks are countered (none ticked = all)
     local akl = settings.whitelist.antiKickOnly
     if akl and next(akl) ~= nil and not akl[plr.UserId] then return end
+    if not uniPicked(plr) then return end -- (v101) Universal whitelist
     -- (v82) only while you're actually in a fight: saber ignited (ignited / blocking / parrying / swinging).
     -- Sheathed, unequipped, or just walking around = Anti-kick never moves you.
     local csK = combatStateNow()
@@ -3887,7 +3901,7 @@ do
             local hrp = char and char:FindFirstChild("HumanoidRootPart")
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             if plr ~= LocalPlayer and hrp and hum and hum.Health > 0
-                and (not settings.espTeamCheck or not sameTeam(plr)) and not inWhitelist("esp", plr) then
+                and (not settings.espTeamCheck or not sameTeam(plr)) and not inWhitelist("esp", plr) and uniPicked(plr) then
                 list[#list + 1] = { plr = plr, char = char, hrp = hrp, hum = hum,
                     d = myHrp and (hrp.Position - myHrp.Position).Magnitude or 0 }
             end
@@ -4764,7 +4778,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v100"
+hint.Text = "Ctrl+H = hide  |  v101"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4876,7 +4890,7 @@ local function makeHeader(order, text)
 end
 -- WHITELIST drop-down: a header row "Whitelist (n) v"; click it to open a search box and the
 -- list of everyone in the server. Tick a name = that feature skips them. Stored by UserId.
-local function makeWhitelist(order, labelText, listName, btnWord)
+local function makeWhitelist(order, labelText, listName, btnWord, single)
     local wl = settings.whitelist[listName]
     local container = Instance.new("Frame")
     container.Size = UDim2.new(1, -16, 0, 26)
@@ -4960,6 +4974,15 @@ local function makeWhitelist(order, labelText, listName, btnWord)
         local n = 0
         for _ in pairs(wl) do n += 1 end
         btn.Text = ("%s (%d) %s"):format(btnWord or "Whitelist", n, panel.Visible and "^" or "v")
+        if single then
+            -- (v101) single pick: show who is picked right in the label
+            local who
+            for uid in pairs(wl) do
+                local p = Players:GetPlayerByUserId(uid)
+                who = p and (p.DisplayName ~= "" and p.DisplayName or p.Name) or ("id " .. tostring(uid))
+            end
+            lbl.Text = who and (labelText .. ": " .. who) or (labelText .. " (none = all)")
+        end
     end
     local function rebuild()
         for _, c in ipairs(list:GetChildren()) do
@@ -4989,7 +5012,12 @@ local function makeWhitelist(order, labelText, listName, btnWord)
                 b.Text = ("  %s %s%s"):format(on and "[x]" or "[ ]", nm, nm ~= plr.Name and (" (@" .. plr.Name .. ")") or "")
                 b.Parent = list
                 b.MouseButton1Click:Connect(function()
-                    if wl[plr.UserId] then wl[plr.UserId] = nil else wl[plr.UserId] = true end
+                    if wl[plr.UserId] then
+                        wl[plr.UserId] = nil
+                    else
+                        if single then for k in pairs(wl) do wl[k] = nil end end -- only ONE player at a time
+                        wl[plr.UserId] = true
+                    end
                     count()
                     rebuild()
                 end)
@@ -5009,6 +5037,8 @@ local function makeWhitelist(order, labelText, listName, btnWord)
 end
 makeHeader(10, "RESOURCES")
 makeHeader(190, "COMBAT")
+-- (v101) Universal whitelist: pick ONE player and every feature only acts on them
+makeWhitelist(195, "Universal whitelist", "universal", "Pick", true)
 makeHeader(1400, "HITBOX EXPANDER")
 makeHeader(1500, "VISUALS")
 
@@ -5439,6 +5469,7 @@ do
             { "Whitelists and teams", {
                 "Each feature has its own list (Parry only, Chase only, HBE, ESP), so ticking someone in one does not affect the others.",
                 "Parry only and Chase only are pick lists: ticked players are the ONLY ones it acts on. The HBE and ESP whitelists skip whoever is ticked.",
+                "Universal whitelist (top of COMBAT): pick ONE player and every feature (HBE, ESP, Auto Parry, Anti-kick, Perfect trade, Parry chase, Stun evade) only acts on them. Picking someone else swaps to them; click the picked name again to clear it (everyone again). Stun evade only goes off when the picked player is near you. It works on top of each feature's own list.",
             } },
         } },
     }
