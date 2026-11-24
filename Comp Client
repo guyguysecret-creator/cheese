@@ -85,6 +85,7 @@ local settings = {
     aimAssistKey = "None", -- key that toggles Aim assist (set it in the panel)
     chaseTeamCheck = false, -- Parry chase: ON = never chase your own team
     parryChaseKey = "None", -- key that toggles Parry chase (set it in the panel)
+    chaseStopKey = "MB2",  -- (v100) key that STOPS a running chase (default right-click)
     autoEvade = false,     -- when you get stunned: turn to face away, then a FORWARD (W) dash, faster than human timing
     espTeamCheck = false,  -- ESP: ON = enemies only, OFF = show your team too
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
@@ -2616,18 +2617,10 @@ local function startChase(plr) -- returns true if a chase started
             pcall(keypress, KEY_A)
         end
 
-        -- (v99) YOU CAN STOP IT: one LEFT-CLICK during a chase stops it on the spot (no more hits, no bonus
-        -- multi). That click is swallowed, so it doesn't throw a swing of its own. The script's own clicks
-        -- (Auto Parry) are ignored.
+        -- (v100) YOU CAN STOP IT: press the "Chase stop key" (RIGHT-CLICK by default) during a chase and it stops
+        -- on the spot (no more hits, no bonus multi). See KB.add for chaseStopKey near the panel code.
         AP.chaseStop = false
-        pcall(function()
-            game:GetService("ContextActionService"):BindActionAtPriority("ForceHBE_ChaseStop", function(_, state)
-                if state == Enum.UserInputState.Begin and os.clock() - (AP.selfClickT or -math.huge) > 0.15 then
-                    AP.chaseStop = true
-                end
-                return Enum.ContextActionResult.Sink
-            end, false, 9001, Enum.UserInputType.MouseButton1)
-        end)
+        AP.chaseStartT = os.clock()
 
         local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
@@ -2774,7 +2767,7 @@ local function startChase(plr) -- returns true if a chase started
         local stunOver = false
         local lastRaw = 0 -- (v97) stun time left as we SEE it (no ping taken off) when the loop stopped
         while os.clock() - t0 < 6 and settings.parryChase do
-            if AP.chaseStop then break end -- (v99) you left-clicked: stop right here, no more hits
+            if AP.chaseStop then break end -- (v100) you pressed the chase stop key: stop right here, no more hits
             local tc = plr.Character
             local thum = tc and tc:FindFirstChildOfClass("Humanoid")
             if not tc or not thum or thum.Health <= 0 then break end
@@ -2880,7 +2873,7 @@ local function startChase(plr) -- returns true if a chase started
         -- (v70) BONUS MULTI: when the script thinks their stun is over, it still throws ONE more multi
         -- cycle (dash cancelled into a swing, or a plain swing) if they are close - what we see of their
         -- stun is a ping late and often ends early on our screen, so this extra hit usually still lands.
-        if stunOver and settings.parryChase and not AP.chaseStop then -- (v99) left-click = no bonus multi either
+        if stunOver and settings.parryChase and not AP.chaseStop then -- (v100) stop key = no bonus multi either
             pcall(function()
                 local dist = updateAim()
                 if not dist or dist > MELEE + 3 then return end
@@ -2944,9 +2937,7 @@ local function startChase(plr) -- returns true if a chase started
         chaseBusy = false
         reblockIfHeld()
       end)
-      -- (v99) the left-click stop is only listening during a chase
-      pcall(function() game:GetService("ContextActionService"):UnbindAction("ForceHBE_ChaseStop") end)
-      if AP.chaseStop then log("Parry chase stopped (left-click)") end
+      if AP.chaseStop then log("Parry chase stopped (stop key)") end
       AP.chaseStop = false
       if not okChase then
         warn("[ForceHBE] parry chase error (cleaned up, next chase will work): " .. tostring(errChase))
@@ -4773,7 +4764,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v99"
+hint.Text = "Ctrl+H = hide  |  v100"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5216,6 +5207,12 @@ makeNumberBox(300, "Parry strictness (0-100)", "parryStrict", 0, 100)
 local parryChaseSwitch = makeSwitch(340, "Parry chase (multi)", settings.parryChase, function(on) settings.parryChase = on end, "parryChase")
 -- keybind that toggles Parry chase on/off (click the box, press a key / combo / mouse button)
 KB.makeRow(350, "Parry chase key", "parryChaseKey")
+-- (v100) press this during a chase to stop it right there (default right-click). Ignored for the first
+-- 0.2s of a chase, so a block you were already pressing as the chase starts doesn't cancel it.
+KB.makeRow(355, "Chase stop key", "chaseStopKey")
+KB.add(function() return settings.chaseStopKey end, function()
+    if chaseBusy and os.clock() - (AP.chaseStartT or 0) > 0.2 then AP.chaseStop = true end
+end)
 KB.add(function() return settings.parryChaseKey end, function()
     settings.parryChase = not settings.parryChase
     if parryChaseSwitch then parryChaseSwitch(settings.parryChase, true) end
@@ -5346,7 +5343,7 @@ do
             } },
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
-                "**Stop it yourself:** LEFT-CLICK once during a chase and it stops right there - no more hits and no bonus multi at the end. That click doesn't throw a swing of its own. Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
+                "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored for the first 0.2s of a chase so a block press you already made doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
