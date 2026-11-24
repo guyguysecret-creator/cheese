@@ -590,11 +590,26 @@ track(RunService.Heartbeat:Connect(function(dt)
         end
     end
     wrapCharComp(charComp)
-    local maxF = rawget(charComp, "MaxForce") or 100
+    -- Use observed max force (≈446)
+    local maxF = 446
     if not visualForce then visualForce = maxF end
+    if prevForce == nil then prevForce = maxF end
 
-    -- Reset force to max for infinite force (keeps underlying mechanics functional)
+    local currentF = rawget(charComp, "Force")
+    if type(currentF) == "number" then
+        if currentF < prevForce then
+            local spent = prevForce - currentF
+            visualForce = math.max(0, visualForce - spent)
+            lastForceSpend = os.clock()
+            pcall(function()
+                charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1))
+            end)
+        end
+    end
+
+    -- Keep infinite force for gameplay
     charComp.Force = maxF
+    prevForce = maxF
 
     -- Regeneration when idle
     if os.clock() - lastForceSpend >= FORCE_RECHARGE_DELAY then
