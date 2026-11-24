@@ -468,6 +468,8 @@ local function wrapCharComp(cc)
             Fire = function(self, val, ...)
                 if settings.force and visualForce ~= nil then
                     local maxF = rawget(cc, "MaxForce") or 100
+                    -- Update visualForce based on game-provided fraction
+                    visualForce = math.clamp(val * maxF, 0, maxF)
                     val = math.clamp(visualForce / maxF, 0, 1)
                 end
                 return realSetForce:Fire(val, ...)
@@ -593,10 +595,13 @@ track(RunService.Heartbeat:Connect(function(dt)
     local currentF = rawget(charComp, "Force")
     if type(currentF) == "number" and currentF < maxF then
         local spent = maxF - currentF
-        visualForce = math.max(0, visualForce - spent)
-        lastForceSpend = os.clock()
+        -- Only apply visual drain if sufficient force was spent (>=1)
+        if spent >= 1 then
+            visualForce = math.max(0, visualForce - spent)
+            lastForceSpend = os.clock()
+            pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
+        end
         charComp.Force = maxF
-        pcall(function() charComp.SetForce:Fire(math.clamp(visualForce / maxF, 0, 1)) end)
     else
         if os.clock() - lastForceSpend >= FORCE_RECHARGE_DELAY then
             if visualForce < maxF then
