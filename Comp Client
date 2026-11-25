@@ -44,9 +44,8 @@ local LocalPlayer = Players.LocalPlayer
 -- clean up an older copy if you re-execute
 
 -- UI OVERHEAT BAR SETUP -------------------------------------------------------
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+-- Duplicate service locals removed (already defined earlier)
+
 
 -- Create ScreenGui if not existing
 local function getOrCreateScreenGui()
