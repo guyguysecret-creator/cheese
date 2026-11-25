@@ -803,7 +803,7 @@ local function getBox(char)
     box.Name = BOX_NAME
     box.Anchored = true       -- not welded to the player = no physics side effects
     box.CanCollide = false    -- nobody bumps into it
-    box.CanTouch = false      -- doesn't fire .Touched on anything
+    box.CanTouch = true       -- allow touch detection (helps hit detection)
     box.CanQuery = true       -- raycasts (your saber) CAN hit it
     box.Massless = true
     box.CastShadow = false
