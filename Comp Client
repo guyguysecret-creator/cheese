@@ -1,17 +1,11 @@
 --[[
-    Infinite Force + Hitbox Expander - one script, one small UI (made for Potassium)
+    Comp Client - one script, one small UI (made for Potassium)
+    (v104: the Hitbox Expander was removed - the game patched it)
 
     Infinite Force:
       - Keeps Force pinned at MaxForce in memory so moves never fail, while
         rendering a natural visual force bar that drains on use and regens at
         the normal rate (40/s after 2.5s delay) so it looks completely legit.
-
-    Hitbox Expander (written from scratch, replaces the obfuscated ScriptBlox one):
-      - The game's lightsaber hits are client raycasts from your blade: any part of
-        a character the ray touches counts. So each enemy gets an extra anchored,
-        non-colliding box (only you see it) that follows them every frame.
-        Their real body is never touched, so no frozen/glitchy players.
-      - Turning it off deletes the boxes.
 
     Infinite Block:
       - hook mode (getgc + hookfunction): hit-block animation still plays, block
@@ -31,8 +25,7 @@
     Auto Parry (needs getgc; hold right-click with your saber ignited): clicks left-click
       for you when a swing is really aimed at you - see the "Auto Parry" section below.
 
-    UI: draggable panel, ON/OFF switches (force, block, parry, kicks, auto parry, HBE, team check),
-    hitbox size + transparency boxes.
+    UI: draggable panel, ON/OFF switches, number boxes, keybinds and pick lists.
     Ctrl + H hides/shows the panel.
 ]]
 
@@ -69,7 +62,7 @@ local function recommendedParryOffset()
     return math.clamp(v, -300, -40)
 end
 local settings = {
-    force = true, -- enabled by default for debugging; can be toggled via HBE UI
+    force = true, -- enabled by default for debugging; can be toggled in the panel
     block = false,
     parry = false,
     kick = false,
@@ -96,17 +89,13 @@ local settings = {
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
     -- [UserId] = true: that player is skipped by that feature (chase / parryOnly: the ONLY ones chased / parried)
     -- ("parry" is the old skip list - no longer used, kept so old configs still load)
-    whitelist = { esp = {}, hbe = {}, parry = {}, chase = {}, parryOnly = {}, antiKickOnly = {}, universal = {} },
+    whitelist = { esp = {}, parry = {}, chase = {}, parryOnly = {}, antiKickOnly = {}, universal = {} },
     esp = false,           -- Visuals: see opponents through walls (outline + health bar + status)
     espOutline = true,     -- ... the through-walls outline
     espInfo = true,        -- ... name/distance, health bar, status + estimated cooldowns
     antiKick = false,      -- ignore the game's kick stun on your screen (see "Anti-kick" section)
     antiKickKey = "RightControl", -- key that toggles Anti-kick (change it in the panel)
     parryOffset = recommendedParryOffset(), -- ms: Auto Parry timing, + = later, - = earlier (added on top of ping). Starts at the value recommended for YOUR ping when you run the script
-    hbe = false,
-    hbeSize = 12,          -- studs (normal HumanoidRootPart is 2 x 2 x 1)
-    hbeTransparency = 0.7, -- so you can see the box
-    teamCheck = false,     -- HBE: ON = don't expand teammates (off by default)
 }
 
 -- shared so the block-break hook (installed once per game session) always reads the
@@ -729,28 +718,16 @@ track(RunService.Heartbeat:Connect(function(dt)
 end))
 
 ------------------------------------------------------------------------
--- Hitbox Expander
+-- Player filters
 ------------------------------------------------------------------------
---[[
-    v2: we no longer touch the player's real HumanoidRootPart (resizing it broke their
-    character physics on your screen = frozen/glitchy players).
-    Instead each enemy gets a separate ANCHORED box inside their character model that
-    just follows their root part every frame. It's not welded to them, so it can't
-    affect their physics. The game's hit check (DamageUtil.GetHumanoidFromHitPart)
-    walks up from the hit part to the character's Humanoid, so a ray hitting the box
-    counts as hitting that player.
-]]
-local BOX_NAME = "HBE_Box"
-local boxes = {} -- [character] = box part
-
--- whitelists (per feature) and a plain "same team?" test, shared by HBE / Auto Parry / ESP
+-- whitelists (per feature) and a plain "same team?" test, shared by Auto Parry / ESP / chase
 local function inWhitelist(listName, plr)
     local wl = settings.whitelist and settings.whitelist[listName]
     return wl ~= nil and wl[plr.UserId] == true
 end
 -- (v84) "Parry only": when anyone is ticked, Auto Parry / Anti-kick / Perfect trade answer ONLY those
 -- players; with nobody ticked they answer everyone
--- (v101) "Universal whitelist": when ONE player is picked there, EVERY feature (HBE, ESP, Auto Parry,
+-- (v101) "Universal whitelist": when players are picked there, EVERY feature (ESP, Auto Parry,
 -- Anti-kick, Perfect trade, Parry chase, Stun evade) acts ONLY on that player. Nobody picked = normal.
 -- Checked on top of each feature's own list.
 local function uniPicked(plr)
@@ -777,72 +754,13 @@ local function sameTeam(plr)
     return ok and same == true
 end
 
-local function isEnemy(plr)
-    if plr == LocalPlayer then return false end
-    if inWhitelist("hbe", plr) then return false end        -- HBE whitelist: no expanded hitbox on them
-    if not uniPicked(plr) then return false end              -- (v101) Universal whitelist: only the picked player
-    if not settings.teamCheck then return true end
-    if LocalPlayer.Team == nil or plr.Team == nil then return true end
-    return plr.Team ~= LocalPlayer.Team
-end
-
-local function removeBox(char)
-    local box = boxes[char]
-    boxes[char] = nil
-    if box then box:Destroy() end
-end
-
-local function removeAllBoxes()
-    for char in pairs(boxes) do removeBox(char) end
-end
-
-local function getBox(char)
-    local box = boxes[char]
-    if box and box.Parent == char then return box end
-    box = Instance.new("Part")
-    box.Name = BOX_NAME
-    box.Anchored = true       -- not welded to the player = no physics side effects
-    box.CanCollide = false    -- nobody bumps into it
-    box.CanTouch = false      -- doesn't fire .Touched on anything
-    box.CanQuery = true       -- raycasts (your saber) CAN hit it
-    box.Massless = true
-    box.CastShadow = false
-    box.Material = Enum.Material.SmoothPlastic
-    box.Color = Color3.fromRGB(255, 60, 60)
-    box.Parent = char         -- must be inside the character so the hit maps to its Humanoid
-    boxes[char] = box
-    return box
-end
-
--- RenderStepped runs before Heartbeat, where the game does its blade raycasts,
--- so the boxes are already in place when the game checks for hits.
-track(RunService.RenderStepped:Connect(function()
-    if not settings.hbe then return end
-    local s = settings.hbeSize
-    local size = Vector3.new(s, s, s)
-    local seen = {}
+-- (v104) Hitbox Expander removed. Clear any leftover boxes an older copy of the script left on players.
+pcall(function()
     for _, plr in ipairs(Players:GetPlayers()) do
-        local char = plr.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        if hrp and hum and hum.Health > 0 and isEnemy(plr) then
-            local box = getBox(char)
-            box.CFrame = hrp.CFrame
-            if box.Size ~= size then box.Size = size end
-            if box.Transparency ~= settings.hbeTransparency then box.Transparency = settings.hbeTransparency end
-            seen[char] = true
-        end
+        local b = plr.Character and plr.Character:FindFirstChild("HBE_Box")
+        if b then b:Destroy() end
     end
-    -- remove boxes for teammates, dead players, players who left
-    for char in pairs(boxes) do
-        if not seen[char] then removeBox(char) end
-    end
-end))
-
-local function setHBE(on)
-    settings.hbe = on
-    if not on then removeAllBoxes() end
-end
+end)
 
 ------------------------------------------------------------------------
 -- Auto Parry
@@ -2670,7 +2588,7 @@ local function startChase(plr) -- returns true if a chase started
             task.delay(8, restoreCam)
         end
         local DASH_COST = 32 + 8
-        local MELEE, ARRIVED = 7, 5     -- re-set every frame: tighter when the Hitbox Expander is OFF
+        local MELEE, ARRIVED = 5, 3.5   -- (v104) no Hitbox Expander: you have to be close to connect
         local mode = "approach"
 
         -- re-aim: where they ARE and where they're HEADING. Called ONCE per frame. Returns the flat
@@ -2695,9 +2613,6 @@ local function startChase(plr) -- returns true if a chase started
             local to = Vector3.new(aim.X - mh.Position.X, 0, aim.Z - mh.Position.Z)
             if to.Magnitude > 0.5 then
                 local dir = to.Unit
-                -- in the multi, slip ~35 degrees to the left (W + A) while swinging
-                -- (only with the Hitbox Expander on: without it a swing taken 35 deg off-target misses)
-                if mode == "multi" and dist <= 9 and settings.hbe then dir = CFrame.Angles(0, math.rad(35), 0):VectorToWorldSpace(dir) end
                 moveDir = dir
             end
             return dist
@@ -2802,7 +2717,7 @@ local function startChase(plr) -- returns true if a chase started
             local canSwing = remEff >= 0.12
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
-            MELEE, ARRIVED = (settings.hbe and 7 or 5), (settings.hbe and 5 or 3.5)
+            MELEE, ARRIVED = 5, 3.5
 
             local dist = updateAim()
             if not dist then break end
@@ -3167,7 +3082,7 @@ local function startKickCounter(plr, kickTrk)
         local okRun, errRun = pcall(function()
             -- start from the kicker's already-tracked speed: a far dash-kicker is mid-run on frame one
             local lastTPos, tVel, lastTime = nil, (plrVelFast[plr] or Vector3.zero), os.clock()
-            local DASH_COST, MELEE = 32 + 8, (settings.hbe and 7 or 5)
+            local DASH_COST, MELEE = 32 + 8, 5
             local dashFrames, cancelled, nextMultiAt = 0, false, 0
             local dashAsked, dashAskAt = false, nil
             local function sendAttack()
@@ -3775,7 +3690,7 @@ end)
 
 ------------------------------------------------------------------------
 -- Visuals (ESP) - purely a drawing on YOUR screen; nothing is sent to the server and
--- nobody else can see it. Per opponent (same enemy/team rule as the hitbox expander):
+-- nobody else can see it. Per opponent:
 --   * an outline + soft fill that shows through walls (red; yellow when under 30% health)
 --   * name + distance, a health bar, and a status line: STUNNED / BLOCKING / PARRYING /
 --     ATTACKING / KICKING / DASHING (read from the animations you can see them playing)
@@ -4778,7 +4693,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v102"
+hint.Text = "Ctrl+H = hide  |  v104"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -4868,7 +4783,7 @@ local function makeSwitch(y, labelText, initial, onChanged, key)
     return setter
 end
 
--- section headers: Resources / Combat / HBE (the number is the position in the list)
+-- section headers: Resources / Combat / Visuals (the number is the position in the list)
 local function makeHeader(order, text)
     local h = Instance.new("TextLabel")
     h.Size = UDim2.new(1, -16, 0, 18)
@@ -5039,7 +4954,6 @@ makeHeader(10, "RESOURCES")
 makeHeader(190, "COMBAT")
 -- (v101/v102) Universal whitelist: pick one or more players and every feature only acts on them
 makeWhitelist(195, "Universal whitelist", "universal", "Pick", true)
-makeHeader(1400, "HITBOX EXPANDER")
 makeHeader(1500, "VISUALS")
 
 makeSwitch(11, "Infinite Force", settings.force, setForce, "force")
@@ -5071,8 +4985,6 @@ makeSwitch(270, "Auto Parry", settings.autoParry, function(on)
         end)
     end
 end, "autoParry")
-makeSwitch(1410, "Hitbox Expander", settings.hbe, setHBE, "hbe")
-makeSwitch(1420, "HBE team check", settings.teamCheck, function(on) settings.teamCheck = on end, "teamCheck")
 makeSwitch(280, "Parry team check", settings.parryTeamCheck, function(on) settings.parryTeamCheck = on end, "parryTeamCheck")
 makeWhitelist(290, "Parry only (none = all)", "parryOnly", "Pick")
 makeSwitch(310, "Parry follows ping", settings.pingAdjust, function(on) settings.pingAdjust = on end, "pingAdjust")
@@ -5214,10 +5126,6 @@ local function makeNumberBox(y, labelText, key, minV, maxV)
     CFG_UI.num[key] = { min = minV, max = maxV, refresh = function() box.Text = tostring(settings[key]) end }
 end
 
-makeWhitelist(1430, "HBE whitelist", "hbe")
-makeNumberBox(1440, "Hitbox size", "hbeSize", 2, 50)
--- 0 = solid (easiest to see), 1 = invisible
-makeNumberBox(1450, "Transparency (0-1)", "hbeTransparency", 0, 1)
 
 -- see opponents through walls: outline, health bar, status, estimated cooldowns (your screen only)
 makeSwitch(1510, "ESP (through walls)", settings.esp, function(on) settings.esp = on end, "esp")
@@ -5427,21 +5335,6 @@ do
                 "Clicks on the menu or this guide never trigger a bind.",
             } },
         } },
-        { "HITBOX EXPANDER", {
-            { "Hitbox Expander", {
-                "Makes other players' hitboxes bigger on your side, so your swings connect more easily.",
-            } },
-            { "Hitbox size", {
-                "Range {{2}} to {{50}} studs, default {{12}}. Bigger = easier hits, but looks odd and is easier to notice.",
-            } },
-            { "Transparency (0-1)", {
-                "{{0}} = solid box (easiest to see), {{1}} = invisible. Default {{0.7}}.",
-            } },
-            { "HBE team check / HBE whitelist", {
-                "Team check ON: teammates are not expanded.",
-                "Whitelist: ticked players are not expanded.",
-            } },
-        } },
         { "VISUALS", {
             { "ESP (through walls)", {
                 "Master switch. Shows other players through walls on your screen only.",
@@ -5467,9 +5360,9 @@ do
                 "Kick timing gets marginal around 250 ms and above.",
             } },
             { "Whitelists and teams", {
-                "Each feature has its own list (Parry only, Chase only, HBE, ESP), so ticking someone in one does not affect the others.",
-                "Parry only and Chase only are pick lists: ticked players are the ONLY ones it acts on. The HBE and ESP whitelists skip whoever is ticked.",
-                "Universal whitelist (top of COMBAT): tick one or more players and every feature (HBE, ESP, Auto Parry, Anti-kick, Perfect trade, Parry chase, Stun evade) only acts on them. Click a ticked name again to untick it; nobody ticked = everyone again. Stun evade only goes off when a picked player is near you. It works on top of each feature's own list.",
+                "Each feature has its own list (Parry only, Anti-kick only, Chase only, ESP), so ticking someone in one does not affect the others.",
+                "Parry only, Anti-kick only and Chase only are pick lists: ticked players are the ONLY ones it acts on. The ESP whitelist skips whoever is ticked.",
+                "Universal whitelist (top of COMBAT): tick one or more players and every feature (ESP, Auto Parry, Anti-kick, Perfect trade, Parry chase, Stun evade) only acts on them. Click a ticked name again to untick it; nobody ticked = everyone again. Stun evade only goes off when a picked player is near you. It works on top of each feature's own list.",
             } },
         } },
     }
@@ -6172,7 +6065,6 @@ local function onList()
     if settings.autoEvade then table.insert(on, "AutoEvade") end
     if settings.parryChase then table.insert(on, "ParryChase") end
     if settings.dashGuard then table.insert(on, "DashGuard") end
-    if settings.hbe then table.insert(on, "HBE") end
     return #on > 0 and table.concat(on, ", ") or "nothing"
 end
 
@@ -6213,7 +6105,6 @@ local function cleanup()
     settings.antiKick = false
     settings.esp = false
     if espClear then espClear() end
-    setHBE(false)
     -- never leave the camera taken over when the script is stopped / re-run
     pcall(function()
         for k in pairs(AP.camOwners) do AP.camOwners[k] = nil end
