@@ -69,7 +69,7 @@ local settings = {
     autoParry = false,
     pingAdjust = true,     -- Auto Parry follows your live ping (spikes / drops adjust it)
     dashGuard = false,     -- Auto Parry also answers enemies force-dashing at you (early warning vs dash-kicks)
-    multiDelay = 230,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows)
+    multiDelay = 100,      -- Parry chase: extra ms between multi cycles (0 = as fast as the game allows). (v107) was 230 - too slow
     jumpChase = false,     -- Parry chase: for VERY far evades, dash-snipe with a jump (click, W+E, Space)
     parryChase = false,    -- after you parry + stun someone: chase them and multi until their stun ends
     perfectTrade = false,  -- a swing lands on your block -> let go and multi them ONCE right after (a trade)
@@ -84,7 +84,7 @@ local settings = {
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
-    chaseDelay = 150,      -- (v105) extra wait (ms) after the parry before the chase starts
+    chaseDelay = 0,        -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
@@ -4706,7 +4706,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v106"
+hint.Text = "Ctrl+H = hide  |  v107"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5303,7 +5303,7 @@ do
                 "**Chase only (none = all):** click Pick, search and tick names. With anyone ticked, the chase ONLY ever goes after those players. With nobody ticked it chases anyone who qualifies. Saved in configs too.",
             } },
             { "Multi delay (ms)", {
-                "Range {{0}} to {{800}}, default {{230}}. Extra wait between multi cycles.",
+                "Range {{0}} to {{800}}, default {{100}}. Extra wait between multi cycles.",
                 "Raise it if swings get eaten or feel out of sync, especially on high ping. The Anti-kick counter uses it too (capped so it never waits long).",
                 "{{50 or below = ULTRA multi}}: all pacing is dropped and inputs go out every frame, limited only by the game's own cooldowns. It is very fast and looks suspicious. Keep it above 50 for the normal, human-looking pace.",
             } },
@@ -5316,7 +5316,7 @@ do
             } },
             { "Chase delay (ms)", {
                 "Your parry animation always plays out fully before the chase starts, like the normal cooldown after a parry.",
-                "Chase delay: extra wait after the parry animation before the first hit. Range {{0}} to {{1000}}, default {{150}}. Higher = looks more natural, but less of their stun is left to hit them in.",
+                "Chase delay: extra wait after the parry animation before the first hit. Range {{0}} to {{1000}}, default {{0}}. Higher = looks more natural, but less of their stun is left to hit them in.",
                 "Only after a parry; a chase after your own kick starts as before. The Chase stop key also works during the wait.",
             } },
             { "Anti-kick (counter)", {
