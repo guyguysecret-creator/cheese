@@ -84,6 +84,8 @@ local settings = {
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
+    chaseWaitParry = true, -- (v105) Parry chase: ON = your parry animation plays out fully before the chase (natural cooldown)
+    chaseDelay = 150,      -- (v105) extra wait (ms) after the parry before the chase starts
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
@@ -2496,7 +2498,7 @@ function AP.easeCamTo(dir, dur)
 end
 
 local chaseBusy = false
-local function startChase(plr) -- returns true if a chase started
+local function startChase(plr, viaParry) -- returns true if a chase started
     if chaseBusy then return false end
     chaseBusy = true
     task.spawn(function()
@@ -2524,6 +2526,36 @@ local function startChase(plr) -- returns true if a chase started
                 chaseBusy = false
                 return
             end
+        end
+
+        -- (v105) NATURAL PARRY COOLDOWN: a real player can't attack until their parry animation is over.
+        -- With "Chase: wait for parry" ON the parry plays out fully (it is no longer cut short), then the
+        -- chase waits "Chase delay (ms)" more before the first hit. The Chase stop key works during the wait.
+        if viaParry then
+            AP.chaseStop = false
+            AP.chaseStartT = os.clock()
+            if settings.chaseWaitParry then
+                local w0 = os.clock()
+                while settings.parryChase and not AP.chaseStop and os.clock() - w0 < 1.2
+                    and combatStateNow() == "parrying" do
+                    RunService.Heartbeat:Wait()
+                end
+            end
+            local dly = math.clamp(tonumber(settings.chaseDelay) or 0, 0, 1000) / 1000
+            local d0 = os.clock()
+            while settings.parryChase and not AP.chaseStop and os.clock() - d0 < dly do
+                RunService.Heartbeat:Wait()
+            end
+            if AP.chaseStop or not settings.parryChase then
+                if AP.chaseStop then log("Parry chase stopped (stop key)") end
+                AP.chaseStop = false
+                chaseBusy = false
+                return
+            end
+            char = LocalPlayer.Character
+            hrp = char and char:FindFirstChild("HumanoidRootPart")
+            hum = char and char:FindFirstChildOfClass("Humanoid")
+            if not hrp or not plr.Parent then chaseBusy = false return end
         end
 
         -- Steering: ONE move vector, applied after the game's own controls every frame. We never
@@ -2961,8 +2993,9 @@ do
                 end
                 local viaParry = afterParry and seen >= parryAt - 0.05 and wasAttacker and fightingMe
                 if (viaParry or kickOK) and not chaseBusy then
-                    if viaParry then cutParry() end
-                    if startChase(plr) then
+                    -- (v105) only cut the parry animation short when "Chase: wait for parry" is OFF
+                    if viaParry and not settings.chaseWaitParry then cutParry() end
+                    if startChase(plr, viaParry) then
                         parryAt, kickAt = -math.huge, -math.huge  -- count it once (only once it really started)
                     end
                     break
@@ -4693,7 +4726,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v104"
+hint.Text = "Ctrl+H = hide  |  v105"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5163,6 +5196,9 @@ makeNumberBox(410, "Multi delay (ms)", "multiDelay", 0, 800)
 makeSwitch(420, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
 makeSwitch(430, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
+-- (v105) let your parry animation finish before the chase (natural cooldown), plus an extra delay
+makeSwitch(432, "Chase: wait for parry", settings.chaseWaitParry, function(on) settings.chaseWaitParry = on end, "chaseWaitParry")
+makeNumberBox(434, "Chase delay (ms)", "chaseDelay", 0, 1000)
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(440, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
@@ -5298,6 +5334,11 @@ do
             { "Chase: unblock to start", {
                 "OFF: the chase starts right away, even while you hold block.",
                 "ON: it only starts once you let go of block.",
+            } },
+            { "Chase: wait for parry / Chase delay (ms)", {
+                "Wait for parry ON (default): your parry animation plays out fully before the chase starts, like the normal cooldown after a parry. OFF: the parry is cut short and the chase starts instantly (the old way).",
+                "Chase delay: extra wait after the parry before the first hit. Range {{0}} to {{1000}}, default {{150}}. Higher = looks more natural, but less of their stun is left to hit them in.",
+                "Only after a parry; a chase after your own kick starts as before. The Chase stop key also works during the wait.",
             } },
             { "Anti-kick (counter)", {
                 "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
