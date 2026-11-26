@@ -84,7 +84,6 @@ local settings = {
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
-    chaseWaitParry = true, -- (v105) Parry chase: ON = your parry animation plays out fully before the chase (natural cooldown)
     chaseDelay = 150,      -- (v105) extra wait (ms) after the parry before the chase starts
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
@@ -2307,35 +2306,19 @@ local function doEvade()
 end
 
 ------------------------------------------------------------------------
--- Parry chase  (+ "cut the parry animation" so you can move right after a parry)
+-- Parry chase
 --   1. Watching: right after you parry, if a nearby player's STUN animation starts, that
 --      parry worked and they're stunned.
---   2. The rest of your parry animation is cut short (the game only lets you act normally
---      once it finishes - that was the delay before you could chase). The server-side parry
---      is not touched. Needs Auto Parry or Parry chase on.
+--   2. (v106) Your parry animation plays out fully (natural cooldown), then "Chase delay (ms)",
+--      then the chase starts. Needs Auto Parry or Parry chase on.
 --   3. Parry chase (own switch): run at them (or where their evade dash is taking them) and
 --      multi: hold W + A, dash (E), cancel the dash into a swing - repeated on the first frame
 --      the game accepts each step (see the timing notes in startChase). The approach is a FULL-LENGTH
 --      dash toward where they're going, re-aimed every frame; if they don't evade we just multi. Stops AT ONCE when their stun
 --      animation ends, if they leave or die, you get stunned, or after 6s.------------------------------------------------------------------------
 
-local function cutParry()
-    local sc = saberComp
-    if not saberStillValid(sc) then return end
-    pcall(function()
-        local a = rawget(sc, "Animations").Parry
-        if a and a.IsPlaying then a:Stop(0) end -- its Stopped event ends the parrying state
-    end)
-    task.defer(function()
-        RunService.Heartbeat:Wait()
-        if combatStateNow() == "parrying" then -- didn't end by itself: finish it ourselves
-            local held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
-            pcall(function()
-                rawget(sc, "CombatStateMachine"):Input(held and "parry_to_block" or "parry_finished")
-            end)
-        end
-    end)
-end
+-- (v106) the old cutParry (stopping your parry animation early so the chase could start instantly)
+-- was removed: the chase now always waits for the parry to finish, so it looks natural.
 
 ------------------------------------------------------------------------
 -- CAMERA SAFETY (v78). Only the Parry chase lock-on ever takes the camera over now. Handing it back
@@ -2528,18 +2511,16 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             end
         end
 
-        -- (v105) NATURAL PARRY COOLDOWN: a real player can't attack until their parry animation is over.
-        -- With "Chase: wait for parry" ON the parry plays out fully (it is no longer cut short), then the
-        -- chase waits "Chase delay (ms)" more before the first hit. The Chase stop key works during the wait.
+        -- (v105/v106) NATURAL PARRY COOLDOWN: a real player can't attack until their parry animation is over.
+        -- The parry always plays out fully (it is never cut short), then the chase waits "Chase delay (ms)"
+        -- more before the first hit. The Chase stop key works during the wait.
         if viaParry then
             AP.chaseStop = false
             AP.chaseStartT = os.clock()
-            if settings.chaseWaitParry then
-                local w0 = os.clock()
-                while settings.parryChase and not AP.chaseStop and os.clock() - w0 < 1.2
-                    and combatStateNow() == "parrying" do
-                    RunService.Heartbeat:Wait()
-                end
+            local w0 = os.clock()
+            while settings.parryChase and not AP.chaseStop and os.clock() - w0 < 1.2
+                and combatStateNow() == "parrying" do
+                RunService.Heartbeat:Wait()
             end
             local dly = math.clamp(tonumber(settings.chaseDelay) or 0, 0, 1000) / 1000
             local d0 = os.clock()
@@ -2993,8 +2974,7 @@ do
                 end
                 local viaParry = afterParry and seen >= parryAt - 0.05 and wasAttacker and fightingMe
                 if (viaParry or kickOK) and not chaseBusy then
-                    -- (v105) only cut the parry animation short when "Chase: wait for parry" is OFF
-                    if viaParry and not settings.chaseWaitParry then cutParry() end
+                    -- (v106) the parry animation is never cut short: startChase waits for it to finish
                     if startChase(plr, viaParry) then
                         parryAt, kickAt = -math.huge, -math.huge  -- count it once (only once it really started)
                     end
@@ -4726,7 +4706,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v105"
+hint.Text = "Ctrl+H = hide  |  v106"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5196,8 +5176,7 @@ makeNumberBox(410, "Multi delay (ms)", "multiDelay", 0, 800)
 makeSwitch(420, "Jump chase (far evades)", settings.jumpChase, function(on) settings.jumpChase = on end, "jumpChase")
 -- friend-style start: the chase only begins after you let go of block (off = starts right away, even while blocking)
 makeSwitch(430, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
--- (v105) let your parry animation finish before the chase (natural cooldown), plus an extra delay
-makeSwitch(432, "Chase: wait for parry", settings.chaseWaitParry, function(on) settings.chaseWaitParry = on end, "chaseWaitParry")
+-- (v105) extra wait after your parry animation finishes, before the chase's first hit
 makeNumberBox(434, "Chase delay (ms)", "chaseDelay", 0, 1000)
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(440, "Chase only (none = all)", "chase", "Pick")
@@ -5335,9 +5314,9 @@ do
                 "OFF: the chase starts right away, even while you hold block.",
                 "ON: it only starts once you let go of block.",
             } },
-            { "Chase: wait for parry / Chase delay (ms)", {
-                "Wait for parry ON (default): your parry animation plays out fully before the chase starts, like the normal cooldown after a parry. OFF: the parry is cut short and the chase starts instantly (the old way).",
-                "Chase delay: extra wait after the parry before the first hit. Range {{0}} to {{1000}}, default {{150}}. Higher = looks more natural, but less of their stun is left to hit them in.",
+            { "Chase delay (ms)", {
+                "Your parry animation always plays out fully before the chase starts, like the normal cooldown after a parry.",
+                "Chase delay: extra wait after the parry animation before the first hit. Range {{0}} to {{1000}}, default {{150}}. Higher = looks more natural, but less of their stun is left to hit them in.",
                 "Only after a parry; a chase after your own kick starts as before. The Chase stop key also works during the wait.",
             } },
             { "Anti-kick (counter)", {
