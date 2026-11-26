@@ -1899,12 +1899,16 @@ function AP.noBackKey()
     if type(keyrelease) == "function" and UserInputService:IsKeyDown(Enum.KeyCode.S) then pcall(keyrelease, 0x53) end
 end
 -- turn your character to face a player (flat, no tilt); the camera follows (AP.followFacing)
+-- (v113) ON YOUR HEAD: when someone is (almost) straight above / below you, the flat direction to them
+-- flips around every frame, and turning the camera + character to it made the camera spin in circles.
+-- Closer than this (sideways, in studs) = keep the direction you already had, don't turn.
+AP.CLOSE_HOLD = 2.5
 function AP.faceToward(plr, onlyIfBehind)
     local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
     local th = plr and plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
     if not mh or not th then return end
     local to = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
-    if to.Magnitude < 0.3 then return end
+    if to.Magnitude < AP.CLOSE_HOLD then return end
     if onlyIfBehind then
         local lf = Vector3.new(mh.CFrame.LookVector.X, 0, mh.CFrame.LookVector.Z)
         if lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end -- already roughly facing them
@@ -2422,7 +2426,12 @@ function AP.lockTargetDir()
     local th2 = tc and tc:FindFirstChildOfClass("Humanoid")
     if not mh or not th or (th2 and th2.Health <= 0) then return nil end
     local to = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
-    if to.Magnitude < 0.3 then return nil end
+    -- (v113) on your head: keep the last direction instead of chasing one that flips every frame
+    if to.Magnitude < AP.CLOSE_HOLD then
+        if AP.lastLockDir and AP.lastLockPlr == AP.lockPlr then return AP.lastLockDir, mh end
+        return nil
+    end
+    AP.lastLockDir, AP.lastLockPlr = to.Unit, AP.lockPlr
     return to.Unit, mh
 end
 -- wait (a few frames at most) until you are really facing them, so the attack goes out forward
@@ -2436,7 +2445,7 @@ function AP.waitFacing(plr, maxT)
         local lf = Vector3.new(mh.CFrame.LookVector.X, 0, mh.CFrame.LookVector.Z)
         local cam = workspace.CurrentCamera
         local cl = cam and Vector3.new(cam.CFrame.LookVector.X, 0, cam.CFrame.LookVector.Z) or lf
-        if to.Magnitude < 0.3 or (lf.Magnitude > 0.1 and cl.Magnitude > 0.1
+        if to.Magnitude < AP.CLOSE_HOLD or (lf.Magnitude > 0.1 and cl.Magnitude > 0.1
             and lf.Unit:Dot(to.Unit) > 0.9 and cl.Unit:Dot(to.Unit) > 0.85) then return end
         RunService.RenderStepped:Wait()
     end
@@ -2640,7 +2649,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             local lead = math.min(dist / 60, 0.5)
             local aim = th.Position + tVel * lead
             local to = Vector3.new(aim.X - mh.Position.X, 0, aim.Z - mh.Position.Z)
-            if to.Magnitude > 0.5 then
+            if to.Magnitude > AP.CLOSE_HOLD then -- (v113) on your head: keep the move direction you had
                 local dir = to.Unit
                 moveDir = dir
             end
@@ -2655,6 +2664,8 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             if not lastTPos or not hrp then return end
             pcall(function()
                 local pos = hrp.Position
+                -- (v113) on your head: don't spin round to a direction that flips every frame
+                if Vector3.new(lastTPos.X - pos.X, 0, lastTPos.Z - pos.Z).Magnitude < AP.CLOSE_HOLD then return end
                 hrp.CFrame = CFrame.lookAt(pos, Vector3.new(lastTPos.X, pos.Y, lastTPos.Z))
                 AP.followFacing(0.4)
             end)
@@ -3103,7 +3114,7 @@ local function startKickCounter(plr, kickTrk)
             faceAt = kh.Position
             local pos = hrp.Position
             local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
-            if flat.Magnitude > 0.5 then
+            if flat.Magnitude > AP.CLOSE_HOLD then -- (v113) not when they're on your head
                 moveDir = flat.Unit
                 hrp.CFrame = CFrame.lookAt(pos, pos + flat)
                 AP.followFacing(0.6)
@@ -3117,7 +3128,7 @@ local function startKickCounter(plr, kickTrk)
                 if faceAt and hrp and hrp.Parent then
                     local pos = hrp.Position
                     local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
-                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.4) end
+                    if flat.Magnitude > AP.CLOSE_HOLD then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.4) end
                 end
             end)
         end)
@@ -3146,7 +3157,7 @@ local function startKickCounter(plr, kickTrk)
                 pcall(function()
                     local pos = hrp.Position
                     local flat = Vector3.new(lastTPos.X - pos.X, 0, lastTPos.Z - pos.Z)
-                    if flat.Magnitude > 0.5 then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.5) end
+                    if flat.Magnitude > AP.CLOSE_HOLD then hrp.CFrame = CFrame.lookAt(pos, pos + flat); AP.followFacing(0.5) end
                 end)
             end
 
@@ -3412,7 +3423,7 @@ do
                 local mh = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
                 if not th or not mh then return nil end
                 local to = flatV(aimPoint(th) - mh.Position)
-                if to.Magnitude > 0.3 then moveDir = to.Unit end
+                if to.Magnitude > AP.CLOSE_HOLD then moveDir = to.Unit end -- (v113) not when on your head
                 return th, mh
             end
             local function faceThem()
@@ -3427,7 +3438,10 @@ do
                         if to.Magnitude > 0.1 and lf.Magnitude > 0.1 and lf.Unit:Dot(to.Unit) > 0.5 then return end
                     end
                     local p = aimPoint(th)
-                    pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(p.X, mh.Position.Y, p.Z)) end)
+                    -- (v113) on your head: don't turn (the direction flips every frame); the lock-on holds the last one
+                    if flatV(p - mh.Position).Magnitude >= AP.CLOSE_HOLD then
+                        pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, Vector3.new(p.X, mh.Position.Y, p.Z)) end)
+                    end
                     AP.lockOn(plr, 0.4)
                 end
             end
@@ -4743,7 +4757,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v112"
+hint.Text = "Ctrl+H = hide  |  v113"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
