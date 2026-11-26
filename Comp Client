@@ -2711,8 +2711,13 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         -- (v69) 3 HITS PER STUN: the pause between cycles is shrunk so that what's left of their stun fits
         -- 3 cycles in total. "Multi delay" can only make it slower when there is time to spare; it never
         -- pushes you below 3 hits. The game's own minimum (0.15s swing / 0.18s dash) is the floor.
-        local hitsDone, WANT_HITS = 0, 3
+        -- (v110) 5 MULTIS WHEN THEY DON'T EVADE: if they stay stuck next to you (never get further than a
+        -- couple of studs past melee range) the pacing is packed to fit 5 multis into their stun. The moment
+        -- they evade away it drops back to 3 (time goes into dashing after them instead).
+        local hitsDone, WANT_HITS = 0, 5
+        local evadedAway, startDist = false, nil
         local function chaseGap(base, remLeft)
+            WANT_HITS = evadedAway and 3 or 5
             hitsDone += 1
             local normal = multiGap(base)
             local left = WANT_HITS - hitsDone
@@ -2750,6 +2755,9 @@ local function startChase(plr, viaParry) -- returns true if a chase started
 
             local dist = updateAim()
             if not dist then break end
+            -- (v110) they got away from you (further than melee AND further than where the chase began): back to 3 multis
+            startDist = startDist or dist
+            if dist > math.max(MELEE + 3, startDist + 3) then evadedAway = true end
 
             local ms = movementState()
             local sc = saberComp
@@ -4723,7 +4731,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v109"
+hint.Text = "Ctrl+H = hide  |  v110"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5317,6 +5325,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
