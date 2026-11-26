@@ -2751,7 +2751,9 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             local canSwing = remEff >= 0.12
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
-            MELEE, ARRIVED = 5, 3.5
+            -- (v111) after an evade the arrival swing goes out a little earlier (4.5 studs instead of 3.5),
+            -- saving the last bit of the dash so there's stun time left for all 3 hits
+            MELEE, ARRIVED = 5, (evadedAway and 4.5 or 3.5)
 
             local dist = updateAim()
             if not dist then break end
@@ -2818,8 +2820,14 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                     -- PACING: the game would allow a new cycle every ~0.18s, which looks like a machine.
                     -- "Multi delay" adds extra time between cycles (+-20% so it isn't a metronome).
                     -- (Multi delay at or below AP.MULTI_ULTRA ms = no pacing: ULTRA multi, every frame.)
+                    -- (v111) MAKE SURE OF 3 AFTER AN EVADE: once they evaded, if their stun left is only just
+                    -- enough for the hits still owed, skip the dash part of the multi and throw plain swings
+                    -- (a swing is ~0.15s, a dash-cancel cycle ~0.18s+), so all 3 land before their stun ends.
+                    local owed = (evadedAway and 3 or 5) - hitsDone
+                    local tight = evadedAway and owed > 0 and remEff < owed * 0.2 + 0.1
                     if os.clock() >= nextMultiAt and canSwing then
-                        if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
+                        -- (a plain swing needs the saber "ignited"; while you hold block the multi dash is still used)
+                        if ready and not (tight and cs == "ignited") and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
                             faceTarget()
                             sendDashInput()                     -- E (W and A are held)
                             nextMultiAt = os.clock() + chaseGap(0.18, remEff)
@@ -4731,7 +4739,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v110"
+hint.Text = "Ctrl+H = hide  |  v111"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5325,7 +5333,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
-                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111) After an evade it swings on arrival a bit earlier and, when their stun is running out, switches to plain quick swings so all 3 fit. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
