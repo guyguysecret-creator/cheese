@@ -84,7 +84,8 @@ local settings = {
     kickPreUnblock = false, -- (removed in v68 - a plain dash never drops your block; kept so old configs load)
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
-    chaseDelay = 0,        -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
+    camTurnSpeed = 12,     -- (v108) how fast the camera turns when the script takes it over (higher = snappier, 60 = instant)
+    chaseDelay = 0,       -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
@@ -2224,7 +2225,7 @@ local function doEvade()
         AP.lockDirVec, AP.lockDirUntil = faceDir, os.clock() + 3
         do
             local tw = os.clock()
-            while os.clock() - tw < 0.08 do -- a frame or two: until you really face the escape way
+            while os.clock() - tw < 0.2 do -- until you really face the escape way ((v108) camera turns smoothly now)
                 local lv = hrp.CFrame.LookVector
                 local c = workspace.CurrentCamera
                 local cl = c and c.CFrame.LookVector or lv
@@ -2399,6 +2400,14 @@ pcall(function() RunService:UnbindFromRenderStep("ForceHBE_FollowCam") end)
 -- with it. With shift lock the game turns your character to the CAMERA, so if the camera still pointed
 -- away the dash / multi went out backwards - now camera and character both face the opponent first.
 AP.lockPlr, AP.lockUntil = nil, 0
+-- (v108) SMOOTH TAKEOVER: the camera no longer SNAPS onto them. It turns smoothly at "Camera turn
+-- speed" (default 12: a 180 turn is mostly done in ~0.15s). Your CHARACTER is still turned instantly,
+-- so moves always go out facing them; the attack waits until the camera is roughly round too.
+function AP.camSpeed(mult)
+    local s = math.clamp(tonumber(settings.camTurnSpeed) or 12, 4, 60)
+    if s >= 60 then return 1e6 end -- 60 = the old instant snap
+    return s * (mult or 1)
+end
 function AP.lockOn(plr, sec)
     if not plr then return end
     local keep = (AP.lockPlr == plr) and AP.lockUntil or 0
@@ -2440,14 +2449,14 @@ pcall(function()
             local v = Vector3.new(AP.lockDirVec.X, 0, AP.lockDirVec.Z)
             if mh and v.Magnitude > 0.05 then
                 v = v.Unit
-                AP.camStep(workspace.CurrentCamera, v, dt, 1e6)
+                AP.camStep(workspace.CurrentCamera, v, dt, AP.camSpeed(1.5)) -- (v108) smooth, a bit quicker for evades
                 pcall(function() mh.CFrame = CFrame.lookAt(mh.Position, mh.Position + v) end)
                 return
             end
         end
         local lockDir, lockHrp = AP.lockTargetDir()
         if lockDir then
-            AP.camStep(workspace.CurrentCamera, lockDir, dt, 1e6) -- instant: camera snapped onto them
+            AP.camStep(workspace.CurrentCamera, lockDir, dt, AP.camSpeed()) -- (v108) smooth turn onto them
             pcall(function() lockHrp.CFrame = CFrame.lookAt(lockHrp.Position, lockHrp.Position + lockDir) end)
             return
         end
@@ -2553,7 +2562,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                 AP.lockOn(plr, 0.3) -- camera stays locked on them for the whole chase (lets go 0.3s after)
             end)
         end)
-        AP.waitFacing(plr, 0.25) -- face them FIRST, then start attacking
+        AP.waitFacing(plr, 0.35) -- face them FIRST, then start attacking ((v108) a bit longer: the camera turns smoothly)
 
         -- the dash reads "is W down?"; the multi is W + A + E
         if haveKeys then
@@ -3421,7 +3430,7 @@ do
                 end)
                 if assist then AP.lockOn(plr, 0.4) end
                 faceThem()
-                AP.waitFacing(plr, 0.15) -- face them FIRST, then dash / multi
+                AP.waitFacing(plr, 0.3) -- face them FIRST, then dash / multi ((v108) camera turns smoothly)
                 steer = true
                 if haveKeys and not plain then pcall(keypress, KEY_W); pcall(keypress, KEY_A) end
                 -- 1) let go of block
@@ -4706,7 +4715,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v107"
+hint.Text = "Ctrl+H = hide  |  v108"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5146,6 +5155,8 @@ makeSwitch(1520, "ESP outline", settings.espOutline, function(on) settings.espOu
 makeSwitch(1530, "ESP bars + info", settings.espInfo, function(on) settings.espInfo = on end, "espInfo")
 makeSwitch(1540, "ESP team check", settings.espTeamCheck, function(on) settings.espTeamCheck = on end, "espTeamCheck")
 makeWhitelist(1550, "ESP whitelist", "esp")
+-- (v108) how fast the camera turns when the script takes it over (4 = slow and smooth, 60 = instant snap)
+makeNumberBox(1560, "Camera turn speed (4-60)", "camTurnSpeed", 4, 60)
 -- Auto Parry timing: parry too EARLY (it expires before the hit) -> raise this;
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
@@ -5366,6 +5377,11 @@ do
             { "ESP team check / ESP whitelist", {
                 "Team check ON: enemies only. OFF: your team is shown too.",
                 "Whitelist: ticked players are hidden from ESP.",
+            } },
+            { "Camera turn speed (4-60)", {
+                "When Parry chase, Perfect trade, Auto Parry (from behind) or Stun evade turn you, the camera now turns SMOOTHLY instead of snapping. Your character still turns instantly, so moves always go out facing the right way.",
+                "Default {{12}}. Lower = slower and smoother (moves may wait a moment for the camera). Higher = snappier. {{60}} = the old instant snap.",
+                "Stun evade turns the camera a bit faster than the rest, since it has to get out quickly.",
             } },
         } },
         { "TIPS AND FIXES", {
