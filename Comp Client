@@ -2493,6 +2493,7 @@ local chaseBusy = false
 local function startChase(plr, viaParry) -- returns true if a chase started
     if chaseBusy then return false end
     chaseBusy = true
+    AP.chaseStopArmed = false -- (v109) the stop key is armed only once the chase really starts
     task.spawn(function()
       -- The whole chase runs inside pcall. Before, any error in the middle (e.g. the saber component
       -- being swapped out mid-chase) killed the chase with "chaseBusy" still ON - and from then on
@@ -2522,23 +2523,28 @@ local function startChase(plr, viaParry) -- returns true if a chase started
 
         -- (v105/v106) NATURAL PARRY COOLDOWN: a real player can't attack until their parry animation is over.
         -- The parry always plays out fully (it is never cut short), then the chase waits "Chase delay (ms)"
-        -- more before the first hit. The Chase stop key works during the wait.
+        -- more before the first hit.
+        -- (v109) FIXES for "no hits / only 1 hit":
+        --   * the Chase stop key (right-click) is IGNORED during this wait - blocking with right-click while
+        --     your parry plays used to count as "stop" and cancel the chase before it began
+        --   * the camera + character turn onto them DURING the parry, so the very frame the parry ends the
+        --     chase goes (no extra turning time eating their stun)
         if viaParry then
+            AP.chaseStopArmed = false
             AP.chaseStop = false
-            AP.chaseStartT = os.clock()
             local w0 = os.clock()
-            while settings.parryChase and not AP.chaseStop and os.clock() - w0 < 1.2
-                and combatStateNow() == "parrying" do
-                RunService.Heartbeat:Wait()
+            while settings.parryChase and os.clock() - w0 < 1.2 and combatStateNow() == "parrying" do
+                AP.lockOn(plr, 0.5)
+                RunService.RenderStepped:Wait()
             end
             local dly = math.clamp(tonumber(settings.chaseDelay) or 0, 0, 1000) / 1000
             local d0 = os.clock()
-            while settings.parryChase and not AP.chaseStop and os.clock() - d0 < dly do
-                RunService.Heartbeat:Wait()
+            while settings.parryChase and os.clock() - d0 < dly do
+                AP.lockOn(plr, 0.5)
+                RunService.RenderStepped:Wait()
             end
-            if AP.chaseStop or not settings.parryChase then
-                if AP.chaseStop then log("Parry chase stopped (stop key)") end
-                AP.chaseStop = false
+            AP.chaseStop = false
+            if not settings.parryChase then
                 chaseBusy = false
                 return
             end
@@ -2574,6 +2580,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         -- on the spot (no more hits, no bonus multi). See KB.add for chaseStopKey near the panel code.
         AP.chaseStop = false
         AP.chaseStartT = os.clock()
+        AP.chaseStopArmed = true -- (v109) only from here on does the stop key count
 
         local lastTPos, tVel = nil, Vector3.zero   -- target velocity, measured here (works with Auto Parry off)
         local lastTime = os.clock()
@@ -2889,6 +2896,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
       end)
       if AP.chaseStop then log("Parry chase stopped (stop key)") end
       AP.chaseStop = false
+      AP.chaseStopArmed = false
       if not okChase then
         warn("[ForceHBE] parry chase error (cleaned up, next chase will work): " .. tostring(errChase))
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseMove") end)
@@ -4715,7 +4723,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v108"
+hint.Text = "Ctrl+H = hide  |  v109"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5173,7 +5181,8 @@ KB.makeRow(350, "Parry chase key", "parryChaseKey")
 -- 0.2s of a chase, so a block you were already pressing as the chase starts doesn't cancel it.
 KB.makeRow(355, "Chase stop key", "chaseStopKey")
 KB.add(function() return settings.chaseStopKey end, function()
-    if chaseBusy and os.clock() - (AP.chaseStartT or 0) > 0.2 then AP.chaseStop = true end
+    -- (v109) ignored while your parry is still playing (AP.chaseStopArmed) and for 0.3s after the chase starts
+    if chaseBusy and AP.chaseStopArmed and os.clock() - (AP.chaseStartT or 0) > 0.3 then AP.chaseStop = true end
 end)
 KB.add(function() return settings.parryChaseKey end, function()
     settings.parryChase = not settings.parryChase
@@ -5307,7 +5316,7 @@ do
             } },
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
-                "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored for the first 0.2s of a chase so a block press you already made doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
+                "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
@@ -5328,7 +5337,7 @@ do
             { "Chase delay (ms)", {
                 "Your parry animation always plays out fully before the chase starts, like the normal cooldown after a parry.",
                 "Chase delay: extra wait after the parry animation before the first hit. Range {{0}} to {{1000}}, default {{0}}. Higher = looks more natural, but less of their stun is left to hit them in.",
-                "Only after a parry; a chase after your own kick starts as before. The Chase stop key also works during the wait.",
+                "Only after a parry; a chase after your own kick starts as before. While your parry plays the camera already turns onto them, so the chase goes the instant the parry ends.",
             } },
             { "Anti-kick (counter)", {
                 "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
