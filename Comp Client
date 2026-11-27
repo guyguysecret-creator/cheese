@@ -85,7 +85,8 @@ local settings = {
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
     camTurnSpeed = 12,     -- (v108) how fast the camera turns when the script takes it over (higher = snappier, 60 = instant)
-    chaseInstant = false,  -- (v114) Parry chase: ON = cut your parry animation short and chase INSTANTLY (old, blatant way)
+    antiKickMultis = 3,    -- (v122) Anti-kick: how many multis it does per kick, then it stops (1-10)
+    chaseInstant = false, -- (v114) Parry chase: ON = cut your parry animation short and chase INSTANTLY (old, blatant way)
     chaseDelay = 0,      -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
@@ -2775,12 +2776,10 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                 WANT_HITS = evadedAway and 3 or 5
             end
             hitsDone += 1
-            -- (v112) after an EVADE there's no time to spare: no "Multi delay" at all, every hit goes out at
-            -- the game's own minimum gap, so the 3rd hit lands before they can get a parry up
-            if evadedAway and not blatant then return base end
-            -- (v116) HIGH PING (about 100ms+ in Roblox's stats): their stun reaches you late and your hits reach
-            -- the server late, so there's less time - no Multi delay either, every hit at the game's minimum gap
-            if not blatant and pingEma >= 0.05 then return base end
+            -- (v122) NORMAL chase: FULL PACE until the target is reached (5 if they stayed, 3 if they evaded) -
+            -- no Multi delay at all before that, every multi at the game's own minimum gap. Multi delay only
+            -- paces anything extra after the target. (Covers the old v112 evade / v116 high-ping rules too.)
+            if not blatant and hitsDone < WANT_HITS then return base end
             local normal = multiGap(base)
             local left = WANT_HITS - hitsDone
             if left <= 0 then return normal end
@@ -2807,10 +2806,13 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                 return (stunTrk.Length - stunTrk.TimePosition) / math.max(stunTrk.Speed, 0.05)
             end)
             if okR and type(rem) == "number" then remEff = rem - pingEma; lastRaw = rem end
-            if remEff <= 0.05 then stunOver = true break end   -- their stun is over (or about to be): stop (then one bonus multi)
+            -- (v122) MINIMUM 2 HITS (normal chase): until 2 hits are out, the "too late to start" cut-offs are
+            -- relaxed - getting the 2nd hit out is worth the small risk of it landing right at the stun's end
+            local need2 = not blatant and hitsDone < 2
+            if remEff <= (need2 and -0.05 or 0.05) then stunOver = true break end   -- their stun is over (or about to be): stop (then one bonus multi)
             -- a new dash needs ~0.3s to land, a cancel-into-swing ~0.12s: don't START what can't land
-            local canDash = remEff >= 0.3
-            local canSwing = remEff >= 0.12
+            local canDash = remEff >= (need2 and 0.15 or 0.3)
+            local canSwing = remEff >= (need2 and 0 or 0.12)
             local cs = combatStateNow()
             if cs == "stunned" then break end                  -- you got hit: stop
             -- (v111) after an evade the arrival swing goes out a little earlier (4.5 studs instead of 3.5),
@@ -2824,6 +2826,8 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             -- (v110) they got away from you (further than melee AND further than where the chase began): back to 3 multis
             startDist = startDist or dist
             if dist > math.max(MELEE + 3, startDist + 3) then evadedAway = true end
+            -- (v122) already well out of reach when the chase began = they evaded before it started: aim for 3
+            if startDist > MELEE + 3 then evadedAway = true end
 
             local ms = movementState()
             local sc = saberComp
@@ -2916,11 +2920,13 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         -- allowed to wait up to ~0.9s before going out - that late one got parried. Now it only goes if it can
         -- start almost at once (all its waits cut to a quarter) and they're right on you. Its often the 3rd hit.
         -- The instant chase keeps the full, patient bonus multi.
-        local bq = blatant and 1 or 0.25
+        -- (v122) fewer than 2 hits out so far: the bonus is allowed its full patience (it's your 2nd hit)
+        local needBonus = blatant or hitsDone < 2
+        local bq = needBonus and 1 or 0.25
         if stunOver and settings.parryChase and not AP.chaseStop then -- (v100) stop key = no bonus multi either
             pcall(function()
                 local dist = updateAim()
-                if not dist or dist > MELEE + (blatant and 3 or 1) then return end
+                if not dist or dist > MELEE + (needBonus and 3 or 1) then return end
                 local tB = os.clock()
                 -- wait (briefly) for a swing to be possible
                 while os.clock() - tB < 0.3 * bq and combatStateNow() ~= "ignited" and combatStateNow() ~= "blocking" do
@@ -3219,6 +3225,9 @@ local function startKickCounter(plr, kickTrk)
             local dashFrames, cancelled, nextMultiAt = 0, false, 0
             local dashAsked, dashAskAt = false, nil
             local rushingIn = false -- (v114) is the kicker dashing straight at me right now?
+            -- (v122) "Anti-kick multis" box: stop after this many multis (each dash-cancel swing or plain swing = 1)
+            local swingsOut = 0
+            local maxSwings = math.clamp(math.floor(tonumber(settings.antiKickMultis) or 3), 1, 10)
             local function sendAttack()
                 pcall(function()
                     saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
@@ -3236,6 +3245,7 @@ local function startKickCounter(plr, kickTrk)
 
             local t0 = os.clock()
             while os.clock() - t0 < 2.5 and settings.antiKick do
+                if swingsOut >= maxSwings and movementState() ~= "dashing" then break end -- (v122) enough multis
                 local tc = plr.Character
                 local th = tc and tc:FindFirstChild("HumanoidRootPart")
                 local thum = tc and tc:FindFirstChildOfClass("Humanoid")
@@ -3308,11 +3318,13 @@ local function startKickCounter(plr, kickTrk)
                     end
                     pcall(function() rawget(sc, "_janitor"):Remove("DashCancelInputBegan") end)
                     -- the dash runs its full length toward the flank; once on them, it becomes a swing
-                    if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE + 3 and canSwing then
+                    if not cancelled and dashFrames >= 2 and swingReady and dist <= MELEE + 3 and canSwing
+                        and swingsOut < maxSwings then
                         cancelled = true
                         faceTarget()
                         local h = rawget(sc, "_dashCancelHandler")
                         if type(h) == "function" then pcall(h, true) else sendAttack() end
+                        swingsOut += 1
                     end
                 else
                     dashFrames, cancelled = 0, false
@@ -3354,6 +3366,7 @@ local function startKickCounter(plr, kickTrk)
                             dashAsked, dashAskAt = false, nil
                             faceTarget()
                             sendAttack()
+                            swingsOut += 1
                             nextMultiAt = os.clock() + AP.counterGap(0.15)
                         end
                     end
@@ -4846,7 +4859,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v121"
+hint.Text = "Ctrl+H = hide  |  v122"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5292,6 +5305,8 @@ makeNumberBox(1560, "Camera turn speed (4-60)", "camTurnSpeed", 4, 60)
 -- parry too LATE (you get hit first) -> lower it (negative is fine).
 -- With "Parry follows ping" ON this is added on top of your (negated) live ping.
 makeNumberBox(330, "Parry timing (ms)", "parryOffset", -500, 500)
+-- (v122) how many multis Anti-kick does per kick (then it stops), 1-10
+makeNumberBox(235, "Anti-kick multis (1-10)", "antiKickMultis", 1, 10)
 -- how wide the Stun evade zig-zag swings (degrees): lower = ends up FARTHER away, higher = harder to chase
 makeNumberBox(210, "Evade zig-zag (deg)", "zigAngle", 0, 80)
 -- how picky Auto Parry is about what counts as a hit: lower = parries more, higher = only clear hits
@@ -5442,7 +5457,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
-                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). After an evade it swings on arrival a bit earlier and multis at the game's minimum gap (Multi delay is ignored there). High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping and swings on arrival a little earlier. It always multis (dash-cancel); a plain swing is only used when the dash is on cooldown or you have no Force. Very high ping can still fit fewer. (v117) After an evade: it walks toward them WHILE your parry plays (the parry still finishes), and (v118) the bonus hit after their stun only goes out if it can go out at once (the slow, late one was the one that got parried). The {{F9}} console prints one line per chase starting with [Comp Client]: hits sent, whether they evaded, distance and ping. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). After an evade it swings on arrival a bit earlier and multis at the game's minimum gap (Multi delay is ignored there). High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping and swings on arrival a little earlier. It always multis (dash-cancel); a plain swing is only used when the dash is on cooldown or you have no Force. Very high ping can still fit fewer. (v117) After an evade: it walks toward them WHILE your parry plays (the parry still finishes), and (v118) the bonus hit after their stun only goes out if it can go out at once (the slow, late one was the one that got parried). The {{F9}} console prints one line per chase starting with [Comp Client]: hits sent, whether they evaded, distance and ping. (v122) It goes at full pace (no Multi delay) until 5 / 3 are out, and it always tries for at least {{2}}: until the 2nd hit is out it allows a hit right at the end of their stun, and the bonus hit gets its full time. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
@@ -5494,6 +5509,9 @@ do
                 "Default ON. Every Perfect trade turns you to face them first, keeps the camera on them, and aims where they're moving to (their speed + your ping), so trades land on strafing opponents.",
                 "OFF: it aims where they are (no lead) and only turns you if they're off to the side or behind you (so the multi still never goes out backwards).",
                 "Set a key in the Aim assist key box to flip it on/off mid-fight - a small pop-up shows ON or OFF.",
+            } },
+            { "Anti-kick multis (1-10)", {
+                "How many multis Anti-kick does per kick, then it stops. Default {{3}}. Type {{2}} for 2 multis, {{5}} for 5. It also stops earlier if their kick animation ends first.",
             } },
             { "Anti-kick only (none = all)", {
                 "Tick players here and Anti-kick only counters THEIR kicks. Nobody ticked = it counters everyone (it then follows the Parry only list like before).",
