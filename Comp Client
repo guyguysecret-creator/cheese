@@ -2560,6 +2560,21 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         if viaParry then
             AP.chaseStopArmed = false
             AP.chaseStop = false
+            -- (v117) CLOSE IN DURING THE PARRY: if they evaded, walk toward them while your parry animation plays
+            -- (walking doesn't cut the parry short). Every stud closed here is dash time saved later, so there's
+            -- stun time left for all 3 hits.
+            pcall(function()
+                RunService:BindToRenderStep("ForceHBE_ChasePre", Enum.RenderPriority.Last.Value, function()
+                    local th = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+                    local me = LocalPlayer.Character
+                    local mh = me and me:FindFirstChild("HumanoidRootPart")
+                    local mhum = me and me:FindFirstChildOfClass("Humanoid")
+                    if not th or not mh or not mhum then return end
+                    local v = Vector3.new(th.Position.X - mh.Position.X, 0, th.Position.Z - mh.Position.Z)
+                    if v.Magnitude > 4 then mhum:Move(v.Unit, false) end
+                    AP.noBackKey()
+                end)
+            end)
             local w0 = os.clock()
             while settings.parryChase and os.clock() - w0 < 1.2 and combatStateNow() == "parrying" do
                 AP.lockOn(plr, 0.5)
@@ -2571,6 +2586,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                 AP.lockOn(plr, 0.5)
                 RunService.RenderStepped:Wait()
             end
+            pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChasePre") end)
             AP.chaseStop = false
             if not settings.parryChase then
                 chaseBusy = false
@@ -2855,6 +2871,15 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                         sendAttack()
                         nextMultiAt = os.clock() + chaseGap(0.15, remEff)
                     end
+                elseif dist > MELEE and not blatant and evadedAway and dist <= MELEE + 2.5
+                    and ready and not onCd and groundedMS(ms) and force >= DASH_COST and canSwing then
+                    -- (v117) LUNGE-SWING: after an evade they often end up just out of reach (5-7.5 studs). Before,
+                    -- that meant ANOTHER full-length dash (cooldown + the whole dash) before the next hit. Now it's a
+                    -- multi: the dash is cancelled into a swing after 2 frames, which lunges you the last bit and hits.
+                    mode = "multi"
+                    hitsDone += 1
+                    faceTarget()
+                    sendDashInput()
                 elseif dist > MELEE then
                     mode = "approach"
                     if settings.jumpChase and not sniped and dist > AP.SNIPE_MIN_DIST and remEff >= AP.SNIPE_MIN_STUN
@@ -2898,7 +2923,9 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         -- (v70) BONUS MULTI: when the script thinks their stun is over, it still throws ONE more multi
         -- cycle (dash cancelled into a swing, or a plain swing) if they are close - what we see of their
         -- stun is a ping late and often ends early on our screen, so this extra hit usually still lands.
-        if stunOver and settings.parryChase and not AP.chaseStop then -- (v100) stop key = no bonus multi either
+        -- (v117) NORMAL chase (Chase: instant OFF): NO bonus multi. It can take up to ~0.9s to go out, after
+        -- their stun is already over - that late hit is the one that got parried. The instant chase keeps it.
+        if stunOver and settings.parryChase and not AP.chaseStop and blatant then -- (v100) stop key = no bonus multi either
             pcall(function()
                 local dist = updateAim()
                 if not dist or dist > MELEE + 3 then return end
@@ -2965,6 +2992,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
       if AP.chaseStop then log("Parry chase stopped (stop key)") end
       AP.chaseStop = false
       AP.chaseStopArmed = false
+      pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChasePre") end) -- (v117) always cleaned up
       if not okChase then
         warn("[ForceHBE] parry chase error (cleaned up, next chase will work): " .. tostring(errChase))
         pcall(function() RunService:UnbindFromRenderStep("ForceHBE_ChaseMove") end)
@@ -4814,7 +4842,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v116"
+hint.Text = "Ctrl+H = hide  |  v117"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5410,7 +5438,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
-                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111/v112) After an evade it swings on arrival a bit earlier, then throws plain quick swings at the game's minimum gap (Multi delay is ignored there) so the 3rd hit lands before they can parry. (v116) High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping, swings on arrival a little earlier, and switches to quick plain swings whenever their stun left is only just enough - so the 5 / 3 hits still fit. Very high ping can still fit fewer. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111/v112) After an evade it swings on arrival a bit earlier, then throws plain quick swings at the game's minimum gap (Multi delay is ignored there) so the 3rd hit lands before they can parry. (v116) High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping, swings on arrival a little earlier, and switches to quick plain swings whenever their stun left is only just enough - so the 5 / 3 hits still fit. Very high ping can still fit fewer. (v117) After an evade: it walks toward them WHILE your parry plays (the parry still finishes), lunges into a swing when they're just out of reach instead of a whole new dash, and there's no late bonus hit any more (that's the one that got parried). Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
