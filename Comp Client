@@ -2666,6 +2666,9 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
             -- lead: our dash covers ~60 studs/s, so aim where they'll be by the time we get there
             local lead = math.min(dist / 60, 0.5)
+            -- (v116) what you see of them is a ping old: an evading player is already further along, so lead by
+            -- your ping as well (normal chase only; the instant chase stays exactly as it was)
+            if not settings.chaseInstant then lead = math.min(lead + pingEma, 0.6) end
             local aim = th.Position + tVel * lead
             local to = Vector3.new(aim.X - mh.Position.X, 0, aim.Z - mh.Position.Z)
             if to.Magnitude > AP.CLOSE_HOLD then -- (v113) on your head: keep the move direction you had
@@ -2759,6 +2762,9 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             -- (v112) after an EVADE there's no time to spare: no "Multi delay" at all, every hit goes out at
             -- the game's own minimum gap, so the 3rd hit lands before they can get a parry up
             if evadedAway and not blatant then return base end
+            -- (v116) HIGH PING (about 100ms+ in Roblox's stats): their stun reaches you late and your hits reach
+            -- the server late, so there's less time - no Multi delay either, every hit at the game's minimum gap
+            if not blatant and pingEma >= 0.05 then return base end
             local normal = multiGap(base)
             local left = WANT_HITS - hitsDone
             if left <= 0 then return normal end
@@ -2794,6 +2800,8 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             -- (v111) after an evade the arrival swing goes out a little earlier (4.5 studs instead of 3.5),
             -- saving the last bit of the dash so there's stun time left for all 3 hits
             MELEE, ARRIVED = 5, ((evadedAway and not blatant) and 4.5 or 3.5)
+            -- (v116) high ping: swing on arrival a touch earlier (up to +1 stud), you see them a ping late
+            if not blatant then ARRIVED = ARRIVED + math.min(pingEma * 10, 1) end
 
             local dist = updateAim()
             if not dist then break end
@@ -2865,7 +2873,10 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                     -- (a swing is ~0.15s, a dash-cancel cycle ~0.18s+), so all 3 land before their stun ends.
                     local owed = (evadedAway and 3 or 5) - hitsDone
                     -- (v112) after an evade ALWAYS plain swings once you're on them (fastest way to 3 hits)
-                    local tight = evadedAway and owed > 0 and not blatant -- (v115) not in the old/instant chase
+                    -- (v115) not in the old/instant chase. (v116) also for the 5-multi case when their stun left
+                    -- (with your ping taken off) is only just enough for the hits still owed - so high ping still gets 5
+                    local tight = not blatant and owed > 0
+                        and (evadedAway or remEff < owed * 0.2 + 0.1 + pingEma)
                     if os.clock() >= nextMultiAt and canSwing then
                         -- (a plain swing needs the saber "ignited"; while you hold block the multi dash is still used)
                         if ready and not (tight and cs == "ignited") and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
@@ -4803,7 +4814,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v115"
+hint.Text = "Ctrl+H = hide  |  v116"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5399,7 +5410,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
-                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111/v112) After an evade it swings on arrival a bit earlier, then throws plain quick swings at the game's minimum gap (Multi delay is ignored there) so the 3rd hit lands before they can parry. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111/v112) After an evade it swings on arrival a bit earlier, then throws plain quick swings at the game's minimum gap (Multi delay is ignored there) so the 3rd hit lands before they can parry. (v116) High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping, swings on arrival a little earlier, and switches to quick plain swings whenever their stun left is only just enough - so the 5 / 3 hits still fit. Very high ping can still fit fewer. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
