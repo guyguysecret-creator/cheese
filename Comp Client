@@ -85,7 +85,8 @@ local settings = {
     chaseCam = true,       -- Parry chase: ALWAYS on (not a menu switch any more): the camera locks onto the target
     chaseUnblock = false,  -- Parry chase: false = starts right away (even while blocking); true = starts once you let go of block
     camTurnSpeed = 12,     -- (v108) how fast the camera turns when the script takes it over (higher = snappier, 60 = instant)
-    chaseDelay = 0,       -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
+    chaseInstant = false,  -- (v114) Parry chase: ON = cut your parry animation short and chase INSTANTLY (old, blatant way)
+    chaseDelay = 0,      -- (v105) extra wait (ms) after the parry before the chase starts. (v107) 0: the parry animation itself is the cooldown
     zigAngle = 50,         -- Stun evade: how wide the zig-zag swings, in degrees (lower = farther away, easier to follow)
     parryStrict = 60,      -- Auto Parry strictness 0-100 (higher = fewer, surer parries)
     parryTeamCheck = false, -- Auto Parry: ON = never react to teammates
@@ -2322,8 +2323,26 @@ end
 --      dash toward where they're going, re-aimed every frame; if they don't evade we just multi. Stops AT ONCE when their stun
 --      animation ends, if they leave or die, you get stunned, or after 6s.------------------------------------------------------------------------
 
--- (v106) the old cutParry (stopping your parry animation early so the chase could start instantly)
--- was removed: the chase now always waits for the parry to finish, so it looks natural.
+-- (v114) cutParry is back, but ONLY used with "Chase: instant (cut parry)" ON: it stops your parry
+-- animation early so the chase can start instantly (the old, blatant way). OFF (default) = the chase
+-- waits for your parry to finish, so it looks natural.
+local function cutParry()
+    local sc = saberComp
+    if not saberStillValid(sc) then return end
+    pcall(function()
+        local a = rawget(sc, "Animations").Parry
+        if a and a.IsPlaying then a:Stop(0) end -- its Stopped event ends the parrying state
+    end)
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        if combatStateNow() == "parrying" then -- didn't end by itself: finish it ourselves
+            local held = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2)
+            pcall(function()
+                rawget(sc, "CombatStateMachine"):Input(held and "parry_to_block" or "parry_finished")
+            end)
+        end
+    end)
+end
 
 ------------------------------------------------------------------------
 -- CAMERA SAFETY (v78). Only the Parry chase lock-on ever takes the camera over now. Handing it back
@@ -2727,12 +2746,19 @@ local function startChase(plr, viaParry) -- returns true if a chase started
         -- they evade away it drops back to 3 (time goes into dashing after them instead).
         local hitsDone, WANT_HITS = 0, 5
         local evadedAway, startDist = false, nil
+        -- (v115) "Chase: instant (cut parry)" ON = the OLD chase exactly as it was before v110: none of the
+        -- 5-multi / 3-hits-after-evade rules, it just keeps multi-ing until their stun animation is over
+        local blatant = settings.chaseInstant == true
         local function chaseGap(base, remLeft)
-            WANT_HITS = evadedAway and 3 or 5
+            if blatant then
+                WANT_HITS = 3
+            else
+                WANT_HITS = evadedAway and 3 or 5
+            end
             hitsDone += 1
             -- (v112) after an EVADE there's no time to spare: no "Multi delay" at all, every hit goes out at
             -- the game's own minimum gap, so the 3rd hit lands before they can get a parry up
-            if evadedAway then return base end
+            if evadedAway and not blatant then return base end
             local normal = multiGap(base)
             local left = WANT_HITS - hitsDone
             if left <= 0 then return normal end
@@ -2767,7 +2793,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
             if cs == "stunned" then break end                  -- you got hit: stop
             -- (v111) after an evade the arrival swing goes out a little earlier (4.5 studs instead of 3.5),
             -- saving the last bit of the dash so there's stun time left for all 3 hits
-            MELEE, ARRIVED = 5, (evadedAway and 4.5 or 3.5)
+            MELEE, ARRIVED = 5, ((evadedAway and not blatant) and 4.5 or 3.5)
 
             local dist = updateAim()
             if not dist then break end
@@ -2839,7 +2865,7 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                     -- (a swing is ~0.15s, a dash-cancel cycle ~0.18s+), so all 3 land before their stun ends.
                     local owed = (evadedAway and 3 or 5) - hitsDone
                     -- (v112) after an evade ALWAYS plain swings once you're on them (fastest way to 3 hits)
-                    local tight = evadedAway and owed > 0
+                    local tight = evadedAway and owed > 0 and not blatant -- (v115) not in the old/instant chase
                     if os.clock() >= nextMultiAt and canSwing then
                         -- (a plain swing needs the saber "ignited"; while you hold block the multi dash is still used)
                         if ready and not (tight and cs == "ignited") and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
@@ -3023,7 +3049,10 @@ do
                 local viaParry = afterParry and seen >= parryAt - 0.05 and wasAttacker and fightingMe
                 if (viaParry or kickOK) and not chaseBusy then
                     -- (v106) the parry animation is never cut short: startChase waits for it to finish
-                    if startChase(plr, viaParry) then
+                    -- (v114) ...unless "Chase: instant (cut parry)" is ON: then it's cut and the chase goes at once
+                    local instant = viaParry and settings.chaseInstant
+                    if instant then cutParry() end
+                    if startChase(plr, viaParry and not instant) then
                         parryAt, kickAt = -math.huge, -math.huge  -- count it once (only once it really started)
                     end
                     break
@@ -3125,6 +3154,9 @@ local function startKickCounter(plr, kickTrk)
                 if hum then hum:Move(moveDir, false) end
                 -- the game checks S BEFORE W: S held (backing away) = backwards dash, so let go of it
                 if haveKeys and UserInputService:IsKeyDown(Enum.KeyCode.S) then pcall(keyrelease, 0x53) end
+                -- (v114) camera locked on the kicker too (smooth, Camera turn speed): with shift lock the dash
+                -- follows the camera, so a camera still pointing elsewhere sent the multi dash the wrong way
+                AP.lockOn(plr, 0.3)
                 if faceAt and hrp and hrp.Parent then
                     local pos = hrp.Position
                     local flat = Vector3.new(faceAt.X - pos.X, 0, faceAt.Z - pos.Z)
@@ -3143,9 +3175,11 @@ local function startKickCounter(plr, kickTrk)
         local okRun, errRun = pcall(function()
             -- start from the kicker's already-tracked speed: a far dash-kicker is mid-run on frame one
             local lastTPos, tVel, lastTime = nil, (plrVelFast[plr] or Vector3.zero), os.clock()
-            local DASH_COST, MELEE = 32 + 8, 5
+            -- (v114) multi range back to 7 (as before v104): the multi's own dash closes the last couple of studs
+            local DASH_COST, MELEE = 32 + 8, 7
             local dashFrames, cancelled, nextMultiAt = 0, false, 0
             local dashAsked, dashAskAt = false, nil
+            local rushingIn = false -- (v114) is the kicker dashing straight at me right now?
             local function sendAttack()
                 pcall(function()
                     saberComp:ProcessInput(true, { name = "ATTACK", inputState = Enum.UserInputState.Begin })
@@ -3193,15 +3227,25 @@ local function startKickCounter(plr, kickTrk)
                 lastTPos = th.Position
                 local dist = (Vector3.new(th.Position.X, 0, th.Position.Z) - Vector3.new(mh.Position.X, 0, mh.Position.Z)).Magnitude
                 local lead = math.min(dist / 60, 0.4)
+                -- (v114) DASH-KICKER RUSHING AT YOU: how fast are they coming straight at me?
+                local toMeF = Vector3.new(mh.Position.X - th.Position.X, 0, mh.Position.Z - th.Position.Z)
+                local closingK = (toMeF.Magnitude > 0.1) and Vector3.new(tVel.X, 0, tVel.Z):Dot(toMeF.Unit) or 0
+                rushingIn = closingK > 15
                 -- (what you see of them is one ping old: a dash-sniper has already gone further than drawn)
                 local center = th.Position + tVel * (lead + pingEma * 0.8)
+                -- (v114) THE BACKWARDS-DASH BUG: for someone dashing AT you, "where they'll be" is BEHIND you,
+                -- so the counter dashed you backwards and dodged instead of hitting. Now: rushing in = aim at
+                -- where they ARE, and the aim point may never end up behind you.
+                if rushingIn then center = th.Position end
+                local toC = Vector3.new(center.X - mh.Position.X, 0, center.Z - mh.Position.Z)
+                if toMeF.Magnitude > 0.1 and toC:Dot(-toMeF.Unit) <= 0.5 then center = th.Position end
                 -- aim at their FLANK (the side I'm already on), not the cube in front of them
                 local look = Vector3.new(th.CFrame.LookVector.X, 0, th.CFrame.LookVector.Z)
                 look = look.Magnitude > 0.05 and look.Unit or Vector3.new(0, 0, -1)
                 local right = Vector3.new(th.CFrame.RightVector.X, 0, th.CFrame.RightVector.Z)
                 right = right.Magnitude > 0.05 and right.Unit or Vector3.new(1, 0, 0)
                 local mySide = (right:Dot(Vector3.new(mh.Position.X - th.Position.X, 0, mh.Position.Z - th.Position.Z)) >= 0) and 1 or -1
-                local aimPoint = (dist > 6) and (center + right * mySide * 4.5 - look * 1.5) or center
+                local aimPoint = (dist > 6 and not rushingIn) and (center + right * mySide * 4.5 - look * 1.5) or center
                 local to = Vector3.new(aimPoint.X - mh.Position.X, 0, aimPoint.Z - mh.Position.Z)
                 if to.Magnitude > 0.5 then moveDir = to.Unit end
 
@@ -3239,7 +3283,9 @@ local function startKickCounter(plr, kickTrk)
                         onCd = okC and v or false
                     end
                     if dist > MELEE then
-                        if dashReady and not onCd and groundedMS(ms) and force >= 32 and canDash then
+                        -- (v114) a dash-kicker rushing at you comes to YOU: no dash of your own (that's what made
+                        -- you fly past / away). Stay unblocked, face them, and multi the moment they're in range.
+                        if not rushingIn and dashReady and not onCd and groundedMS(ms) and force >= 32 and canDash then
                             sendDashInput()                     -- close the gap with a full dash
                         end
                     elseif os.clock() >= nextMultiAt and canSwing then
@@ -4757,7 +4803,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v113"
+hint.Text = "Ctrl+H = hide  |  v115"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5232,6 +5278,8 @@ makeSwitch(420, "Jump chase (far evades)", settings.jumpChase, function(on) sett
 makeSwitch(430, "Chase: unblock to start", settings.chaseUnblock, function(on) settings.chaseUnblock = on end, "chaseUnblock")
 -- (v105) extra wait after your parry animation finishes, before the chase's first hit
 makeNumberBox(434, "Chase delay (ms)", "chaseDelay", 0, 1000)
+-- (v114) the old blatant way: cut your parry animation short and chase instantly
+makeSwitch(436, "Chase: instant (cut parry)", settings.chaseInstant, function(on) settings.chaseInstant = on end, "chaseInstant")
 -- tick players here and the chase will ONLY ever go after them (nobody ticked = anyone)
 makeWhitelist(440, "Chase only (none = all)", "chase", "Pick")
 -- someone's swing lands on your block -> you multi them once right after (then block again if held)
@@ -5370,9 +5418,13 @@ do
                 "ON: it only starts once you let go of block.",
             } },
             { "Chase delay (ms)", {
-                "Your parry animation always plays out fully before the chase starts, like the normal cooldown after a parry.",
+                "Your parry animation plays out fully before the chase starts, like the normal cooldown after a parry (unless Chase: instant is ON).",
                 "Chase delay: extra wait after the parry animation before the first hit. Range {{0}} to {{1000}}, default {{0}}. Higher = looks more natural, but less of their stun is left to hit them in.",
                 "Only after a parry; a chase after your own kick starts as before. While your parry plays the camera already turns onto them, so the chase goes the instant the parry ends.",
+            } },
+            { "Chase: instant (cut parry)", {
+                "OFF (default): the natural way above.",
+                "ON: the old, blatant way, exactly as before. Your parry animation is cut short, the chase starts the instant the parry lands (Chase delay is skipped), and it keeps multi-ing until their stun animation is over - none of the 5-multi / 3-hits-after-evade rules. Lots of hits, but it looks obvious. Multi delay still sets the pace (lower = more hits).",
             } },
             { "Anti-kick (counter)", {
                 "Counters kicks: the moment someone starts a kick near you it lets go of block (a kick breaks blocks) and hits them before the kick's hit box switches on.",
