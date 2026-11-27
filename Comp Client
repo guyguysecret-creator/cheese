@@ -2889,15 +2889,11 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                     -- (v111) MAKE SURE OF 3 AFTER AN EVADE: once they evaded, if their stun left is only just
                     -- enough for the hits still owed, skip the dash part of the multi and throw plain swings
                     -- (a swing is ~0.15s, a dash-cancel cycle ~0.18s+), so all 3 land before their stun ends.
-                    local owed = (evadedAway and 3 or 5) - hitsDone
-                    -- (v112) after an evade ALWAYS plain swings once you're on them (fastest way to 3 hits)
-                    -- (v115) not in the old/instant chase. (v116) also for the 5-multi case when their stun left
-                    -- (with your ping taken off) is only just enough for the hits still owed - so high ping still gets 5
-                    local tight = not blatant and owed > 0
-                        and (evadedAway or remEff < owed * 0.2 + 0.1 + pingEma)
+                    -- (v119) the v111-v116 "plain swings when time is short" mode was REMOVED: it turned the chase
+                    -- into regular M1s. The dash-cancel multi is the fast combo - it's used whenever a dash is
+                    -- possible; a plain swing only when the dash is on cooldown / no Force (as originally).
                     if os.clock() >= nextMultiAt and canSwing then
-                        -- (a plain swing needs the saber "ignited"; while you hold block the multi dash is still used)
-                        if ready and not (tight and cs == "ignited") and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
+                        if ready and not onCd and groundedMS(ms) and force >= DASH_COST and canDash then
                             faceTarget()
                             sendDashInput()                     -- E (W and A are held)
                             nextMultiAt = os.clock() + chaseGap(0.18, remEff)
@@ -2976,9 +2972,10 @@ local function startChase(plr, viaParry) -- returns true if a chase started
                 hitsDone += 1
             end)
         end
-        -- (v118) one line per chase in the menu's log box, so tuning is based on what really happens
+        -- (v118/v121) one line per chase, printed straight to the F9 console (Output), so tuning is based on
+        -- what really happens. (v121: it went to an internal log nobody could see before.)
         pcall(function()
-            log(("Parry chase on %s: %d hits sent | evaded: %s | started %.1f studs away | ping ~%d ms | %s"):format(
+            print(("[Comp Client] Parry chase on %s: %d hits sent | evaded: %s | started %.1f studs away | ping ~%d ms | %s"):format(
                 plr.Name, hitsDone, evadedAway and "yes" or "no", startDist or -1, math.floor(pingEma * 2000 + 0.5),
                 blatant and "instant" or "normal"))
         end)
@@ -4113,7 +4110,11 @@ track(task.spawn(function()
         task.wait(2)
         local char = LocalPlayer.Character
         if char then
-            if settings.force and (char:GetAttribute(REGEN_ATTR) ~= REGEN_MULTIPLIER
+            -- (v120) forceApply / forceConns no longer exist in this script (Infinite Force works differently
+            -- now), so calling it crashed this loop on its first pass ("line 4118: attempt to call a nil value")
+            -- and the two re-checks below (Infinite Block delete mode, Stun evade hook) never ran again.
+            if settings.force and type(forceApply) == "function" and type(forceConns) == "table"
+                and (char:GetAttribute(REGEN_ATTR) ~= REGEN_MULTIPLIER
                 or char:GetAttribute(DRAIN_ATTR) ~= -REFILL_PER_TICK or #forceConns == 0) then
                 forceApply(char)
             end
@@ -4845,7 +4846,7 @@ hint.Font = Enum.Font.Gotham
 hint.TextSize = 10
 hint.TextXAlignment = Enum.TextXAlignment.Right
 hint.TextColor3 = COLORS.sub
-hint.Text = "Ctrl+H = hide  |  v118"
+hint.Text = "Ctrl+H = hide  |  v121"
 hint.Parent = frame
 
 -- everything below the title lives in `content`, which stays hidden until the
@@ -5441,7 +5442,7 @@ do
             { "Parry chase (multi)", {
                 "After you parry OR kick an enemy and stun them, you dash to them and multi (W, E, swing) until their stun is about to end. The camera turns to keep them in view (your normal camera at your own zoom, shift lock or not) and simply stays where it is when the chase ends - no jump or snap back.",
                 "**Chase stop key:** default {{MB2}} (right-click). Press it during a chase and it stops right there - no more hits and no bonus multi at the end (right-click also puts your block up). Ignored while your parry animation is still playing and for the first 0.3s of the chase, so blocking right after your parry doesn't cancel it. Change it in the Chase stop key box (key, combo or mouse button; Backspace = None). Otherwise it chases all the way like before, including the one bonus multi when their stun ends.",
-                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). (v111/v112) After an evade it swings on arrival a bit earlier, then throws plain quick swings at the game's minimum gap (Multi delay is ignored there) so the 3rd hit lands before they can parry. (v116) High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping, swings on arrival a little earlier, and switches to quick plain swings whenever their stun left is only just enough - so the 5 / 3 hits still fit. Very high ping can still fit fewer. (v117) After an evade: it walks toward them WHILE your parry plays (the parry still finishes), and (v118) the bonus hit after their stun only goes out if it can go out at once (the slow, late one was the one that got parried). The log box under the menu shows one line per chase: hits sent, whether they evaded, distance and ping. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
+                "How many multis (v110): if they DON'T evade and stay stuck next to you, it packs in {{5}} multis before their stun ends. If they evade away it aims for {{3}} (time goes into dashing after them). After an evade it swings on arrival a bit earlier and multis at the game's minimum gap (Multi delay is ignored there). High ping / off-region: from about 100ms (Roblox stats) Multi delay is skipped, it aims ahead by your ping and swings on arrival a little earlier. It always multis (dash-cancel); a plain swing is only used when the dash is on cooldown or you have no Force. Very high ping can still fit fewer. (v117) After an evade: it walks toward them WHILE your parry plays (the parry still finishes), and (v118) the bonus hit after their stun only goes out if it can go out at once (the slow, late one was the one that got parried). The {{F9}} console prints one line per chase starting with [Comp Client]: hits sent, whether they evaded, distance and ping. Your parry animation still always plays out fully first. It never keeps hitting after their stun is over (apart from the one bonus multi), so it can't hand them a free parry. A short stun or high ping can fit fewer.",
                 "It starts on a fresh stun up to about 1.8 seconds after your own parry (someone close who attacked recently and is facing you), or up to about 1.2 seconds after your kick (someone close in front of you). The long window covers lag: the stun has to travel from them to the server to you.",
                 "**Parry chase key:** toggles Parry chase on/off. Click the box, then press a key, a combo (e.g. Ctrl+P) or a mouse button. Esc cancels, Backspace clears it to None (the default).",
                 "**Chase team check:** ON = the chase never goes after your own side (a Jedi won't chase other Jedi, etc.). Your side is your Roblox team or the game's Jedi/Sith alignment.",
